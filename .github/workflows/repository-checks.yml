@@ -91,6 +91,16 @@ jobs:
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
           if (-not $msbuild) { throw 'MSBuild unavailable' }
           pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+      - name: Publish verified pinned SumatraPDF artifacts for instrumentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-a3-native-${{ github.run_id }}
+          path: |
+            build/a3/Release/sumatrafuzz-harness.exe
+            build/a3/Release/PdfFilter.dll
+            build/a3/Release/libmupdf.dll
+          if-no-files-found: error
+          retention-days: 7
   debug-evidence-unit:
     name: DynamoRIO debug evidence parser
     runs-on: ubuntu-latest
@@ -101,7 +111,7 @@ jobs:
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
-    needs: [windows-tests, debug-evidence-unit]
+    needs: [windows-tests, debug-evidence-unit, native-real-engine]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
@@ -112,12 +122,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Pinned upstream clone failed' }
           $sha = (& git -C external/sumatrapdf rev-parse HEAD).Trim()
           if ($sha -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0') { throw 'Pinned Sumatra source drift' }
-      - name: Build real SumatraPDF Windows x64 filter and harness
+      - name: Load genuine CTest-verified pinned SumatraPDF binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-a3-native-${{ github.run_id }}
+          path: build/a3/Release
+      - name: Assert intact parser artifacts before instrumenting
         shell: pwsh
         run: |
-          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-          if (-not $msbuild) { throw 'MSBuild missing' }
-          pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+          foreach ($name in @('sumatrafuzz-harness.exe','PdfFilter.dll','libmupdf.dll')) {
+            $path = Join-Path (Get-Location) "build/a3/Release/$name"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing real artifact: $path" }
+            Write-Output "$name SHA256=$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash)"
+          }
       - name: Provision pinned source-built WinAFL and DynamoRIO
         shell: pwsh
         run: |
