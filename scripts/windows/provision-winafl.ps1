@@ -26,12 +26,63 @@ if (-not (Test-Path -LiteralPath $unpacked -PathType Container)) {
   Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -ErrorAction Stop
 }
 $binCandidates = @(Get-ChildItem -LiteralPath $unpacked -Filter 'drrun.exe' -Recurse -File |
-  Where-Object { $_.DirectoryName -match '[\\/]bin64$' })
-if ($binCandidates.Count -ne 1) { throw "Exactly one x64 drrun.exe required; found $($binCandidates.Count)" }
-$drrun = $binCandidates[0].FullName
-$drRoot = Split-Path (Split-Path $drrun -Parent) -Parent
-$drConfig = Join-Path $drRoot 'cmake/DynamoRIOConfig.cmake'
-if (-not (Test-Path -LiteralPath $drConfig -PathType Leaf)) { throw "DynamoRIO CMake config missing: $drConfig" }
+  Where-Object { $_.DirectoryName -match '[\\/]bin64
+$src = Join-Path $Workspace 'winafl-source'
+if (-not (Test-Path -LiteralPath $src -PathType Container)) {
+  & git clone 'https://github.com/googleprojectzero/winafl.git' $src
+  if ($LASTEXITCODE -ne 0) { throw 'WinAFL clone failed' }
+}
+& git -C $src checkout --detach $winAflCommit
+if ($LASTEXITCODE -ne 0) { throw 'Pinned WinAFL checkout failed' }
+$actual = (& git -C $src rev-parse HEAD).Trim()
+if ($actual -ne $winAflCommit) { throw 'WinAFL revision mismatch' }
+$build = Join-Path $Workspace 'winafl-build'
+& cmake -S $src -B $build -A x64 "-DDynamoRIO_DIR=$(Split-Path $drConfig -Parent)" '-DINTELPT=OFF' '-DTINYINST=OFF' '-DUSE_DRSYMS=OFF'
+if ($LASTEXITCODE -ne 0) { throw 'WinAFL configure failed' }
+& cmake --build $build --config Release --target afl-fuzz winafl
+if ($LASTEXITCODE -ne 0) { throw 'WinAFL build failed' }
+$aflCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'afl-fuzz.exe' -Recurse -File)
+$dllCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'winafl.dll' -Recurse -File)
+if ($aflCandidates.Count -ne 1 -or $dllCandidates.Count -ne 1) { throw 'WinAFL x64 artifacts missing/ambiguous' }
+$lockDir = Join-Path $Workspace 'locks'
+$null = New-Item -ItemType Directory -Path $lockDir -Force
+& (Join-Path $PSScriptRoot 'verify-toolchain.ps1') -SumatraSource $SumatraSource `
+   -WinAflExe $aflCandidates[0].FullName -WinAflDll $dllCandidates[0].FullName `
+   -DrrunExe $drrun -Workspace $lockDir
+if ($LASTEXITCODE -ne 0) { throw 'Real WinAFL toolchain validation failed' }
+$lockPath = Join-Path $lockDir 'target-lock.json'
+if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { throw 'target-lock.json missing' }
+$lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lock | Add-Member -NotePropertyName acquisition -NotePropertyValue ([ordered]@{
+  dynamorio_release = 'release_7.1.0'
+  dynamorio_archive_url = $drUrl
+  dynamorio_archive_sha256 = $archiveHash
+  dynamorio_source_commit = '191c479ffcf287aa8baf55ddc6013403eb503fdb'
+  winafl_source_commit = $winAflCommit
+  winafl_repository = 'https://github.com/googleprojectzero/winafl'
+}) -Force
+$lock | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $lockPath -Encoding utf8
+Write-Output "Real toolchain lock: $lockPath"
+ })
+# The release archive can contain more than one runnable DR distribution.
+# Only accept the bin64 belonging to the root containing the CMake SDK,
+# which is the same runtime the pinned WinAFL client is built against.
+$installs = @()
+foreach ($binary in $binCandidates) {
+  $candidateRoot = Split-Path (Split-Path $binary.FullName -Parent) -Parent
+  $candidateConfig = Join-Path $candidateRoot 'cmake/DynamoRIOConfig.cmake'
+  if (Test-Path -LiteralPath $candidateConfig -PathType Leaf) {
+    $installs += [pscustomobject]@{ drrun = $binary.FullName; root = $candidateRoot; config = $candidateConfig }
+  }
+}
+if ($installs.Count -ne 1) {
+  $locations = $binCandidates.FullName -join '; '
+  throw "Expected one x64 DynamoRIO SDK installation; found $($installs.Count). Candidates: $locations"
+}
+$drrun = $installs[0].drrun
+$drRoot = $installs[0].root
+$drConfig = $installs[0].config
+Write-Output "Selected SDK-backed x64 DynamoRIO: $drrun"
 $src = Join-Path $Workspace 'winafl-source'
 if (-not (Test-Path -LiteralPath $src -PathType Container)) {
   & git clone 'https://github.com/googleprojectzero/winafl.git' $src
