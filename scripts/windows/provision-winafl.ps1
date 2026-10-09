@@ -7,8 +7,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $winAflCommit = 'fd85f38548b14352f4b70ad414f364ea6dc1a769'
-$drRelease = 'DynamoRIO-Windows-7.1.0-1.zip'
-$drUrl = "https://github.com/DynamoRIO/dynamorio/releases/download/release_7.1.0/$drRelease"
+$drRelease = 'DynamoRIO-Windows-11.3.0.zip'
+$drUrl = "https://github.com/DynamoRIO/dynamorio/releases/download/release_11.3.0-1/$drRelease"
 if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
   throw 'Windows x64 required'
 }
@@ -70,10 +70,10 @@ $lockPath = Join-Path $lockDir 'target-lock.json'
 if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { throw 'target-lock.json missing' }
 $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
 $lock | Add-Member -NotePropertyName acquisition -NotePropertyValue ([ordered]@{
-  dynamorio_release = 'release_7.1.0'
+  dynamorio_release = 'release_11.3.0-1'
   dynamorio_archive_url = $drUrl
   dynamorio_archive_sha256 = $archiveHash
-  dynamorio_source_commit = '191c479ffcf287aa8baf55ddc6013403eb503fdb'
+  dynamorio_source_commit = '6847bb210bea0ca11d1bf47704383d6a075da490'
   winafl_source_commit = $winAflCommit
   winafl_repository = 'https://github.com/googleprojectzero/winafl'
 }) -Force
