@@ -29,9 +29,9 @@ function Assert-X64PE([string]$Path,[string]$Label) {
     if ($machine -ne 0x8664) { throw "$Label must be x64, found $machine" }
   } finally { $s.Dispose() }
 }
-function GitResult([string]$Path,[string[]]$Args) {
-  $output = @(& git -C $Path @Args 2>&1)
-  if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "git failed: $($Args -join ' ')" }
+function GitResult([string]$Path,[string[]]$GitArguments) {
+  $output = @(& git -C $Path @GitArguments 2>&1)
+  if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "git failed: $($GitArguments -join ' ')" }
   return [string]$output[0]
 }
 
