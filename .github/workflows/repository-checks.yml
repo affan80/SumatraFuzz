@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [dev, main]
   push:
-    branches: [dev]
+    branches: [dev, 'feat/**', 'fix/**', 'test/**', 'chore/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,3 +43,17 @@ jobs:
         run: |
           Import-Module Pester -MinimumVersion 5.0
           Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+  native-contract:
+    name: Native C++ contract
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Windows x64 harness contract
+        shell: pwsh
+        run: cmake -S native/sumatra-harness -B build/a2 -A x64
+      - name: Build contract tests
+        shell: pwsh
+        run: cmake --build build/a2 --config Debug
+      - name: Execute contract tests
+        shell: pwsh
+        run: ctest --test-dir build/a2 -C Debug --output-on-failure
