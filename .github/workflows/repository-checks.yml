@@ -76,3 +76,51 @@ jobs:
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
           if (-not $msbuild) { throw 'MSBuild unavailable' }
           pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+  debug-evidence-unit:
+    name: DynamoRIO debug evidence parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject incomplete fake, crashed and empty instrumentation records
+        run: python3 -m unittest discover -s tools/instrumentation/tests -v
+  real-dynamorio:
+    name: DynamoRIO persistent debug
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pinned SumatraPDF 3.6.1rel
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 3.6.1rel https://github.com/sumatrapdfreader/sumatrapdf.git external/sumatrapdf
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned upstream clone failed' }
+          $sha = (& git -C external/sumatrapdf rev-parse HEAD).Trim()
+          if ($sha -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0') { throw 'Pinned Sumatra source drift' }
+      - name: Build real SumatraPDF Windows x64 filter and harness
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild missing' }
+          pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+      - name: Provision pinned source-built WinAFL and DynamoRIO
+        shell: pwsh
+        run: |
+          pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
+      - name: Genuine 10-cycle DynamoRIO debug with actual edge feedback
+        shell: pwsh
+        run: |
+          $repo = (Get-Location).Path
+          $seed = Join-Path $repo 'runs/a4/seed.pdf'
+          python tools/instrumentation/make_debug_seed.py --out $seed
+          if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
+          pwsh -File scripts/windows/run-dynamorio-debug.ps1 `
+            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
+            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
+            -InputPdf $seed -OutputDir (Join-Path $repo 'runs/a4/debug-evidence')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a4-genuine-dynamorio-debug-${{ github.run_id }}
+          path: runs/a4/debug-evidence/
+          if-no-files-found: warn
+          retention-days: 7
