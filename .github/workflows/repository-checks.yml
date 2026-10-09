@@ -43,6 +43,21 @@ jobs:
         run: |
           Import-Module Pester -MinimumVersion 5.0
           Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+      - name: Parse all Windows PowerShell scripts before expensive builds
+        shell: pwsh
+        run: |
+          $paths = @(Get-ChildItem -Path scripts/windows -Filter '*.ps1' -Recurse -File)
+          if ($paths.Count -lt 3) { throw 'Expected native Windows verification scripts not found' }
+          foreach ($file in $paths) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
+              throw "PowerShell script fails parser validation: $($file.FullName)"
+            }
+            Write-Output "PowerShell parse OK: $($file.FullName)"
+          }
   native-contract:
     name: Native C++ contract
     runs-on: windows-2022
@@ -86,6 +101,7 @@ jobs:
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
+    needs: [windows-tests, debug-evidence-unit]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
