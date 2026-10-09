@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "target_id": "sumatrapdf-3.6.1rel",
+  "display_name": "SumatraPDF 3.6.1 (Windows x64)",
+  "source_repository": "https://github.com/sumatrapdfreader/sumatrapdf",
+  "source_tag": "3.6.1rel",
+  "source_commit": "16c59fde8b824ab54c56f23aef910a6fdd874ad0",
+  "architecture": "x64",
+  "harness_entry": "fuzz_one_file",
+  "nargs": 1,
+  "coverage_modules": [],
+  "coverage_modules_status": "unverified_until_dynamorio_debug"
+}
