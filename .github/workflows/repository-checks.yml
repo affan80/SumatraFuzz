@@ -1,0 +1,45 @@
+name: Repository checks
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  target-config:
+    name: Target config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify source pin
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('configs/targets/sumatrapdf-3.6.1rel.json')
+          x = json.loads(p.read_text())
+          assert x['source_tag'] == '3.6.1rel'
+          assert x['source_commit'] == '16c59fde8b824ab54c56f23aef910a6fdd874ad0'
+          assert x['architecture'] == 'x64'
+          assert x['harness_entry'] == 'fuzz_one_file'
+          assert x['nargs'] == 1
+          assert x['coverage_modules'] == []
+          print('Source pin metadata PASS; runtime verification NOT RUN')
+          PY
+  windows-tests:
+    name: Windows Pester
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+      - name: Validate Windows toolchain code
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0
+          Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
