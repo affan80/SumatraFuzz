@@ -1,0 +1,29 @@
+name: Bug report
+description: Non-sensitive, reproducible defects only
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "For sensitive vulnerabilities use a private disclosure channel; never post exploit samples."
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS, versions, commit
