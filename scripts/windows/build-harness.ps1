@@ -30,8 +30,43 @@ Copy-Item -LiteralPath $engine -Destination (Join-Path $bin 'libmupdf.dll') -For
 & ctest --test-dir $BuildDir -C $Configuration --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw 'A3 real engine tests failed' }
 $exe=Join-Path $BuildDir "$Configuration/sumatrafuzz-harness.exe"
-& dumpbin /exports $exe | Select-String -Pattern 'fuzz_one_file' | Out-Host
-if ($LASTEXITCODE -ne 0) { throw 'dumpbin export check failed' }
+# GitHub-hosted PowerShell shells do not populate the Visual Studio C++ tools PATH.
+# Locate the genuine x64 dumpbin in the installed MSVC toolchain; do not skip
+# the symbol verification if the binary is missing.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+  throw "Visual Studio locator missing: $vswhere"
+}
+$vsRoot = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsRoot)) {
+  throw 'Visual Studio x64 C++ toolchain not found'
+}
+$vcTools = Join-Path $vsRoot 'VC/Tools/MSVC'
+if (-not (Test-Path -LiteralPath $vcTools -PathType Container)) {
+  throw "MSVC toolchain directory missing: $vcTools"
+}
+$dumpbin = $null
+foreach ($toolVersion in (Get-ChildItem -LiteralPath $vcTools -Directory | Sort-Object Name -Descending)) {
+  $candidate = Join-Path $toolVersion.FullName 'bin/Hostx64/x64/dumpbin.exe'
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+    $dumpbin = $candidate
+    break
+  }
+}
+if (-not $dumpbin) { throw 'x64 dumpbin.exe not found in installed MSVC toolchains' }
+Write-Output "Checking WinAFL harness export with: $dumpbin"
+$exports = @(& $dumpbin /nologo /exports $exe 2>&1)
+if ($LASTEXITCODE -ne 0) {
+  throw "dumpbin /exports failed with exit code $LASTEXITCODE : $($exports -join [Environment]::NewLine)"
+}
+# A successful process exit is not enough: require the actual unmangled
+# exported symbol in the PE export table. Printed string matches elsewhere
+# (e.g. path or message) must not count.
+$exportText = $exports -join [Environment]::NewLine
+if ($exportText -notmatch '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+fuzz_one_file(?:\s|$)') {
+  throw "The harness does not export the required unmangled fuzz_one_file symbol: $exe"
+}
+Write-Output 'Verified x64 harness export: fuzz_one_file'
 $sha=(Get-FileHash -Algorithm SHA256 -LiteralPath $filter).Hash
 Write-Output "Validated pinned PdfFilter: $filter SHA256=$sha"
 Write-Output "Validated pinned libmupdf: $engine SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $engine).Hash)"
