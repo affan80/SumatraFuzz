@@ -20,7 +20,7 @@ BeforeAll {
     & git -C $src tag 3.6.1rel
     $sha=(& git -C $src rev-parse HEAD).Trim()
     $cfg=Join-Path $Root 'target.json'
-    @{target_id='sumatrapdf-3.6.1rel';source_tag='3.6.1rel';source_commit=$sha;architecture='x64';harness_entry='fuzz_one_file';nargs=1} | ConvertTo-Json | Set-Content -LiteralPath $cfg
+    @{target_id='sumatrapdf-3.6.1rel';source_repository='https://github.com/sumatrapdfreader/sumatrapdf';source_tag='3.6.1rel';source_commit=$sha;architecture='x64';harness_entry='fuzz_one_file';nargs=1} | ConvertTo-Json | Set-Content -LiteralPath $cfg
     $afl=Join-Path $bin 'afl-fuzz.exe'
     $dll=Join-Path $bin 'winafl.dll'
     $dr=Join-Path $bin 'drrun.exe'
