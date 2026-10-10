@@ -10,11 +10,19 @@ BeforeAll {
     Set-Content -LiteralPath $sample -Value '%PDF-malformed'
     $harness = Join-Path $root 'sumatrafuzz-harness.exe'
     Set-Content -LiteralPath $harness -Value 'test-only nonexecutable fixture'
+    $parser = Join-Path $root 'PdfFilter.dll'
+    $mupdf = Join-Path $root 'libmupdf.dll'
+    Set-Content -LiteralPath $parser -Value 'parser fixture'
+    Set-Content -LiteralPath $mupdf -Value 'mupdf fixture'
     $relative = 'hangs/id_000001'
     $manifest = Join-Path $root 'evidence.json'
     @{
       source_commit='16c59fde8b824ab54c56f23aef910a6fdd874ad0'
-      binary_hashes=@{harness=(Get-FileHash -LiteralPath $harness -Algorithm SHA256).Hash}
+      binary_hashes=@{
+        harness=(Get-FileHash -LiteralPath $harness -Algorithm SHA256).Hash
+        'PdfFilter.dll'=(Get-FileHash -LiteralPath $parser -Algorithm SHA256).Hash
+        'libmupdf.dll'=(Get-FileHash -LiteralPath $mupdf -Algorithm SHA256).Hash
+      }
       crashes=@()
       hangs=@(@{
         path=$relative
@@ -44,5 +52,35 @@ Describe 'Real finding replay fails closed before executing native samples' -Ski
   It 'rejects path traversal syntax' {
     $replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding='hangs/../outside.pdf'}
     { & $script:replay @replayParams } | Should -Throw '*Finding must name*'
+  }
+}
+
+Describe 'Replay parser identity and directory confinement' -Skip:(!$IsWindows) {
+  BeforeEach {
+    $script:f=New-ReplayFixture (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+    $script:replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding=$f.Finding}
+  }
+  It 'rejects altered sibling <Name>' -ForEach @(@{Name='PdfFilter.dll'},@{Name='libmupdf.dll'}) {
+    Add-Content -LiteralPath (Join-Path (Split-Path $f.HarnessExe) $Name) -Value 'changed'
+    { & $script:replay @replayParams } | Should -Throw '*Parser SHA-256 mismatch*'
+  }
+  It 'rejects a missing sibling parser' {
+    Remove-Item -LiteralPath (Join-Path (Split-Path $f.HarnessExe) 'PdfFilter.dll')
+    { & $script:replay @replayParams } | Should -Throw '*Parser binary missing*'
+  }
+  It 'rejects a redirected campaign root' {
+    $outside=Join-Path (Split-Path $f.RunDir) 'outside'
+    Move-Item -LiteralPath $f.RunDir -Destination $outside
+    $null=New-Item -ItemType Junction -Path $f.RunDir -Target $outside
+    try { { & $script:replay @replayParams } | Should -Throw '*Reparse-point directory*' }
+    finally { [IO.Directory]::Delete($f.RunDir) }
+  }
+  It 'rejects a redirected finding directory' {
+    $hangs=Join-Path $f.RunDir 'hangs'
+    $outside=Join-Path (Split-Path $f.RunDir) 'outside hangs'
+    Move-Item -LiteralPath $hangs -Destination $outside
+    $null=New-Item -ItemType Junction -Path $hangs -Target $outside
+    try { { & $script:replay @replayParams } | Should -Throw '*Reparse-point directory*' }
+    finally { [IO.Directory]::Delete($hangs) }
   }
 }
