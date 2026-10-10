@@ -28,21 +28,21 @@ BeforeAll {
 Describe 'Real finding replay fails closed before executing native samples' -Skip:(!$IsWindows) {
   BeforeEach { $script:f=New-ReplayFixture (Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))) }
   It 'rejects an input absent from the evidence inventory' {
-    $args=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding='hangs/id_999999'}
-    { & $script:replay @args } | Should -Throw '*not an authentic untriaged sample*'
+    $replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding='hangs/id_999999'}
+    { & $script:replay @replayParams } | Should -Throw '*not an authentic untriaged sample*'
   }
   It 'rejects sample mutation after original hash collection' {
     Add-Content -LiteralPath $f.Sample -Value 'changed'
-    $args=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding=$f.Finding}
-    { & $script:replay @args } | Should -Throw '*Finding SHA-256 mismatch*'
+    $replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding=$f.Finding}
+    { & $script:replay @replayParams } | Should -Throw '*Finding SHA-256 mismatch*'
   }
   It 'rejects harness mutation after native run' {
     Add-Content -LiteralPath $f.HarnessExe -Value 'changed'
-    $args=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding=$f.Finding}
-    { & $script:replay @args } | Should -Throw '*Harness SHA-256 mismatch*'
+    $replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding=$f.Finding}
+    { & $script:replay @replayParams } | Should -Throw '*Harness SHA-256 mismatch*'
   }
   It 'rejects path traversal syntax' {
-    $args=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding='hangs/../outside.pdf'}
-    { & $script:replay @args } | Should -Throw '*Finding must name*'
+    $replayParams=@{EvidenceManifest=$f.EvidenceManifest;RunDir=$f.RunDir;HarnessExe=$f.HarnessExe;Finding='hangs/../outside.pdf'}
+    { & $script:replay @replayParams } | Should -Throw '*Finding must name*'
   }
 }
