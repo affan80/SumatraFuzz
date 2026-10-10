@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [dev, main, 'feat/**']
   push:
-    branches: [dev]
+    branches: [dev, main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0
-          Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+          Invoke-Pester -Path scripts/windows/tests -CI
       - name: Parse all Windows PowerShell scripts before expensive builds
         shell: pwsh
         run: |
@@ -75,6 +75,7 @@ jobs:
   native-real-engine:
     name: Real SumatraPDF parser
     runs-on: windows-2022
+    needs: [target-config, windows-tests, native-contract, debug-evidence-unit]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +111,8 @@ jobs:
         run: python3 -m unittest discover -s tools/instrumentation/tests -v
       - name: Verify actual WinAFL stats parser and deterministic seed generator
         run: python3 -m unittest discover -s tools/evidence/tests -v
+      - name: Verify preserved deterministic PDF fixture tests
+        run: python3 -m unittest discover -s scripts/windows/tests -p 'test_*.py' -v
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
@@ -214,5 +217,6 @@ jobs:
             runs/a5/campaign/campaign-metadata.json
             runs/a5/first.stats
             runs/a5/second.stats
+            external/native-tools/locks/target-lock.json
           if-no-files-found: warn
           retention-days: 7
