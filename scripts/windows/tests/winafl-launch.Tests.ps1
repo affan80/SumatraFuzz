@@ -13,40 +13,43 @@ BeforeAll {
     Set-Content -LiteralPath $bin -Value 'binary'
     $sha=(Get-FileHash $bin -Algorithm SHA256).Hash
     $lock=Join-Path $root 'lock.json'
-    @{architecture='x64';winafl_commit='fd85f38548b14352f4b70ad414f364ea6dc1a769';dynamorio_release='cronbuild-11.91.20735';dynamorio_bin64=$root;tools=@{
+    @{architecture='x64';source_commit='16c59fde8b824ab54c56f23aef910a6fdd874ad0';tools=@{
       drrun=@{path=$bin;sha256=$sha};winafl_client=@{path=$bin;sha256=$sha};afl_fuzz=@{path=$bin;sha256=$sha}
     }} | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $lock
     $debug=Join-Path $root 'debug.json'
-    @{source='observed-dynamorio-debug';target_module='sumatrafuzz-harness.exe';target_method='fuzz_one_file';
-      nargs=1;iterations=10;nonzero_coverage_slots=1;
-      observed_modules=@('PdfFilter.dll');harness_sha256=(Get-FileHash $harness -Algorithm SHA256).Hash.ToLowerInvariant();
+    foreach ($name in @('PdfFilter.dll','libmupdf.dll')) { Set-Content -LiteralPath (Join-Path $root $name) -Value 'parser fixture' }
+    @{target_commit='16c59fde8b824ab54c56f23aef910a6fdd874ad0';target_module='sumatrafuzz-harness.exe';target_method='fuzz_one_file';
+      cycles=10;confirmed_map_nonzero_bytes=1;
+      confirmed_modules=@('PdfFilter.dll','libmupdf.dll');harness_sha256=(Get-FileHash $harness -Algorithm SHA256).Hash.ToLowerInvariant();
+      pdf_filter_sha256=(Get-FileHash (Join-Path $root 'PdfFilter.dll') -Algorithm SHA256).Hash;
+      mupdf_sha256=(Get-FileHash (Join-Path $root 'libmupdf.dll') -Algorithm SHA256).Hash;
       toolchain_lock_sha256=(Get-FileHash $lock -Algorithm SHA256).Hash.ToLowerInvariant()} |
       ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $debug
-    return @{ToolchainLock=$lock;DebugEvidence=$debug;HarnessExe=$harness;InputDir=$input;OutputDir=(Join-Path $root 'fresh runs')}
+    return @{ToolchainLock=$lock;A4Manifest=$debug;HarnessExe=$harness;InputDir=$input;OutputDir=(Join-Path $root 'fresh runs')}
   }
 }
 Describe 'WinAFL campaign launcher preflight must fail closed' -Skip:(!$IsWindows) {
   BeforeEach { $script:f=New-CampaignFixture (Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))) }
   It 'rejects reused output directory' {
     [void](New-Item -Type Directory -Path $f.OutputDir -Force)
-    { & $script:runner @f } | Should -Throw '*already exists*'
+    { & $script:runner @f } | Should -Throw '*overwrite WinAFL campaign*'
   }
   It 'rejects missing debug evidence' {
-    Remove-Item -LiteralPath $f.DebugEvidence
-    { & $script:runner @f } | Should -Throw '*debug evidence*'
+    Remove-Item -LiteralPath $f.A4Manifest
+    { & $script:runner @f } | Should -Throw '*does not exist*'
   }
   It 'rejects a tampered binary hash' {
     Add-Content -LiteralPath ((Get-Content $f.ToolchainLock -Raw | ConvertFrom-Json).tools.afl_fuzz.path) -Value 'tampered'
-    { & $script:runner @f } | Should -Throw '*checksum*'
+    { & $script:runner @f } | Should -Throw '*Tool binary hash mismatch*'
   }
   It 'rejects changed harness after genuine debug run' {
     Add-Content -LiteralPath $f.HarnessExe -Value 'changed'
-    { & $script:runner @f } | Should -Throw '*harness checksum*'
+    { & $script:runner @f } | Should -Throw '*Parser binary changed since A4*'
   }
-  It 'rejects unsupported source of module observations' {
-    $x=Get-Content $f.DebugEvidence -Raw | ConvertFrom-Json
-    $x.source='manual-candidate-list'
-    $x | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $f.DebugEvidence
-    { & $script:runner @f } | Should -Throw '*DynamoRIO*'
+  It 'rejects evidence for a different pinned source' {
+    $x=Get-Content $f.A4Manifest -Raw | ConvertFrom-Json
+    $x.target_commit='unverified'
+    $x | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $f.A4Manifest
+    { & $script:runner @f } | Should -Throw '*A4 instrumented run evidence missing*'
   }
 }

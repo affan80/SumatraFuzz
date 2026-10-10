@@ -22,10 +22,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     const auto path = utf8(argv[argc - 1]);
     if (path.empty()) return 2;
-    if (!prepare_sumatra_runtime()) {
-        std::cerr << "Unable to load pinned PdfFilter.dll runtime\n";
-        return 3;
-    }
+    if (!prepare_sumatra_runtime()) { std::cerr << "SumatraPDF pinned runtime initialization failed\n"; return 3; }
     const int result = fuzz_one_file(path.c_str());
     release_sumatra_runtime();
     std::cout << (result == 0 ? "PARSED" : "REJECTED") << '\n';

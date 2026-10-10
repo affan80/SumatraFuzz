@@ -4,89 +4,93 @@ param(
   [Parameter(Mandatory)][string]$ToolchainLock,
   [Parameter(Mandatory)][string]$HarnessExe,
   [Parameter(Mandatory)][string]$InputPdf,
-  [Parameter(Mandatory)][string]$LogDir,
-  [ValidateRange(10,10000)][int]$Iterations=10
+  [Parameter(Mandatory)][string]$OutputDir
 )
 Set-StrictMode -Version Latest
-$ErrorActionPreference='Stop'
-if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Windows x64 required' }
-foreach($pair in @(@('ToolchainLock',$ToolchainLock),@('HarnessExe',$HarnessExe),@('InputPdf',$InputPdf),@('LogDir',$LogDir))) {
-  if (-not [IO.Path]::IsPathFullyQualified($pair[1])) { throw "$($pair[0]) must be absolute" }
+$ErrorActionPreference = 'Stop'
+if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
+  throw 'Real Windows x64 DynamoRIO runner required'
 }
-if (-not (Test-Path -LiteralPath $HarnessExe -PathType Leaf)) { throw 'Harness executable missing' }
-if (-not (Test-Path -LiteralPath $InputPdf -PathType Leaf)) { throw 'PDF input missing' }
-$lock=Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
-if ($lock.architecture -ne 'x64' -or $lock.winafl_commit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769' -or $lock.dynamorio_release -ne 'cronbuild-11.91.20735') { throw 'Unrecognized toolchain revision' }
-foreach($name in @('drrun','winafl_client','afl_fuzz')) {
-  $tool=$lock.tools.$name
-  if (-not (Test-Path -LiteralPath $tool.path -PathType Leaf)) { throw "Missing tool: $name" }
-  if ((Get-FileHash -LiteralPath $tool.path -Algorithm SHA256).Hash -ne $tool.sha256) { throw "Tool checksum mismatch: $name" }
+foreach ($p in @($ToolchainLock,$HarnessExe,$InputPdf,$OutputDir)) {
+  if (-not [IO.Path]::IsPathFullyQualified($p)) { throw "Absolute path required: $p" }
 }
-$target='sumatrafuzz-harness.exe'
-if ((Split-Path -Leaf $HarnessExe) -cne $target) { throw "Expected named target module: $target" }
-[void](New-Item -ItemType Directory -Path $LogDir -Force)
-$drrun=$lock.tools.drrun.path
-$client=$lock.tools.winafl_client.path
-function Invoke-DebugCycle([string]$SessionDir,[string[]]$Modules) {
-  [void](New-Item -ItemType Directory -Path $SessionDir -Force)
-  $argsList=@('-c',$client,'-debug','-logdir',$SessionDir,'-covtype','edge')
-  foreach($m in $Modules){$argsList+=@('-coverage_module',$m)}
-  $argsList+=@('-target_module',$target,'-target_method','fuzz_one_file','-fuzz_iterations',"$Iterations",'-nargs','1','--',$HarnessExe,$InputPdf)
-  & $drrun @argsList 2>&1 | Out-File -LiteralPath (Join-Path $SessionDir 'process-output.txt') -Encoding utf8
-  if ($LASTEXITCODE -ne 0) { throw "DynamoRIO debug returned nonzero ($LASTEXITCODE)" }
-  $logs=@(Get-ChildItem -LiteralPath $SessionDir -File -Filter '*.log')
-  if ($logs.Count -eq 0) { throw "Missing actual WinAFL debug log in $SessionDir" }
-  $raw=($logs | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
-  $pre=([regex]::Matches($raw,'pre_fuzz_handler')).Count
-  $post=([regex]::Matches($raw,'post_fuzz_handler')).Count
-  if ($pre -ne $Iterations -or $post -ne $Iterations) {
-    throw "Expected $Iterations pre/post handlers; observed pre=$pre post=$post"
-  }
-  return $raw
+$lock = Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
+if ($lock.acquisition.winafl_source_commit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769' -or
+    $lock.acquisition.dynamorio_release -ne 'cronbuild-11.91.20735') {
+  throw 'Unrecognized toolchain revision'
 }
-$discovery=Join-Path $LogDir '01-discovery'
-$raw=Invoke-DebugCycle $discovery @($target)
-# Module names are admitted ONLY if the live debug log mentions them.
-$observed=@()
-foreach($name in @('PdfFilter.dll','libmupdf.dll')) {
-  if ($raw -match [regex]::Escape($name)) { $observed+= $name }
+if ($lock.source_commit -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0' -or
+    $lock.architecture -ne 'x64' -or $lock.harness_entry -ne 'fuzz_one_file' -or $lock.nargs -ne 1) {
+  throw 'Pinned SumatraPDF toolchain contract mismatch'
 }
-if ($observed.Count -eq 0) { throw 'No genuine parser DLL module observed in WinAFL debug log' }
-$coverageRun=Join-Path $LogDir '02-parser-coverage'
-$raw2=Invoke-DebugCycle $coverageRun $observed
-# Pinned WinAFL winafl.c defines MAP_SIZE=65536 and writes the raw binary
-# 64KiB AFL map *after* 'Coverage map follows:' at the end of its debug log.
-# A textual mention of coverage is not evidence of nonzero instrumented edges.
-$nonzeroSlots=0
-$mapFound=$false
-foreach($log in @(Get-ChildItem -LiteralPath $coverageRun -File -Filter '*.log')) {
-  $bytes=[IO.File]::ReadAllBytes($log.FullName)
-  if ($bytes.Length -le 65536) { continue }
-  $mapStart=$bytes.Length - 65536
-  $prefix=[Text.Encoding]::ASCII.GetString($bytes,0,$mapStart)
-  if (-not $prefix.Contains('Coverage map follows:')) { continue }
-  $mapFound=$true
-  for($i=$mapStart;$i -lt $bytes.Length;$i++) {
-    if ($bytes[$i] -ne 0) { $nonzeroSlots++ }
-  }
+if ([IO.Path]::GetFileName($HarnessExe) -cne 'sumatrafuzz-harness.exe') {
+  throw 'Expected named target module: sumatrafuzz-harness.exe'
 }
-if (-not $mapFound) { throw 'No genuine 64KiB binary coverage map found in WinAFL log' }
-if ($nonzeroSlots -eq 0) { throw 'Parser coverage map is all zeroes; do not accept instrumentation' }
-$manifest=[ordered]@{
-  source='observed-dynamorio-debug'
-  checked_utc=[DateTime]::UtcNow.ToString('o')
-  target_module=$target
+foreach ($entry in @($lock.tools.drrun, $lock.tools.winafl_client, $lock.tools.afl_fuzz)) {
+  if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { throw "Missing tool: $($entry.path)" }
+  $hash = (Get-FileHash -LiteralPath $entry.path -Algorithm SHA256).Hash
+  if ($hash -ne $entry.sha256) { throw "Hash mismatch: $($entry.path)" }
+}
+foreach ($path in @($HarnessExe, $InputPdf,
+    (Join-Path (Split-Path $HarnessExe -Parent) 'PdfFilter.dll'),
+    (Join-Path (Split-Path $HarnessExe -Parent) 'libmupdf.dll'))) {
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Native input/component missing: $path" }
+}
+if (Test-Path -LiteralPath $OutputDir) { throw 'Refusing to overwrite an existing debug evidence directory' }
+$null=New-Item -ItemType Directory -Path $OutputDir -Force
+$debugTool = $lock.tools.drrun.path
+$client = $lock.tools.winafl_client.path
+$pythonScript = (Resolve-Path (Join-Path $PSScriptRoot '../../tools/instrumentation/verify_debug.py')).Path
+$harnessName = [IO.Path]::GetFileName($HarnessExe)
+& $HarnessExe $InputPdf
+if ($LASTEXITCODE -ne 0) { throw 'Genuine A3 parser rejected debug seed before instrumentation' }
+
+# Phase 1: Discover the module names from a genuine executed target. Its
+# all-zero bitmap does NOT certify coverage; the next run must confirm it.
+$discoveryDir=Join-Path $OutputDir 'discovery'
+$null=New-Item -ItemType Directory -Path $discoveryDir
+& $debugTool -c $client -debug -logdir $discoveryDir -target_module $harnessName `
+  -target_method 'fuzz_one_file' -fuzz_iterations 10 -nargs 1 -- $HarnessExe $InputPdf
+if ($LASTEXITCODE -ne 0) { throw "DynamoRIO discovery run failed: $LASTEXITCODE" }
+$files=@(Get-ChildItem -LiteralPath $discoveryDir -File -Recurse | Where-Object {$_.Name -like '*proc.log'})
+if ($files.Count -ne 1) { throw "Expected one real WinAFL debug log; got $($files.Count)" }
+$discoveryJson=Join-Path $OutputDir 'discovery.json'
+& python $pythonScript --log $files[0].FullName --out $discoveryJson --expected-cycles 10 --discovery-only
+if ($LASTEXITCODE -ne 0) { throw 'Real module discovery failed' }
+$observed=Get-Content -LiteralPath $discoveryJson -Raw | ConvertFrom-Json
+$modules=@($observed.confirmed_coverage_modules)
+if ($modules.Count -ne 2) { throw 'Unexpected actual parser coverage module count' }
+
+# Phase 2: Real edge feedback from the exact observed parser modules only.
+$confirmationDir=Join-Path $OutputDir 'confirmation'
+$null=New-Item -ItemType Directory -Path $confirmationDir
+$drArgs=@('-c',$client,'-debug','-logdir',$confirmationDir,'-covtype','edge')
+foreach($name in $modules) { $drArgs += @('-coverage_module',$name) }
+$drArgs += @('-target_module',$harnessName,'-target_method','fuzz_one_file',
+             '-fuzz_iterations','10','-nargs','1','--',$HarnessExe,$InputPdf)
+& $debugTool @drArgs
+if ($LASTEXITCODE -ne 0) { throw "DynamoRIO coverage confirmation failed: $LASTEXITCODE" }
+$confirmed=@(Get-ChildItem -LiteralPath $confirmationDir -File -Recurse | Where-Object {$_.Name -like '*proc.log'})
+if ($confirmed.Count -ne 1) { throw 'Expected one real confirmed WinAFL debug log' }
+$confirmedJson=Join-Path $OutputDir 'confirmed.json'
+& python $pythonScript --log $confirmed[0].FullName --out $confirmedJson --expected-cycles 10
+if ($LASTEXITCODE -ne 0) { throw 'No genuine repeated parser instrumentation/coverage' }
+$record=Get-Content -LiteralPath $confirmedJson -Raw | ConvertFrom-Json
+if ($record.bitmap_nonzero_bytes -lt 1) { throw 'Empty edge feedback map' }
+$manifest = [ordered]@{
+  target_commit=$lock.source_commit
+  target_module=$harnessName
   target_method='fuzz_one_file'
-  nargs=1
-  iterations=$Iterations
-  observed_modules=$observed
-  nonzero_coverage_slots=$nonzeroSlots
-  harness_sha256=(Get-FileHash -LiteralPath $HarnessExe -Algorithm SHA256).Hash.ToLowerInvariant()
-  input_sha256=(Get-FileHash -LiteralPath $InputPdf -Algorithm SHA256).Hash.ToLowerInvariant()
-  toolchain_lock_sha256=(Get-FileHash -LiteralPath $ToolchainLock -Algorithm SHA256).Hash.ToLowerInvariant()
-  raw_log_directory=[IO.Path]::GetFullPath($LogDir)
+  cycles=10
+  confirmed_modules=$modules
+  harness_sha256=(Get-FileHash -LiteralPath $HarnessExe -Algorithm SHA256).Hash
+  pdf_filter_sha256=(Get-FileHash -LiteralPath (Join-Path (Split-Path $HarnessExe -Parent) 'PdfFilter.dll') -Algorithm SHA256).Hash
+  mupdf_sha256=(Get-FileHash -LiteralPath (Join-Path (Split-Path $HarnessExe -Parent) 'libmupdf.dll') -Algorithm SHA256).Hash
+  input_sha256=(Get-FileHash -LiteralPath $InputPdf -Algorithm SHA256).Hash
+  confirmed_log_sha256=$record.sha256
+  confirmed_map_nonzero_bytes=$record.bitmap_nonzero_bytes
+  toolchain_lock_sha256=(Get-FileHash -LiteralPath $ToolchainLock -Algorithm SHA256).Hash
+  confirmed_log=$confirmed[0].FullName
 }
-$out=Join-Path $LogDir 'a4-debug-evidence.json'
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $out -Encoding utf8
-Write-Output "Observed $Iterations real pre/post cycles, $nonzeroSlots nonzero AFL map slots and parser modules: $($observed -join ', ')"
-Write-Output "A4 evidence (requires raw logs): $out"
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputDir 'a4-confirmed.json') -Encoding utf8
+Write-Output "A4 real DynamoRIO verification PASS: 10 pre/post cycles, nonzero edge map, observed modules: $($modules -join ', ')"

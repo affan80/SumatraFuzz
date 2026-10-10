@@ -42,4 +42,14 @@ if(SUMATRAFUZZ_REAL_ENGINE)
       "${SUMATRAFUZZ_PDF_FILTER_DLL}" "$<TARGET_FILE_DIR:real_engine_tests>/PdfFilter.dll")
   endif()
   add_test(NAME real_engine_tests COMMAND real_engine_tests)
+
+  add_executable(persistent_engine_tests tests/persistent_engine_tests.cpp src/sumatra_adapter.cpp)
+  target_link_libraries(persistent_engine_tests PRIVATE fuzz_contract shlwapi ole32 uuid)
+  target_compile_features(persistent_engine_tests PRIVATE cxx_std_17)
+  if(SUMATRAFUZZ_PDF_FILTER_DLL)
+    add_custom_command(TARGET persistent_engine_tests POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${SUMATRAFUZZ_PDF_FILTER_DLL}" "$<TARGET_FILE_DIR:persistent_engine_tests>/PdfFilter.dll")
+  endif()
+  add_test(NAME persistent_engine_tests COMMAND persistent_engine_tests)
 endif()
