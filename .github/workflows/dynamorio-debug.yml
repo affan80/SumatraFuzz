@@ -53,6 +53,31 @@ jobs:
             -InputPdf (Join-Path $cwd 'runs/seeds/01-minimal.pdf') `
             -LogDir (Join-Path $cwd 'runs/a4-debug') -Iterations 10
           if ($LASTEXITCODE -ne 0) { throw 'Real persistent instrumentation failed' }
+      - name: Run genuine bounded WinAFL campaign and require measured progress
+        shell: pwsh
+        run: |
+          $cwd=(Get-Location).Path
+          pwsh -File scripts/windows/run-winafl-smoke.ps1 `
+            -ToolchainLock (Join-Path $cwd 'external/winafl-tools/winafl-toolchain-lock.json') `
+            -DebugEvidence (Join-Path $cwd 'runs/a4-debug/a4-debug-evidence.json') `
+            -HarnessExe (Join-Path $cwd 'build/a3/Release/sumatrafuzz-harness.exe') `
+            -InputDir (Join-Path $cwd 'runs/seeds') `
+            -OutputDir (Join-Path $cwd 'runs/a5-smoke') -DurationSeconds 180 -MinExecutions 1000
+          if ($LASTEXITCODE -ne 0) { throw 'Real WinAFL campaign failed measured execution gates' }
+      - name: Retain sanitized native-run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-evidence-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            runs/a4-debug/**/*.log
+            runs/a4-debug/**/process-output.txt
+            runs/a4-debug/a4-debug-evidence.json
+            runs/a5-smoke/fuzzer_stats
+            runs/a5-smoke/a5-campaign-evidence.json
+            external/winafl-tools/winafl-toolchain-lock.json
       - name: Report evidence paths (do not publish raw corpus)
         if: always()
         shell: pwsh
