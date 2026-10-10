@@ -70,17 +70,17 @@ $parent=Split-Path $OutputDir -Parent
 $afl=[string]$lock.tools.afl_fuzz.path
 $client=[string]$lock.tools.winafl_client.path
 $drBin=Split-Path ([string]$lock.tools.drrun.path) -Parent
-$args=@('-i',$InputDir,'-o',$OutputDir,'-D',$drBin,'-w',$client,
+$aflArguments=@('-i',$InputDir,'-o',$OutputDir,'-D',$drBin,'-w',$client,
         '-t',[string]$TimeoutMs,'--','-covtype','edge')
-foreach ($name in $observed) { $args+=@('-coverage_module',[string]$name) }
-$args+=@('-target_module',[IO.Path]::GetFileName($HarnessExe),'-target_method','fuzz_one_file',
+foreach ($name in $observed) { $aflArguments+=@('-coverage_module',[string]$name) }
+$aflArguments+=@('-target_module',[IO.Path]::GetFileName($HarnessExe),'-target_method','fuzz_one_file',
          '-fuzz_iterations',[string]$FuzzIterations,'-nargs','1','--',$HarnessExe,'@@')
 $info=[Diagnostics.ProcessStartInfo]::new()
 $info.FileName=$afl
 $info.UseShellExecute=$false
 $info.CreateNoWindow=$true
 $info.WorkingDirectory=[IO.Path]::GetFullPath($parent)
-foreach ($arg in $args) { [void]$info.ArgumentList.Add([string]$arg) }
+foreach ($arg in $aflArguments) { [void]$info.ArgumentList.Add([string]$arg) }
 $info.Environment['AFL_NO_UI']='1'
 $begin=[DateTime]::UtcNow
 $proc=[Diagnostics.Process]::new()
@@ -122,7 +122,7 @@ $metadata=[ordered]@{
   start_utc=$begin.ToString('o')
   end_utc=[DateTime]::UtcNow.ToString('o')
   stop_reason=$stopReason
-  argv=@($afl) + $args
+  argv=@($afl) + $aflArguments
   source_commit=$lock.source_commit
   a4_evidence_sha256=(Get-FileHash -LiteralPath $A4Manifest -Algorithm SHA256).Hash
   stats_initial=(Get-FileHash -LiteralPath $first -Algorithm SHA256).Hash
