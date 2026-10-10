@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from sys import path as sys_path
 sys_path.insert(0,str(Path(__file__).resolve().parents[1]))
-from collect import collect, EvidenceError
+from collect import collect, finding_inventory, EvidenceError
 
 SHA='16c59fde8b824ab54c56f23aef910a6fdd874ad0'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -100,8 +100,124 @@ class EvidenceTests(unittest.TestCase):
         metadata['stats_later']=sha(self.after)
         (self.run/'campaign-metadata.json').write_text(json.dumps(metadata))
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
+    def set_observed_findings(self, *, crashes=0, hangs=0):
+        fields = ('execs_done: 2000\npaths_total: 2\n'
+                  f'unique_crashes: {crashes}\nunique_hangs: {hangs}\n')
+        self.after.write_text(fields)
+        (self.run/'fuzzer_stats').write_text(fields)
+        meta_path = self.run/'campaign-metadata.json'
+        meta = json.loads(meta_path.read_text())
+        meta['stats_later'] = sha(self.after)
+        meta_path.write_text(json.dumps(meta))
+
+    def test_hang_artifact_has_hash_replay_path_and_untriaged_status(self):
+        self.set_observed_findings(hangs=1)
+        hangs=self.run/'hangs'
+        hangs.mkdir()
+        data=hangs/'id_000001'
+        data.write_bytes(b'%PDF-1.4 malformed hang candidate')
+        result=collect(**self.kwargs())
+        self.assertEqual(len(result['hangs']),1)
+        self.assertEqual(result['hangs'][0]['sha256'],sha(data))
+        self.assertEqual(result['hangs'][0]['path'],'hangs/id_000001')
+        self.assertEqual(result['hangs'][0]['classification'],'untriaged')
+        self.assertEqual(result['hangs'][0]['replay_argv'],['sumatrafuzz-harness.exe','hangs/id_000001'])
+
+    def test_reported_hang_requires_genuine_hang_file(self):
+        self.set_observed_findings(hangs=1)
+        with self.assertRaisesRegex(EvidenceError,'hang'):
+            collect(**self.kwargs())
+
+    def test_crash_file_inventory_is_not_a_vulnerability_claim(self):
+        self.set_observed_findings(crashes=1)
+        folder=self.run/'crashes'
+        folder.mkdir()
+        sample=folder/'id_000002'
+        sample.write_bytes(b'%PDF-1.4 crash candidate')
+        result=collect(**self.kwargs())
+        self.assertEqual(len(result['crashes']),1)
+        self.assertEqual(result['crashes'][0]['sha256'],sha(sample))
+        self.assertEqual(result['crashes'][0]['classification'],'untriaged')
+        self.assertNotIn('severity',result['crashes'][0])
+
+    def test_untrusted_hang_symlink_cannot_escape_run_directory(self):
+        self.set_observed_findings(hangs=1)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        sample=folder/'id_000001'
+        try:
+            sample.symlink_to(self.h)
+        except (OSError,NotImplementedError):
+            self.skipTest('symlink creation unavailable')
+        with self.assertRaisesRegex(EvidenceError,'Unsafe hangs sample'):
+            collect(**self.kwargs())
+
+    def test_winAfl_crash_readme_is_not_a_replayable_crash(self):
+        self.set_observed_findings(crashes=1)
+        folder=self.run/'crashes'
+        folder.mkdir()
+        (folder/'README.txt').write_text('This folder contains crashes')
+        (folder/'id_000003').write_bytes(b'%PDF-1.4 crash candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual([x['path'] for x in manifest['crashes']],['crashes/id_000003'])
+
+    def test_reported_hangs_cannot_exceed_saved_artifact_count(self):
+        self.set_observed_findings(hangs=2)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        (folder/'id_000001').write_bytes(b'only one')
+        with self.assertRaisesRegex(EvidenceError,'hangs artifact count'):
+            collect(**self.kwargs())
+
+    def test_periodic_hang_counter_can_lag_saved_files_at_forced_stop(self):
+        self.set_observed_findings(hangs=1)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        for name in ('id_000000','id_000001'):
+            (folder/name).write_bytes(b'synthetic hang candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual(manifest['metrics']['unique_hangs'],1)
+        self.assertEqual(len(manifest['hangs']),2)
+        self.assertEqual(manifest['finding_counts']['hangs'],{
+            'reported_in_stats':1,'saved_artifacts':2,'additional_saved_artifacts':1})
+
+    def test_periodic_zero_crash_counter_does_not_hide_saved_file(self):
+        folder=self.run/'crashes'
+        folder.mkdir()
+        (folder/'id_000000').write_bytes(b'synthetic crash candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual(manifest['metrics']['unique_crashes'],0)
+        self.assertEqual(len(manifest['crashes']),1)
+        self.assertEqual(manifest['finding_counts']['crashes']['additional_saved_artifacts'],1)
+
+    def test_reported_crash_requires_genuine_crash_file(self):
+        self.set_observed_findings(crashes=1)
+        with self.assertRaisesRegex(EvidenceError,'crash'):
+            collect(**self.kwargs())
+
     def test_empty_queue_rejected(self):
         (self.run/'queue'/'id_000000').unlink()
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
 
 if __name__=='__main__':unittest.main()
+
+class FindingConfinementTests(unittest.TestCase):
+    def test_redirected_campaign_root_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            outside=root/'outside'; outside.mkdir()
+            (outside/'hangs').mkdir()
+            (outside/'hangs'/'id_000001').write_bytes(b'finding')
+            campaign=root/'campaign'; campaign.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, 'Unsafe'):
+                finding_inventory(campaign, 'hangs', 1)
+
+    def test_redirected_campaign_ancestor_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            outside=root/'outside'; outside.mkdir()
+            (outside/'campaign'/'hangs').mkdir(parents=True)
+            (outside/'campaign'/'hangs'/'id_000001').write_bytes(b'finding')
+            link=root/'redirect'; link.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, 'Unsafe'):
+                finding_inventory(link/'campaign', 'hangs', 1)
