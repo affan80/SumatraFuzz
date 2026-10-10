@@ -6,6 +6,7 @@ BeforeAll {
     $input=Join-Path $root 'valid seeds'
     [void](New-Item -ItemType Directory -Path $input -Force)
     Set-Content -LiteralPath (Join-Path $input 'seed.pdf') -Value '%PDF-1.4'
+    Set-Content -LiteralPath (Join-Path $input 'second.pdf') -Value '%PDF-1.4'
     $harness=Join-Path $root 'sumatrafuzz-harness.exe'
     $bin=Join-Path $root 'tool.bin'
     Set-Content -LiteralPath $harness -Value 'harness'
