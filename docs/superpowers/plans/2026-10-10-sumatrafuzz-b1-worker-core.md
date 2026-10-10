@@ -6,7 +6,7 @@
 
 **Architecture:** A small Rust workspace defines canonical worker identifiers and run states, persists authoritative state/events in worker-local SQLite, and delegates Windows execution to a testable `ProcessRunner` abstraction. The controller, REST/mTLS transport, SSE, evidence bundle sync and Tauri UI will be built in separately reviewed later increments.
 
-**Tech Stack:** Rust stable (pin `rust-toolchain.toml` during implementation), Cargo workspace, Serde, UUID, `thiserror`, `rusqlite` bundled SQLite, Tokio for timed supervision, `windows-sys` for Windows Job Objects. Use a single reviewed `Cargo.lock`; no Redis, PostgreSQL, microservices or task queues.
+**Tech Stack:** Rust stable (pin `rust-toolchain.toml` during implementation), Cargo workspace, Serde, UUID, `thiserror`, `chrono` for UTC event timestamps, `rusqlite` bundled SQLite, Tokio for timed supervision, `windows-sys` for Windows Job Objects. Use a single reviewed `Cargo.lock`; no Redis, PostgreSQL, microservices or task queues.
 
 **Spec:** [SumatraFuzz v1 local/remote desktop design](../specs/2026-10-10-sumatrafuzz-v1-local-remote-desktop-design.md). **Stage map:** [Stage B delivery map](2026-10-10-sumatrafuzz-stage-b-delivery-map.md).
 
