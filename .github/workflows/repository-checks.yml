@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0
-          Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+          Invoke-Pester -Path scripts/windows/tests -CI
   native-contract:
     name: Native C++ contract
     runs-on: windows-2022
@@ -76,3 +76,10 @@ jobs:
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
           if (-not $msbuild) { throw 'MSBuild unavailable' }
           pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+  pdf-seed-tests:
+    name: PDF seed determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actual deterministic fixture tests
+        run: python3 -m unittest discover -s scripts/windows/tests -p 'test_*.py' -v
