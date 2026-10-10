@@ -16,7 +16,7 @@ foreach($pair in @(@('ToolchainLock',$ToolchainLock),@('HarnessExe',$HarnessExe)
 if (-not (Test-Path -LiteralPath $HarnessExe -PathType Leaf)) { throw 'Harness executable missing' }
 if (-not (Test-Path -LiteralPath $InputPdf -PathType Leaf)) { throw 'PDF input missing' }
 $lock=Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
-if ($lock.architecture -ne 'x64' -or $lock.winafl_commit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769' -or $lock.dynamorio_release -ne 'release_11.3.0-1') { throw 'Unrecognized toolchain revision' }
+if ($lock.architecture -ne 'x64' -or $lock.winafl_commit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769' -or $lock.dynamorio_release -ne 'cronbuild-11.91.20735') { throw 'Unrecognized toolchain revision' }
 foreach($name in @('drrun','winafl_client','afl_fuzz')) {
   $tool=$lock.tools.$name
   if (-not (Test-Path -LiteralPath $tool.path -PathType Leaf)) { throw "Missing tool: $name" }

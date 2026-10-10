@@ -3,16 +3,16 @@
 param(
   [Parameter(Mandatory)][string]$Workspace,
   [string]$WinAflCommit='fd85f38548b14352f4b70ad414f364ea6dc1a769',
-  [string]$DynamoRioTag='release_11.3.0-1'
+  [string]$DynamoRioTag='cronbuild-11.91.20735'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Windows x64 required' }
 if (-not [IO.Path]::IsPathFullyQualified($Workspace)) { throw 'Workspace must be absolute' }
-if ($DynamoRioTag -ne 'release_11.3.0-1' -or $WinAflCommit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769') { throw 'Unexpected toolchain source revision' }
+if ($DynamoRioTag -ne 'cronbuild-11.91.20735' -or $WinAflCommit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769') { throw 'Unexpected toolchain source revision' }
 [void](New-Item -Type Directory -Path $Workspace -Force)
-$archive=Join-Path $Workspace 'DynamoRIO-Windows-11.3.0.zip'
-$uri='https://github.com/DynamoRIO/dynamorio/releases/download/release_11.3.0-1/DynamoRIO-Windows-11.3.0.zip'
+$archive=Join-Path $Workspace 'DynamoRIO-Windows-11.91.20735.zip'
+$uri='https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-11.91.20735/DynamoRIO-Windows-11.91.20735.zip'
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { Invoke-WebRequest -Uri $uri -OutFile $archive -MaximumRedirection 5 }
 $archiveHash=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 $unpack=Join-Path $Workspace 'DynamoRIO'

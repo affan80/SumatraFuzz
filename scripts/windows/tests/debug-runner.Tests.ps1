@@ -16,7 +16,7 @@ BeforeAll {
         @{
             architecture='x64'
             winafl_commit='fd85f38548b14352f4b70ad414f364ea6dc1a769'
-            dynamorio_release='release_11.3.0-1'
+            dynamorio_release='cronbuild-11.91.20735'
             tools=@{
                 drrun=@{path=$tool;sha256=$hash}
                 afl_fuzz=@{path=$tool;sha256=$hash}
