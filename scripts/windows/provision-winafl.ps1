@@ -7,8 +7,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $winAflCommit = 'fd85f38548b14352f4b70ad414f364ea6dc1a769'
-$drRelease = 'DynamoRIO-Windows-11.3.0.zip'
-$drUrl = "https://github.com/DynamoRIO/dynamorio/releases/download/release_11.3.0-1/$drRelease"
+$drRelease = 'DynamoRIO-Windows-11.91.20735.zip'
+$drUrl = "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-11.91.20735/$drRelease"
 if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
   throw 'Windows x64 required'
 }
@@ -42,6 +42,14 @@ if ($installs.Count -ne 1) {
 $drrun = $installs[0].drrun
 $drRoot = $installs[0].root
 $drConfig = $installs[0].config
+# Fail early and explicitly if the pinned SDK does not provide the API
+# required by WinAFL commit fd85f385. Earlier DynamoRIO 11.3 fails the link
+# with unresolved drmgr_register_exit_event.
+$drmgrHeaders = @(Get-ChildItem -LiteralPath (Join-Path $drRoot 'include') -Filter 'drmgr.h' -Recurse -File -ErrorAction Stop)
+if ($drmgrHeaders.Count -ne 1) { throw 'Expected a unique drmgr.h in pinned DynamoRIO SDK' }
+if (-not (Select-String -LiteralPath $drmgrHeaders[0].FullName -Pattern 'drmgr_register_exit_event' -Quiet)) {
+  throw 'Incompatible DynamoRIO SDK: drmgr_register_exit_event API is not declared'
+}
 Write-Output "Selected SDK-backed x64 DynamoRIO: $drrun"
 $src = Join-Path $Workspace 'winafl-source'
 if (-not (Test-Path -LiteralPath $src -PathType Container)) {
@@ -70,10 +78,10 @@ $lockPath = Join-Path $lockDir 'target-lock.json'
 if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { throw 'target-lock.json missing' }
 $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
 $lock | Add-Member -NotePropertyName acquisition -NotePropertyValue ([ordered]@{
-  dynamorio_release = 'release_11.3.0-1'
+  dynamorio_release = 'cronbuild-11.91.20735'
   dynamorio_archive_url = $drUrl
   dynamorio_archive_sha256 = $archiveHash
-  dynamorio_source_commit = '6847bb210bea0ca11d1bf47704383d6a075da490'
+  dynamorio_source_commit = '53f74f09dcb548531d08b2d76b37daa05fe58908'
   winafl_source_commit = $winAflCommit
   winafl_repository = 'https://github.com/googleprojectzero/winafl'
 }) -Force
