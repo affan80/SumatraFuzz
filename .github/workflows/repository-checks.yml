@@ -1,9 +1,9 @@
 name: Repository checks
 on:
   pull_request:
-    branches: [dev, main]
+    branches: [dev, main, 'feat/**']
   push:
-    branches: [dev, 'feat/**', 'fix/**', 'test/**', 'chore/**']
+    branches: [dev]
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,6 +43,21 @@ jobs:
         run: |
           Import-Module Pester -MinimumVersion 5.0
           Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+      - name: Parse all Windows PowerShell scripts before expensive builds
+        shell: pwsh
+        run: |
+          $paths = @(Get-ChildItem -Path scripts/windows -Filter '*.ps1' -Recurse -File)
+          if ($paths.Count -lt 3) { throw 'Expected native Windows verification scripts not found' }
+          foreach ($file in $paths) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
+              throw "PowerShell script fails parser validation: $($file.FullName)"
+            }
+            Write-Output "PowerShell parse OK: $($file.FullName)"
+          }
   native-contract:
     name: Native C++ contract
     runs-on: windows-2022
@@ -76,3 +91,69 @@ jobs:
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
           if (-not $msbuild) { throw 'MSBuild unavailable' }
           pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+      - name: Publish verified pinned SumatraPDF artifacts for instrumentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-a3-native-${{ github.run_id }}
+          path: |
+            build/a3/Release/sumatrafuzz-harness.exe
+            build/a3/Release/PdfFilter.dll
+            build/a3/Release/libmupdf.dll
+          if-no-files-found: error
+          retention-days: 7
+  debug-evidence-unit:
+    name: DynamoRIO debug evidence parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject incomplete fake, crashed and empty instrumentation records
+        run: python3 -m unittest discover -s tools/instrumentation/tests -v
+  real-dynamorio:
+    name: DynamoRIO persistent debug
+    runs-on: windows-2022
+    needs: [windows-tests, debug-evidence-unit, native-real-engine]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pinned SumatraPDF 3.6.1rel
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 3.6.1rel https://github.com/sumatrapdfreader/sumatrapdf.git external/sumatrapdf
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned upstream clone failed' }
+          $sha = (& git -C external/sumatrapdf rev-parse HEAD).Trim()
+          if ($sha -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0') { throw 'Pinned Sumatra source drift' }
+      - name: Load genuine CTest-verified pinned SumatraPDF binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-a3-native-${{ github.run_id }}
+          path: build/a3/Release
+      - name: Assert intact parser artifacts before instrumenting
+        shell: pwsh
+        run: |
+          foreach ($name in @('sumatrafuzz-harness.exe','PdfFilter.dll','libmupdf.dll')) {
+            $path = Join-Path (Get-Location) "build/a3/Release/$name"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing real artifact: $path" }
+            Write-Output "$name SHA256=$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash)"
+          }
+      - name: Provision pinned source-built WinAFL and DynamoRIO
+        shell: pwsh
+        run: |
+          pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
+      - name: Genuine 10-cycle DynamoRIO debug with actual edge feedback
+        shell: pwsh
+        run: |
+          $repo = (Get-Location).Path
+          $seed = Join-Path $repo 'runs/a4/seed.pdf'
+          python tools/instrumentation/make_debug_seed.py --out $seed
+          if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
+          pwsh -File scripts/windows/run-dynamorio-debug.ps1 `
+            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
+            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
+            -InputPdf $seed -OutputDir (Join-Path $repo 'runs/a4/debug-evidence')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a4-genuine-dynamorio-debug-${{ github.run_id }}
+          path: runs/a4/debug-evidence/
+          if-no-files-found: warn
+          retention-days: 7

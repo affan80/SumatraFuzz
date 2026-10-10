@@ -1,4 +1,5 @@
 #include "fuzz_contract.h"
+#include "sumatra_runtime.h"
 #include <windows.h>
 #include <filesystem>
 #include <fstream>
@@ -35,12 +36,14 @@ int main() {
 
     { std::ofstream out(path, std::ios::binary); out << pdf; }
     const auto bytes = path.u8string();
+    require(prepare_sumatra_runtime(), "pinned SumatraPDF runtime must initialize");
     require(fuzz_one_file(bytes.c_str()) == 0, "genuine Sumatra PDF engine should parse basic PDF");
     require(fuzz_one_file(bytes.c_str()) == 0, "repeated valid PDF should parse");
     { std::ofstream out(path, std::ios::binary | std::ios::trunc); }
     require(fuzz_one_file(bytes.c_str()) == 1, "empty PDF rejected by real engine");
     { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << "%PDF-1.4\n"; }
     require(fuzz_one_file(bytes.c_str()) == 1, "truncated PDF rejected by real engine");
+    release_sumatra_runtime();
     std::error_code ec;
     require(fs::remove(path, ec) && !ec, "released engine must not hold file lock");
     std::cout << "Real SumatraPDF parser: PASS\n";

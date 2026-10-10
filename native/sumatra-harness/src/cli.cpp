@@ -1,4 +1,5 @@
 #include "fuzz_contract.h"
+#include "sumatra_runtime.h"
 #include <windows.h>
 #include <string>
 #include <iostream>
@@ -21,7 +22,9 @@ int wmain(int argc, wchar_t** argv) {
     }
     const auto path = utf8(argv[argc - 1]);
     if (path.empty()) return 2;
+    if (!prepare_sumatra_runtime()) { std::cerr << "SumatraPDF pinned runtime initialization failed\n"; return 3; }
     const int result = fuzz_one_file(path.c_str());
+    release_sumatra_runtime();
     std::cout << (result == 0 ? "PARSED" : "REJECTED") << '\n';
     return result;
 }
