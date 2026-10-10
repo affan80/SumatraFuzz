@@ -33,8 +33,9 @@ def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dic
     """Inspect actual WinAFL crash/hang files, never synthesize findings.
 
     Only WinAFL's id_* artifacts count; an optional README is not a crash.
-    A discrepancy between saved artifacts and measured unique findings is an
-    explicit evidence failure rather than an invented replayable sample.
+    WinAFL writes statistics periodically. A bounded forced stop may leave
+    additional saved artifacts after the last stats snapshot; preserve both
+    observations without changing or inventing the reported counters.
     """
     if kind not in ('crashes', 'hangs'):
         raise EvidenceError(f'Unsupported finding kind: {kind}')
@@ -48,7 +49,7 @@ def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dic
     candidates = sorted(p for p in folder.iterdir() if p.name.startswith('id_'))
     if any(p.is_symlink() or not p.is_file() for p in candidates):
         raise EvidenceError(f'Unsafe {kind} sample: nonregular file or symlink')
-    if len(candidates) != observed_count:
+    if len(candidates) < observed_count:
         raise EvidenceError(
             f'{kind} artifact count {len(candidates)} differs from measured unique findings {observed_count}'
         )
@@ -133,6 +134,12 @@ def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,bef
       'queue':[{'name':p.name,'sha256':digest(p),'bytes':p.stat().st_size} for p in inputs],
       'crashes': crashes,
       'hangs': hangs,
+      'finding_counts': {
+          kind: {'reported_in_stats': final[counter], 'saved_artifacts': len(items),
+                 'additional_saved_artifacts': len(items) - final[counter]}
+          for kind, counter, items in (('crashes','unique_crashes',crashes),
+                                      ('hangs','unique_hangs',hangs))
+      },
       'raw_stats_sha256':digest(run_dir/'fuzzer_stats'),
       'binary_hashes':{
          'harness':digest(harness),'PdfFilter.dll':digest(folder/'PdfFilter.dll'),

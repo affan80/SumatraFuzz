@@ -161,13 +161,34 @@ class EvidenceTests(unittest.TestCase):
         manifest=collect(**self.kwargs())
         self.assertEqual([x['path'] for x in manifest['crashes']],['crashes/id_000003'])
 
-    def test_hang_counter_must_equal_saved_artifact_count(self):
+    def test_reported_hangs_cannot_exceed_saved_artifact_count(self):
         self.set_observed_findings(hangs=2)
         folder=self.run/'hangs'
         folder.mkdir()
         (folder/'id_000001').write_bytes(b'only one')
         with self.assertRaisesRegex(EvidenceError,'hangs artifact count'):
             collect(**self.kwargs())
+
+    def test_periodic_hang_counter_can_lag_saved_files_at_forced_stop(self):
+        self.set_observed_findings(hangs=1)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        for name in ('id_000000','id_000001'):
+            (folder/name).write_bytes(b'synthetic hang candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual(manifest['metrics']['unique_hangs'],1)
+        self.assertEqual(len(manifest['hangs']),2)
+        self.assertEqual(manifest['finding_counts']['hangs'],{
+            'reported_in_stats':1,'saved_artifacts':2,'additional_saved_artifacts':1})
+
+    def test_periodic_zero_crash_counter_does_not_hide_saved_file(self):
+        folder=self.run/'crashes'
+        folder.mkdir()
+        (folder/'id_000000').write_bytes(b'synthetic crash candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual(manifest['metrics']['unique_crashes'],0)
+        self.assertEqual(len(manifest['crashes']),1)
+        self.assertEqual(manifest['finding_counts']['crashes']['additional_saved_artifacts'],1)
 
     def test_reported_crash_requires_genuine_crash_file(self):
         self.set_observed_findings(crashes=1)

@@ -15,12 +15,20 @@ file, it records its relative path, SHA-256, byte size, replay argv and
 `classification: untriaged`. It never fabricates an input for a counter.
 
 The verifier **fails closed** if a nonzero unique crash/hang count has no
-corresponding saved artifact, the file count differs from reported unique
+corresponding saved artifact, fewer files are saved than the reported unique
 findings, or a finding path is a symlink/nonregular file. Ordinary README
 files do not count as crash samples. Raw PDFs and dump files remain private
 under the ignored `runs/` directory and are **not** uploaded to public
 GitHub Actions artifacts. A summary with hashes is safe to retain only
 after reviewing sample identifiers for sensitive content.
+
+Pinned WinAFL writes `fuzzer_stats` periodically while saving individual
+findings as they occur. The bounded runner explicitly records a forced stop,
+so the final statistics file may precede the last saved sample. The manifest
+preserves the original `metrics` unchanged and records `finding_counts` with
+`reported_in_stats`, `saved_artifacts`, and `additional_saved_artifacts` for
+each kind. Additional files are hashed and remain untriaged; they do not
+silently increase reported WinAFL counters or establish reproducibility.
 
 A `unique_hangs` counter is not evidence that each hang is reproducible;
 the final report must distinguish saved findings, reproducible timeouts,
