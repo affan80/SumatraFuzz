@@ -184,6 +184,26 @@ jobs:
             -InputDir (Join-Path $repo 'runs/a5/seeds') `
             -OutputDir (Join-Path $repo 'runs/a5/campaign') `
             -DurationSeconds 180 -TimeoutMs 20000 -FuzzIterations 1000
+      - name: Collect A6 verified native evidence
+        shell: pwsh
+        run: |
+          $repo = (Get-Location).Path
+          python tools/evidence/collect.py `
+            --toolchain-lock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
+            --a4-manifest (Join-Path $repo 'runs/a4/debug-evidence/a4-confirmed.json') `
+            --harness (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
+            --run-dir (Join-Path $repo 'runs/a5/campaign') `
+            --before-stats (Join-Path $repo 'runs/a5/first.stats') `
+            --after-stats (Join-Path $repo 'runs/a5/second.stats') `
+            --output (Join-Path $repo 'runs/a6/evidence.json')
+          if ($LASTEXITCODE -ne 0) { throw 'A6 cryptographic evidence verification failed' }
+      - name: Upload verified A6 manifest (no crash or queue inputs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: a6-verified-summary-${{ github.run_id }}
+          path: runs/a6/evidence.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Save non-sensitive WinAFL counters and run metadata
         if: always()
         uses: actions/upload-artifact@v4
