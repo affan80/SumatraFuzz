@@ -16,7 +16,8 @@ file, it records its relative path, SHA-256, byte size, replay argv and
 
 The verifier **fails closed** if a nonzero unique crash/hang count has no
 corresponding saved artifact, fewer files are saved than the reported unique
-findings, or a finding path is a symlink/nonregular file. Ordinary README
+findings, or a finding path is a symlink/nonregular file. Campaign roots and directory
+ancestors must also be free of symlinks and Windows reparse points. Ordinary README
 files do not count as crash samples. Raw PDFs and dump files remain private
 under the ignored `runs/` directory and are **not** uploaded to public
 GitHub Actions artifacts. A summary with hashes is safe to retain only
@@ -49,8 +50,8 @@ pwsh -File scripts/windows/replay-input.ps1 `
 
 Replace the `-Finding` value with an actual `path` from the manifest. The
 script checks that the finding is inventoried, matches its SHA-256, does not
-escape the run directory, and that the harness matches its original binary
-hash. Only then does it invoke the genuine C++ harness with discrete argv.
+escape the run directory through redirected parents, and that the harness
+and both sibling parser DLLs match their original binary hashes. Only then does it invoke the genuine C++ harness with discrete argv.
 Administrator execution is refused. Exit 0 means parsed; exit 1 means
 controlled rejection; other exits need investigation. Replaying a hang with
 a real timeout or under debugger requires a separate, controlled triage

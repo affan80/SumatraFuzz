@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import stat
 from pathlib import Path
 import sys
 from stats import parse_stats, verify_progress, StatsError
@@ -29,6 +30,17 @@ def read_json(p:Path)->dict:
 def compare_file(p:Path,expected:str,label:str):
     if digest(p).lower()!=str(expected).lower():raise EvidenceError(f'SHA-256 mismatch for {label}: {p}')
 
+def reject_redirected_path(path: Path):
+    # Keep lexical ancestors: resolve() would hide the redirect being rejected.
+    absolute = path.absolute()
+    for part in (absolute, *absolute.parents):
+        try:
+            attrs = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(attrs.st_mode) or getattr(attrs, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise EvidenceError(f'Unsafe finding path: redirected component {part}')
+
 def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dict]:
     """Inspect actual WinAFL crash/hang files, never synthesize findings.
 
@@ -40,6 +52,7 @@ def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dic
     if kind not in ('crashes', 'hangs'):
         raise EvidenceError(f'Unsupported finding kind: {kind}')
     folder = run_dir / kind
+    reject_redirected_path(folder)
     if not folder.exists():
         if observed_count == 0:
             return []
@@ -47,7 +60,12 @@ def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dic
     if folder.is_symlink() or not folder.is_dir():
         raise EvidenceError(f'Unsafe or invalid {kind} artifact directory')
     candidates = sorted(p for p in folder.iterdir() if p.name.startswith('id_'))
-    if any(p.is_symlink() or not p.is_file() for p in candidates):
+    for candidate in candidates:
+        try:
+            reject_redirected_path(candidate)
+        except EvidenceError as exc:
+            raise EvidenceError(f'Unsafe {kind} sample: {exc}') from exc
+    if any(not p.is_file() for p in candidates):
         raise EvidenceError(f'Unsafe {kind} sample: nonregular file or symlink')
     if len(candidates) < observed_count:
         raise EvidenceError(

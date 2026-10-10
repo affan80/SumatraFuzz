@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from sys import path as sys_path
 sys_path.insert(0,str(Path(__file__).resolve().parents[1]))
-from collect import collect, EvidenceError
+from collect import collect, finding_inventory, EvidenceError
 
 SHA='16c59fde8b824ab54c56f23aef910a6fdd874ad0'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -200,3 +200,24 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
 
 if __name__=='__main__':unittest.main()
+
+class FindingConfinementTests(unittest.TestCase):
+    def test_redirected_campaign_root_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            outside=root/'outside'; outside.mkdir()
+            (outside/'hangs').mkdir()
+            (outside/'hangs'/'id_000001').write_bytes(b'finding')
+            campaign=root/'campaign'; campaign.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, 'Unsafe'):
+                finding_inventory(campaign, 'hangs', 1)
+
+    def test_redirected_campaign_ancestor_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            outside=root/'outside'; outside.mkdir()
+            (outside/'campaign'/'hangs').mkdir(parents=True)
+            (outside/'campaign'/'hangs'/'id_000001').write_bytes(b'finding')
+            link=root/'redirect'; link.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, 'Unsafe'):
+                finding_inventory(link/'campaign', 'hangs', 1)

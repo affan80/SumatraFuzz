@@ -35,6 +35,14 @@ $record = $matches[0]
 $root = [IO.Path]::GetFullPath($RunDir).TrimEnd('\') + '\'
 $artifact = [IO.Path]::GetFullPath((Join-Path $RunDir ($Finding -replace '/','\')))
 if (-not $artifact.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw 'Finding path escapes campaign' }
+# Check lexical parents before reading the sample. Resolving first could hide a junction.
+$directory = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($artifact))
+while ($null -ne $directory) {
+  if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Reparse-point directory is prohibited: $($directory.FullName)"
+  }
+  $directory = $directory.Parent
+}
 if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) { throw 'Recorded finding file missing' }
 $attributes = [IO.File]::GetAttributes($artifact)
 if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse-point finding files are prohibited' }
@@ -43,6 +51,15 @@ if ((Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash -ne $record.sha
 }
 if ((Get-FileHash -LiteralPath $HarnessExe -Algorithm SHA256).Hash -ne $evidence.binary_hashes.harness) {
   throw 'Harness SHA-256 mismatch: executable changed since the campaign'
+}
+
+foreach ($name in @('PdfFilter.dll','libmupdf.dll')) {
+  $parser = Join-Path ([IO.Path]::GetDirectoryName($HarnessExe)) $name
+  if (-not (Test-Path -LiteralPath $parser -PathType Leaf)) { throw "Parser binary missing: $name" }
+  $expected = $evidence.binary_hashes.PSObject.Properties[$name]
+  if ($null -eq $expected -or (Get-FileHash -LiteralPath $parser -Algorithm SHA256).Hash -ne $expected.Value) {
+    throw "Parser SHA-256 mismatch: $name changed since the campaign"
+  }
 }
 
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
