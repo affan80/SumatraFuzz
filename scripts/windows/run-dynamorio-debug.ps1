@@ -54,7 +54,24 @@ foreach($name in @('PdfFilter.dll','libmupdf.dll')) {
 if ($observed.Count -eq 0) { throw 'No genuine parser DLL module observed in WinAFL debug log' }
 $coverageRun=Join-Path $LogDir '02-parser-coverage'
 $raw2=Invoke-DebugCycle $coverageRun $observed
-if ($raw2 -notmatch '(?i)coverage|afl.*map') { throw 'No coverage-map evidence found in parser instrumentation log' }
+# Pinned WinAFL winafl.c defines MAP_SIZE=65536 and writes the raw binary
+# 64KiB AFL map *after* 'Coverage map follows:' at the end of its debug log.
+# A textual mention of coverage is not evidence of nonzero instrumented edges.
+$nonzeroSlots=0
+$mapFound=$false
+foreach($log in @(Get-ChildItem -LiteralPath $coverageRun -File -Filter '*.log')) {
+  $bytes=[IO.File]::ReadAllBytes($log.FullName)
+  if ($bytes.Length -le 65536) { continue }
+  $mapStart=$bytes.Length - 65536
+  $prefix=[Text.Encoding]::ASCII.GetString($bytes,0,$mapStart)
+  if (-not $prefix.Contains('Coverage map follows:')) { continue }
+  $mapFound=$true
+  for($i=$mapStart;$i -lt $bytes.Length;$i++) {
+    if ($bytes[$i] -ne 0) { $nonzeroSlots++ }
+  }
+}
+if (-not $mapFound) { throw 'No genuine 64KiB binary coverage map found in WinAFL log' }
+if ($nonzeroSlots -eq 0) { throw 'Parser coverage map is all zeroes; do not accept instrumentation' }
 $manifest=[ordered]@{
   source='observed-dynamorio-debug'
   checked_utc=[DateTime]::UtcNow.ToString('o')
@@ -63,6 +80,7 @@ $manifest=[ordered]@{
   nargs=1
   iterations=$Iterations
   observed_modules=$observed
+  nonzero_coverage_slots=$nonzeroSlots
   harness_sha256=(Get-FileHash -LiteralPath $HarnessExe -Algorithm SHA256).Hash.ToLowerInvariant()
   input_sha256=(Get-FileHash -LiteralPath $InputPdf -Algorithm SHA256).Hash.ToLowerInvariant()
   toolchain_lock_sha256=(Get-FileHash -LiteralPath $ToolchainLock -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -70,5 +88,5 @@ $manifest=[ordered]@{
 }
 $out=Join-Path $LogDir 'a4-debug-evidence.json'
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $out -Encoding utf8
-Write-Output "Observed $Iterations real pre/post cycles and parser modules: $($observed -join ', ')"
+Write-Output "Observed $Iterations real pre/post cycles, $nonzeroSlots nonzero AFL map slots and parser modules: $($observed -join ', ')"
 Write-Output "A4 evidence (requires raw logs): $out"
