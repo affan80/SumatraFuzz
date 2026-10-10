@@ -88,8 +88,8 @@ $proc.StartInfo=$info
 if (-not $proc.Start()) { throw 'Real WinAFL process did not start' }
 $stopReason='unknown'
 $statsPath=Join-Path $OutputDir 'fuzzer_stats'
-$first=Join-Path $parent 'first.stats'
-$second=Join-Path $parent 'second.stats'
+$first=Join-Path $OutputDir 'first.stats'
+$second=Join-Path $OutputDir 'second.stats'
 $end=$begin.AddSeconds($DurationSeconds)
 try {
   while ([DateTime]::UtcNow -lt $end) {

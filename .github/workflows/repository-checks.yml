@@ -101,7 +101,7 @@ jobs:
             build/a3/Release/PdfFilter.dll
             build/a3/Release/libmupdf.dll
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
   debug-evidence-unit:
     name: DynamoRIO debug evidence parser
     runs-on: ubuntu-latest
@@ -161,7 +161,7 @@ jobs:
           name: a4-genuine-dynamorio-debug-${{ github.run_id }}
           path: runs/a4/debug-evidence/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30
 
       - name: Generate and verify genuine PDF seeds
         shell: pwsh
@@ -196,8 +196,8 @@ jobs:
             --a4-manifest (Join-Path $repo 'runs/a4/debug-evidence/a4-confirmed.json') `
             --harness (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
             --run-dir (Join-Path $repo 'runs/a5/campaign') `
-            --before-stats (Join-Path $repo 'runs/a5/first.stats') `
-            --after-stats (Join-Path $repo 'runs/a5/second.stats') `
+            --before-stats (Join-Path $repo 'runs/a5/campaign/first.stats') `
+            --after-stats (Join-Path $repo 'runs/a5/campaign/second.stats') `
             --output (Join-Path $repo 'runs/a6/evidence.json')
           if ($LASTEXITCODE -ne 0) { throw 'A6 cryptographic evidence verification failed' }
       - name: Upload verified A6 manifest (no crash or queue inputs)
@@ -215,8 +215,8 @@ jobs:
           path: |
             runs/a5/campaign/fuzzer_stats
             runs/a5/campaign/campaign-metadata.json
-            runs/a5/first.stats
-            runs/a5/second.stats
+            runs/a5/campaign/first.stats
+            runs/a5/campaign/second.stats
             external/native-tools/locks/target-lock.json
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30

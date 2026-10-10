@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import sys
 from stats import parse_stats, verify_progress, StatsError
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'instrumentation'))
+from verify_debug import inspect_debug_log, DebugLogError
 
 PIN='16c59fde8b824ab54c56f23aef910a6fdd874ad0'
 
@@ -42,6 +45,13 @@ def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,bef
     compare_file(folder/'libmupdf.dll',a4['mupdf_sha256'],'MuPDF component')
     raw_log=Path(a4['confirmed_log'])
     compare_file(raw_log,a4['confirmed_log_sha256'],'raw DynamoRIO log')
+    try:
+        observed=inspect_debug_log(raw_log.read_bytes(),expected_cycles=10,require_nonzero=True)
+    except (OSError,DebugLogError) as exc:
+        raise EvidenceError(f'Invalid raw DynamoRIO instrumentation: {exc}') from exc
+    if (observed['bitmap_nonzero_bytes'] != a4['confirmed_map_nonzero_bytes'] or
+        observed['confirmed_coverage_modules'] != a4['confirmed_modules']):
+        raise EvidenceError('A4 manifest coverage does not match raw instrumentation')
     try:
         before=parse_stats(before_stats.read_text(encoding='utf-8'))
         after=parse_stats(after_stats.read_text(encoding='utf-8'))

@@ -32,7 +32,12 @@ class EvidenceTests(unittest.TestCase):
             'winafl_client':{'path':str(self.w),'sha256':sha(self.w)},
             'afl_fuzz':{'path':str(self.afl),'sha256':sha(self.afl)}
         }}))
-        self.log=root/'winafl-debug-proc.log';self.log.write_bytes(b'real log content')
+        self.log=root/'winafl-debug-proc.log'
+        # Synthetic raw WinAFL-shaped log for unit tests; never native-run evidence.
+        prefix=('Module loaded, PdfFilter.dll\nModule loaded, libmupdf.dll\n'
+                + 'In pre_fuzz_handler\nIn post_fuzz_handler\n' * 10
+                + 'Everything appears to be running normally.\nCoverage map follows:\n')
+        self.log.write_bytes(prefix.encode() + bytes([1])*10 + bytes(65526))
         self.a4=root/'a4-confirmed.json';self.a4.write_text(json.dumps({
             'target_commit':SHA,'cycles':10,'confirmed_modules':['PdfFilter.dll','libmupdf.dll'],
             'confirmed_map_nonzero_bytes':10,'harness_sha256':sha(self.h),
@@ -63,6 +68,25 @@ class EvidenceTests(unittest.TestCase):
     def test_missing_raw_debug_log_rejected(self):
         self.log.unlink()
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
+    def test_self_hashed_narrative_log_is_not_instrumentation(self):
+        self.log.write_bytes(b'claimed ten cycles without actual WinAFL records')
+        a4=json.loads(self.a4.read_text())
+        a4['confirmed_log_sha256']=sha(self.log)
+        self.a4.write_text(json.dumps(a4))
+        metadata=json.loads((self.run/'campaign-metadata.json').read_text())
+        metadata['a4_evidence_sha256']=sha(self.a4)
+        (self.run/'campaign-metadata.json').write_text(json.dumps(metadata))
+        with self.assertRaisesRegex(EvidenceError,'instrumentation'):
+            collect(**self.kwargs())
+    def test_manifest_coverage_must_match_raw_log(self):
+        a4=json.loads(self.a4.read_text())
+        a4['confirmed_map_nonzero_bytes']=999
+        self.a4.write_text(json.dumps(a4))
+        metadata=json.loads((self.run/'campaign-metadata.json').read_text())
+        metadata['a4_evidence_sha256']=sha(self.a4)
+        (self.run/'campaign-metadata.json').write_text(json.dumps(metadata))
+        with self.assertRaisesRegex(EvidenceError,'coverage'):
+            collect(**self.kwargs())
     def test_missing_counter_rejected(self):
         (self.run/'fuzzer_stats').write_text('execs_done: 2000\n')
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
