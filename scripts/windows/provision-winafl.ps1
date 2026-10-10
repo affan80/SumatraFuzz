@@ -45,7 +45,7 @@ $drConfig = $installs[0].config
 # Fail early and explicitly if the pinned SDK does not provide the API
 # required by WinAFL commit fd85f385. Earlier DynamoRIO 11.3 fails the link
 # with unresolved drmgr_register_exit_event.
-$drmgrHeaders = @(Get-ChildItem -LiteralPath (Join-Path $drRoot 'include') -Filter 'drmgr.h' -Recurse -File -ErrorAction Stop)
+$drmgrHeaders = @(Get-ChildItem -LiteralPath (Join-Path $drRoot 'ext/include') -Filter 'drmgr.h' -Recurse -File -ErrorAction Stop)
 if ($drmgrHeaders.Count -ne 1) { throw 'Expected a unique drmgr.h in pinned DynamoRIO SDK' }
 if (-not (Select-String -LiteralPath $drmgrHeaders[0].FullName -Pattern 'drmgr_register_exit_event' -Quiet)) {
   throw 'Incompatible DynamoRIO SDK: drmgr_register_exit_event API is not declared'
