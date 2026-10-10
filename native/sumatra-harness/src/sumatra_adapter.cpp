@@ -3,6 +3,7 @@
 #endif
 
 #include "fuzz_contract.h"
+#include "sumatra_runtime.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <filter.h>
@@ -29,15 +30,12 @@ template <typename T> struct ComRef {
     T* get() const { return p; }
 };
 
-struct ModuleRef {
-    HMODULE h = nullptr;
-    ~ModuleRef() { if (h) FreeLibrary(h); }
+struct RuntimeState {
+    HMODULE module = nullptr;
+    DllGetClassObjectFn factory_fn = nullptr;
+    bool owns_com_apartment = false;
 };
-
-struct Apartment {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    ~Apartment() { if (SUCCEEDED(hr)) CoUninitialize(); }
-};
+thread_local RuntimeState runtime{};
 
 std::wstring to_wide_utf8(const char* input) {
     const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input, -1, nullptr, 0);
@@ -49,6 +47,46 @@ std::wstring to_wide_utf8(const char* input) {
 }
 } // namespace
 
+bool prepare_sumatra_runtime() {
+    if (runtime.module && runtime.factory_fn) return true;
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) return false;
+    const bool owns_com = SUCCEEDED(com);
+
+    wchar_t location[MAX_PATH] = {};
+    const DWORD count = GetModuleFileNameW(nullptr, location, MAX_PATH);
+    if (count == 0 || count >= MAX_PATH) {
+        if (owns_com) CoUninitialize();
+        return false;
+    }
+    const auto filter_path = std::filesystem::path(location).parent_path() / L"PdfFilter.dll";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(filter_path, ec) || ec) {
+        if (owns_com) CoUninitialize();
+        return false;
+    }
+    HMODULE module = LoadLibraryExW(filter_path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) {
+        if (owns_com) CoUninitialize();
+        return false;
+    }
+    auto fn = reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(module, "DllGetClassObject"));
+    if (!fn) {
+        FreeLibrary(module);
+        if (owns_com) CoUninitialize();
+        return false;
+    }
+    runtime = {module, fn, owns_com};
+    return true;
+}
+
+void release_sumatra_runtime() noexcept {
+    if (runtime.module) FreeLibrary(runtime.module);
+    if (runtime.owns_com_apartment) CoUninitialize();
+    runtime = {};
+}
+
 extern "C" int sumatra_parse_pdf(const char* input_path) {
     if (!input_path || !*input_path) return 1;
     const auto input = to_wide_utf8(input_path);
@@ -56,24 +94,10 @@ extern "C" int sumatra_parse_pdf(const char* input_path) {
 
     // No registry registration and no generic system PDF filter fallback.
     // The deployed DLL MUST come from the verified pinned SumatraPDF build.
-    wchar_t location[MAX_PATH] = {};
-    const DWORD count = GetModuleFileNameW(nullptr, location, MAX_PATH);
-    if (count == 0 || count >= MAX_PATH) return 1;
-    const auto filter_path = std::filesystem::path(location).parent_path() / L"PdfFilter.dll";
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(filter_path, ec) || ec) return 1;
-
-    Apartment apartment;
-    if (FAILED(apartment.hr) && apartment.hr != RPC_E_CHANGED_MODE) return 1;
-    ModuleRef dll;
-    dll.h = LoadLibraryExW(filter_path.c_str(), nullptr,
-                           LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!dll.h) return 1;
-    auto factory_fn = reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(dll.h, "DllGetClassObject"));
-    if (!factory_fn) return 1;
+    if (!runtime.factory_fn) return 1;
 
     ComRef<IClassFactory> factory;
-    if (FAILED(factory_fn(kPinnedPdfFilterClsid, IID_IClassFactory,
+    if (FAILED(runtime.factory_fn(kPinnedPdfFilterClsid, IID_IClassFactory,
                           reinterpret_cast<void**>(factory.out()))) || !factory.get()) return 1;
 
     ComRef<IFilter> filter;

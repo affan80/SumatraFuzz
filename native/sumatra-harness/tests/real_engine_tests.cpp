@@ -1,4 +1,5 @@
 #include "fuzz_contract.h"
+#include "sumatra_runtime.h"
 #include <windows.h>
 #include <filesystem>
 #include <fstream>
@@ -35,13 +36,30 @@ int main() {
 
     { std::ofstream out(path, std::ios::binary); out << pdf; }
     const auto bytes = path.u8string();
+    require(prepare_sumatra_runtime(), "pinned Sumatra runtime must initialize before fuzzing");
+    DWORD handlesBefore = 0;
+    require(GetProcessHandleCount(GetCurrentProcess(), &handlesBefore) != 0, "initial handle count");
     require(fuzz_one_file(bytes.c_str()) == 0, "genuine Sumatra PDF engine should parse basic PDF");
     require(fuzz_one_file(bytes.c_str()) == 0, "repeated valid PDF should parse");
     { std::ofstream out(path, std::ios::binary | std::ios::trunc); }
     require(fuzz_one_file(bytes.c_str()) == 1, "empty PDF rejected by real engine");
     { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << "%PDF-1.4\n"; }
     require(fuzz_one_file(bytes.c_str()) == 1, "truncated PDF rejected by real engine");
+    // Every entry must reopen the current file bytes, including after rejection.
+    for (int i = 0; i < 12; ++i) {
+        { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << pdf; }
+        require(fuzz_one_file(bytes.c_str()) == 0, "valid PDF must parse after rewritten file");
+        { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << "NOT A PDF"; }
+        require(fuzz_one_file(bytes.c_str()) == 1, "invalid rewrite must reject");
+    }
+    require(fuzz_one_file("does-not-exist-at-all.pdf") == 1, "nonexistent input is rejected");
+    DWORD handlesAfter = 0;
+    require(GetProcessHandleCount(GetCurrentProcess(), &handlesAfter) != 0, "final handle count");
+    require(handlesAfter <= handlesBefore + 8, "reentry leaked OS handles");
+    release_sumatra_runtime();
     std::error_code ec;
     require(fs::remove(path, ec) && !ec, "released engine must not hold file lock");
+    require(prepare_sumatra_runtime(), "runtime must support clean reinitialization");
+    release_sumatra_runtime();
     std::cout << "Real SumatraPDF parser: PASS\n";
 }
