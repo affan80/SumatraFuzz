@@ -49,6 +49,8 @@ def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,bef
         verify_progress(before,after)
         if final['execs_done'] < after['execs_done']:
             raise EvidenceError('Final execution counter is older than last snapshot')
+        if final['execs_done'] < 1000:
+            raise EvidenceError('WinAFL reference campaign has fewer than 1000 real executions')
     except (OSError,StatsError) as e:
         raise EvidenceError(f'Invalid WinAFL stats: {e}') from e
     metadata=read_json(run_dir/'campaign-metadata.json')
