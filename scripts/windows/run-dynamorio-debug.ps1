@@ -15,9 +15,16 @@ foreach ($p in @($ToolchainLock,$HarnessExe,$InputPdf,$OutputDir)) {
   if (-not [IO.Path]::IsPathFullyQualified($p)) { throw "Absolute path required: $p" }
 }
 $lock = Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
+if ($lock.acquisition.winafl_source_commit -ne 'fd85f38548b14352f4b70ad414f364ea6dc1a769' -or
+    $lock.acquisition.dynamorio_release -ne 'cronbuild-11.91.20735') {
+  throw 'Unrecognized toolchain revision'
+}
 if ($lock.source_commit -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0' -or
     $lock.architecture -ne 'x64' -or $lock.harness_entry -ne 'fuzz_one_file' -or $lock.nargs -ne 1) {
   throw 'Pinned SumatraPDF toolchain contract mismatch'
+}
+if ([IO.Path]::GetFileName($HarnessExe) -cne 'sumatrafuzz-harness.exe') {
+  throw 'Expected named target module: sumatrafuzz-harness.exe'
 }
 foreach ($entry in @($lock.tools.drrun, $lock.tools.winafl_client, $lock.tools.afl_fuzz)) {
   if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { throw "Missing tool: $($entry.path)" }

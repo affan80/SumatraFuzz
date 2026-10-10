@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [dev, main, 'feat/**']
   push:
-    branches: [dev]
+    branches: [dev, main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Verify source pin
         shell: bash
         run: |
@@ -34,6 +36,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Pester 5
         shell: pwsh
         run: |
@@ -42,7 +46,7 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0
-          Invoke-Pester -Path scripts/windows/tests/verify-toolchain.Tests.ps1 -CI
+          Invoke-Pester -Path scripts/windows/tests -CI
       - name: Parse all Windows PowerShell scripts before expensive builds
         shell: pwsh
         run: |
@@ -63,6 +67,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Configure Windows x64 harness contract
         shell: pwsh
         run: cmake -S native/sumatra-harness -B build/a2 -A x64 -DSUMATRAFUZZ_REAL_ENGINE=OFF
@@ -75,9 +81,12 @@ jobs:
   native-real-engine:
     name: Real SumatraPDF parser
     runs-on: windows-2022
+    needs: [target-config, windows-tests, native-contract, debug-evidence-unit]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Clone pinned SumatraPDF 3.6.1rel source
         shell: pwsh
         run: |
@@ -100,14 +109,20 @@ jobs:
             build/a3/Release/PdfFilter.dll
             build/a3/Release/libmupdf.dll
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
   debug-evidence-unit:
     name: DynamoRIO debug evidence parser
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Reject incomplete fake, crashed and empty instrumentation records
         run: python3 -m unittest discover -s tools/instrumentation/tests -v
+      - name: Verify actual WinAFL stats parser and deterministic seed generator
+        run: python3 -m unittest discover -s tools/evidence/tests -v
+      - name: Verify preserved deterministic PDF fixture tests
+        run: python3 -m unittest discover -s scripts/windows/tests -p 'test_*.py' -v
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
@@ -115,6 +130,8 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Check out pinned SumatraPDF 3.6.1rel
         shell: pwsh
         run: |
@@ -139,21 +156,38 @@ jobs:
         shell: pwsh
         run: |
           pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
-      - name: Genuine 10-cycle DynamoRIO debug with actual edge feedback
+      - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          $seed = Join-Path $repo 'runs/a4/seed.pdf'
-          python tools/instrumentation/make_debug_seed.py --out $seed
-          if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
-          pwsh -File scripts/windows/run-dynamorio-debug.ps1 `
-            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
-            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
-            -InputPdf $seed -OutputDir (Join-Path $repo 'runs/a4/debug-evidence')
+        timeout-minutes: 22
+        run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: a4-genuine-dynamorio-debug-${{ github.run_id }}
           path: runs/a4/debug-evidence/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30
+      - name: Upload verified A6 manifest (no crash or queue inputs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: a6-verified-summary-${{ github.run_id }}
+          path: |
+            runs/a6/evidence.json
+            runs/native-execution-context.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save non-sensitive WinAFL counters and run metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5-winafl-counters-${{ github.run_id }}
+          path: |
+            runs/a5/campaign/fuzzer_stats
+            runs/a5/campaign/campaign-metadata.json
+            runs/a5/campaign/first.stats
+            runs/a5/campaign/second.stats
+            external/native-tools/locks/target-lock.json
+            runs/native-gate.stdout.log
+            runs/native-gate.stderr.log
+          if-no-files-found: warn
+          retention-days: 30
