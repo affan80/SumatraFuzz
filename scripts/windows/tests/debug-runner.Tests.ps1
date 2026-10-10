@@ -11,6 +11,9 @@ BeforeAll {
         Set-Content -LiteralPath $exe -Value 'fake-harness'
         Set-Content -LiteralPath $pdf -Value '%PDF-1.4'
         Set-Content -LiteralPath $tool -Value 'fake-tool'
+        foreach ($name in @('PdfFilter.dll','libmupdf.dll')) {
+            Set-Content -LiteralPath (Join-Path $root $name) -Value 'parser fixture'
+        }
         $hash=(Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash
         $lock=Join-Path $root 'lock.json'
         @{
