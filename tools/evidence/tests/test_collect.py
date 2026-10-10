@@ -69,6 +69,13 @@ class EvidenceTests(unittest.TestCase):
     def test_stats_progress_required(self):
         self.after.write_text(self.before.read_text())
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
+    def test_too_few_executions_rejected(self):
+        (self.run/'fuzzer_stats').write_text('execs_done: 999\npaths_total: 2\nunique_crashes: 0\nunique_hangs: 0\n')
+        self.after.write_text('execs_done: 998\npaths_total: 2\nunique_crashes: 0\nunique_hangs: 0\n')
+        metadata=json.loads((self.run/'campaign-metadata.json').read_text())
+        metadata['stats_later']=sha(self.after)
+        (self.run/'campaign-metadata.json').write_text(json.dumps(metadata))
+        with self.assertRaises(EvidenceError):collect(**self.kwargs())
     def test_empty_queue_rejected(self):
         (self.run/'queue'/'id_000000').unlink()
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
