@@ -100,6 +100,51 @@ class EvidenceTests(unittest.TestCase):
         metadata['stats_later']=sha(self.after)
         (self.run/'campaign-metadata.json').write_text(json.dumps(metadata))
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
+    def set_observed_findings(self, *, crashes=0, hangs=0):
+        fields = ('execs_done: 2000\npaths_total: 2\n'
+                  f'unique_crashes: {crashes}\nunique_hangs: {hangs}\n')
+        self.after.write_text(fields)
+        (self.run/'fuzzer_stats').write_text(fields)
+        meta_path = self.run/'campaign-metadata.json'
+        meta = json.loads(meta_path.read_text())
+        meta['stats_later'] = sha(self.after)
+        meta_path.write_text(json.dumps(meta))
+
+    def test_hang_artifact_has_hash_replay_path_and_untriaged_status(self):
+        self.set_observed_findings(hangs=1)
+        hangs=self.run/'hangs'
+        hangs.mkdir()
+        data=hangs/'id_000001'
+        data.write_bytes(b'%PDF-1.4 malformed hang candidate')
+        result=collect(**self.kwargs())
+        self.assertEqual(len(result['hangs']),1)
+        self.assertEqual(result['hangs'][0]['sha256'],sha(data))
+        self.assertEqual(result['hangs'][0]['path'],'hangs/id_000001')
+        self.assertEqual(result['hangs'][0]['classification'],'untriaged')
+        self.assertEqual(result['hangs'][0]['replay_argv'],['sumatrafuzz-harness.exe','hangs/id_000001'])
+
+    def test_reported_hang_requires_genuine_hang_file(self):
+        self.set_observed_findings(hangs=1)
+        with self.assertRaisesRegex(EvidenceError,'hang'):
+            collect(**self.kwargs())
+
+    def test_crash_file_inventory_is_not_a_vulnerability_claim(self):
+        self.set_observed_findings(crashes=1)
+        folder=self.run/'crashes'
+        folder.mkdir()
+        sample=folder/'id_000002'
+        sample.write_bytes(b'%PDF-1.4 crash candidate')
+        result=collect(**self.kwargs())
+        self.assertEqual(len(result['crashes']),1)
+        self.assertEqual(result['crashes'][0]['sha256'],sha(sample))
+        self.assertEqual(result['crashes'][0]['classification'],'untriaged')
+        self.assertNotIn('severity',result['crashes'][0])
+
+    def test_reported_crash_requires_genuine_crash_file(self):
+        self.set_observed_findings(crashes=1)
+        with self.assertRaisesRegex(EvidenceError,'crash'):
+            collect(**self.kwargs())
+
     def test_empty_queue_rejected(self):
         (self.run/'queue'/'id_000000').unlink()
         with self.assertRaises(EvidenceError):collect(**self.kwargs())
