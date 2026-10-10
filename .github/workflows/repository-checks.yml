@@ -108,6 +108,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Reject incomplete fake, crashed and empty instrumentation records
         run: python3 -m unittest discover -s tools/instrumentation/tests -v
+      - name: Verify actual WinAFL stats parser and deterministic seed generator
+        run: python3 -m unittest discover -s tools/evidence/tests -v
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
@@ -155,5 +157,42 @@ jobs:
         with:
           name: a4-genuine-dynamorio-debug-${{ github.run_id }}
           path: runs/a4/debug-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Generate and verify genuine PDF seeds
+        shell: pwsh
+        run: |
+          $repo = (Get-Location).Path
+          $seeds = Join-Path $repo 'runs/a5/seeds'
+          python scripts/windows/generate_fixtures.py --out $seeds
+          if ($LASTEXITCODE -ne 0) { throw 'Deterministic PDF seed generation failed' }
+          $harness = Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe'
+          foreach ($file in @(Get-ChildItem -LiteralPath $seeds -Filter '*.pdf' -File)) {
+            & $harness $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Pinned SumatraPDF parser rejected a seed: $($file.Name)" }
+          }
+      - name: Genuine bounded WinAFL reference run
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $repo = (Get-Location).Path
+          pwsh -File scripts/windows/run-winafl-smoke.ps1 `
+            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
+            -A4Manifest (Join-Path $repo 'runs/a4/debug-evidence/a4-confirmed.json') `
+            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
+            -InputDir (Join-Path $repo 'runs/a5/seeds') `
+            -OutputDir (Join-Path $repo 'runs/a5/campaign') `
+            -DurationSeconds 180 -TimeoutMs 20000 -FuzzIterations 1000
+      - name: Save non-sensitive WinAFL counters and run metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5-winafl-counters-${{ github.run_id }}
+          path: |
+            runs/a5/campaign/fuzzer_stats
+            runs/a5/campaign/campaign-metadata.json
+            runs/a5/first.stats
+            runs/a5/second.stats
           if-no-files-found: warn
           retention-days: 7
