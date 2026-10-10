@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Verify source pin
         shell: bash
         run: |
@@ -34,6 +36,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Pester 5
         shell: pwsh
         run: |
@@ -63,6 +67,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Configure Windows x64 harness contract
         shell: pwsh
         run: cmake -S native/sumatra-harness -B build/a2 -A x64 -DSUMATRAFUZZ_REAL_ENGINE=OFF
@@ -79,6 +85,8 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Clone pinned SumatraPDF 3.6.1rel source
         shell: pwsh
         run: |
@@ -107,6 +115,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Reject incomplete fake, crashed and empty instrumentation records
         run: python3 -m unittest discover -s tools/instrumentation/tests -v
       - name: Verify actual WinAFL stats parser and deterministic seed generator
@@ -120,6 +130,8 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Check out pinned SumatraPDF 3.6.1rel
         shell: pwsh
         run: |
@@ -144,17 +156,10 @@ jobs:
         shell: pwsh
         run: |
           pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
-      - name: Genuine 10-cycle DynamoRIO debug with actual edge feedback
+      - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          $seed = Join-Path $repo 'runs/a4/seed.pdf'
-          python tools/instrumentation/make_debug_seed.py --out $seed
-          if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
-          pwsh -File scripts/windows/run-dynamorio-debug.ps1 `
-            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
-            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
-            -InputPdf $seed -OutputDir (Join-Path $repo 'runs/a4/debug-evidence')
+        timeout-minutes: 22
+        run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -162,49 +167,13 @@ jobs:
           path: runs/a4/debug-evidence/
           if-no-files-found: warn
           retention-days: 30
-
-      - name: Generate and verify genuine PDF seeds
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          $seeds = Join-Path $repo 'runs/a5/seeds'
-          python scripts/windows/generate_fixtures.py --out $seeds
-          if ($LASTEXITCODE -ne 0) { throw 'Deterministic PDF seed generation failed' }
-          $harness = Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe'
-          foreach ($file in @(Get-ChildItem -LiteralPath $seeds -Filter '*.pdf' -File)) {
-            & $harness $file.FullName
-            if ($LASTEXITCODE -ne 0) { throw "Pinned SumatraPDF parser rejected a seed: $($file.Name)" }
-          }
-      - name: Genuine bounded WinAFL reference run
-        shell: pwsh
-        timeout-minutes: 15
-        run: |
-          $repo = (Get-Location).Path
-          pwsh -File scripts/windows/run-winafl-smoke.ps1 `
-            -ToolchainLock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
-            -A4Manifest (Join-Path $repo 'runs/a4/debug-evidence/a4-confirmed.json') `
-            -HarnessExe (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
-            -InputDir (Join-Path $repo 'runs/a5/seeds') `
-            -OutputDir (Join-Path $repo 'runs/a5/campaign') `
-            -DurationSeconds 720 -TimeoutMs 20000 -FuzzIterations 1000
-      - name: Collect A6 verified native evidence
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          python tools/evidence/collect.py `
-            --toolchain-lock (Join-Path $repo 'external/native-tools/locks/target-lock.json') `
-            --a4-manifest (Join-Path $repo 'runs/a4/debug-evidence/a4-confirmed.json') `
-            --harness (Join-Path $repo 'build/a3/Release/sumatrafuzz-harness.exe') `
-            --run-dir (Join-Path $repo 'runs/a5/campaign') `
-            --before-stats (Join-Path $repo 'runs/a5/campaign/first.stats') `
-            --after-stats (Join-Path $repo 'runs/a5/campaign/second.stats') `
-            --output (Join-Path $repo 'runs/a6/evidence.json')
-          if ($LASTEXITCODE -ne 0) { throw 'A6 cryptographic evidence verification failed' }
       - name: Upload verified A6 manifest (no crash or queue inputs)
         uses: actions/upload-artifact@v4
         with:
           name: a6-verified-summary-${{ github.run_id }}
-          path: runs/a6/evidence.json
+          path: |
+            runs/a6/evidence.json
+            runs/native-execution-context.json
           if-no-files-found: error
           retention-days: 30
       - name: Save non-sensitive WinAFL counters and run metadata
@@ -218,5 +187,7 @@ jobs:
             runs/a5/campaign/first.stats
             runs/a5/campaign/second.stats
             external/native-tools/locks/target-lock.json
+            runs/native-gate.stdout.log
+            runs/native-gate.stderr.log
           if-no-files-found: warn
           retention-days: 30
