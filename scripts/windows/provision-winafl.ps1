@@ -21,6 +21,12 @@ if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
   Invoke-WebRequest -Uri $drUrl -OutFile $archive -ErrorAction Stop
 }
 $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+# GitHub's published SHA-256 digest for this exact immutable release asset.
+# Reject tampering, accidental asset replacement, and partial downloads.
+$expectedArchiveHash = '55724756d2646aa47ef3f67046b67c090ddc7b26f3f14d63fdc144a571d6a0e6'
+if ($archiveHash -ne $expectedArchiveHash) {
+  throw "Pinned DynamoRIO archive SHA-256 mismatch. Got $archiveHash; expected $expectedArchiveHash"
+}
 $unpacked = Join-Path $Workspace 'dynamorio'
 if (-not (Test-Path -LiteralPath $unpacked -PathType Container)) {
   Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -ErrorAction Stop
