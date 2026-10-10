@@ -3,7 +3,7 @@
 **Status:** DESIGN FOR USER REVIEW — no desktop or remote-worker implementation is authorized by this document.
 **Date:** 2026-10-10
 **Repository:** [affan80/SumatraFuzz](https://github.com/affan80/SumatraFuzz)
-**Dependencies:** Native Stage A4–A6 acceptance, verified on genuine Windows x64; see [roadmap](../../../ROADMAP.md).
+**Dependencies:** Native Stage A4–A6 acceptance, verified on genuine Windows x64; see [roadmap](../../ROADMAP.md).
 **Scope:** Stage B: local/remote campaign control, recovery, evidence synchronization, and a maintainable desktop user experience. Stage C advanced reporting is a follow-on.
 
 ## 1. Intent, users, and success
