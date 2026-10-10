@@ -1,0 +1,63 @@
+name: Real DynamoRIO persistent verification
+on:
+  push:
+    branches: ['feat/a4-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  dynamorio-debug:
+    name: DynamoRIO persistent debug
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact SumatraPDF revision
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 3.6.1rel https://github.com/sumatrapdfreader/sumatrapdf.git external/sumatrapdf
+          if ($LASTEXITCODE -ne 0) { throw 'SumatraPDF clone failed' }
+          $sha = (& git -C external/sumatrapdf rev-parse HEAD).Trim()
+          if ($sha -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0') { throw "Unexpected SumatraPDF revision $sha" }
+      - name: Build pinned real parser and harness
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild missing' }
+          pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
+          if ($LASTEXITCODE -ne 0) { throw 'Real harness build or tests failed' }
+      - name: Build pinned WinAFL against pinned DynamoRIO
+        shell: pwsh
+        run: |
+          pwsh -File scripts/windows/bootstrap-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/winafl-tools')
+          if ($LASTEXITCODE -ne 0) { throw 'Real toolchain provisioning failed' }
+      - name: Generate and validate both real PDF seeds
+        shell: pwsh
+        run: |
+          $seedDir = Join-Path (Get-Location) 'runs/seeds'
+          python scripts/windows/generate-fixtures.py --output-dir $seedDir
+          if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
+          $exe = Join-Path (Get-Location) 'build/a3/Release/sumatrafuzz-harness.exe'
+          foreach ($seed in (Get-ChildItem -LiteralPath $seedDir -Filter '*.pdf')) {
+            & $exe $seed.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Pinned Sumatra parser rejected seed $($seed.Name)" }
+          }
+      - name: Verify ten real WinAFL debug iterations and parser modules
+        shell: pwsh
+        run: |
+          $cwd=(Get-Location).Path
+          pwsh -File scripts/windows/run-dynamorio-debug.ps1 `
+            -ToolchainLock (Join-Path $cwd 'external/winafl-tools/winafl-toolchain-lock.json') `
+            -HarnessExe (Join-Path $cwd 'build/a3/Release/sumatrafuzz-harness.exe') `
+            -InputPdf (Join-Path $cwd 'runs/seeds/01-minimal.pdf') `
+            -LogDir (Join-Path $cwd 'runs/a4-debug') -Iterations 10
+          if ($LASTEXITCODE -ne 0) { throw 'Real persistent instrumentation failed' }
+      - name: Report evidence paths (do not publish raw corpus)
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Output 'Raw instrumentation evidence remains in ignored ephemeral runs/ directory.'
+          if (Test-Path 'runs/a4-debug/a4-debug-evidence.json') {
+            Get-Content 'runs/a4-debug/a4-debug-evidence.json'
+          }
