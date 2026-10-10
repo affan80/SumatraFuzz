@@ -72,6 +72,9 @@ Types and names in the tasks below are architectural contracts to preserve in la
 - `pub enum RunState { Created, Preparing, Running, Stopping, Completed, Failed, Interrupted }`
 - `pub struct CampaignLimits { max_duration_s: NonZeroU64, max_memory_bytes: NonZeroU64, max_disk_bytes: NonZeroU64, max_cpu_percent: NonZeroU8 }`
 - `pub struct RunRequest { request_id: Uuid, controller_id: ControllerId, input_bundle_id: String, target_lock_sha256: String, limits: CampaignLimits, label: String }`
+- `pub struct RunStatus { run_id: RunId, worker_id: WorkerId, state: RunState, last_event_seq: u64, stop_reason: Option<StopReason> }`
+- `pub struct RunEvent { run_id: RunId, seq: u64, time_utc: DateTime<Utc>, event_type: EventType, payload: serde_json::Value }`
+- `pub enum StopReason { Requested, TimeLimit, CpuLimit, MemoryLimit, DiskLimit, NativeExit, ProcessFailure, WorkerRestart }`
 - `pub fn valid_transition(from: RunState, to: RunState) -> bool`
 - `pub enum WorkerError { WorkerBusy, IdempotencyConflict, InvalidConfig, Unauthorized, UnsupportedPlatform, UnverifiedToolchain, LimitExceeded, InvalidTransition, ProcessError, StorageError }`
 
@@ -105,9 +108,10 @@ Types and names in the tasks below are architectural contracts to preserve in la
 **Interfaces:**
 - `pub struct SqliteRunStore { /* private SQLite connection pool or serialized writer */ }`
 - `pub fn append_state_event(&self, run: RunId, expected: RunState, next: RunState, event: RunEvent) -> Result<u64, StoreError>`
-- `pub fn claim_worker_slot(&self, request_id: Uuid, payload_digest: &str, run_id: RunId) -> Result<ClaimOutcome, StoreError>`
+- `pub fn claim_worker_slot(&self, controller_id: ControllerId, request_id: Uuid, payload_digest: &str, run_id: RunId) -> Result<ClaimOutcome, StoreError>`
 - `pub fn read_events_after(&self, run_id: RunId, seq: u64, limit: u32) -> Result<Vec<RunEvent>, StoreError>`
 - `pub enum ClaimOutcome { New(RunId), Existing(RunId), WorkerBusy }`
+- `pub enum StoreError { Migration, Constraint, IdempotencyConflict, InvalidTransition, Database }`
 
 - [ ] **Step 1:** Add RED tests: fresh migration, migrate-existing DB, one active persisted slot, duplicate command replay, same ID with changed digest -> conflict, run-local strict monotonic sequence, transactional state-and-event rollback on invalid transition.
 - [ ] **Step 2:** Implement transactional schema tables `schema_migrations`, `run_state`, `events`, `command_idempotency`, `worker_slot` (single key 1), `evidence_index`. Set foreign keys and WAL, use parameterized queries and unique constraints; no shared SQLite file across hosts.
@@ -157,12 +161,12 @@ Types and names in the tasks below are architectural contracts to preserve in la
 - Test: `crates/worker-core/tests/restart_recovery.rs`
 
 **Interfaces:**
-- `pub enum RecoveryOutcome { ResumedObserved, Interrupted(RunId), NoActiveRun }`
+- `pub enum RecoveryOutcome { Interrupted(RunId), NoActiveRun }`
 - `pub fn reconcile_startup(&self) -> Result<RecoveryOutcome, WorkerError>`
 - `pub fn finalize_run(&self, run_id: RunId, reason: StopReason) -> Result<RunStatus, WorkerError>`
 
 - [ ] **Step 1:** Write RED tests: stale DB active slot with no live process becomes `Interrupted`, a second startup never spawns another process, finalized artifact checksums remain stable, a crash does not claim `Completed`, and retrying finalization cannot overwrite an existing evidence artifact.
-- [ ] **Step 2:** Implement bounded reconciliation by verifying process identity/ownership if available; if not provable, safely terminate owned process tree and record `Interrupted`. Clear/release lease only in a journal transaction after process teardown or confirmed loss.
+- [ ] **Step 2:** Implement bounded reconciliation: the Windows Job Object uses kill-on-close, so a restarted worker must not assume a prior child remains safely owned or restart it. Terminate any verifiably owned residue, record `Interrupted`, and release the lease transactionally only after teardown or confirmed loss.
 - [ ] **Step 3:** Add failure tests: abruptly killed controller has no effect on worker; killed worker preserves last durable event and replays it after recovery; full filesystem prevents further artifact writes and records a failure without overwriting prior evidence.
 - [ ] **Step 4:** Add Rust unit and Windows lifecycle jobs to existing CI **without removing or weakening any native job**; run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-targets` and the existing genuine Windows A4–A6 gate.
 - [ ] **Step 5:** Record test command/output, pinned source, tool binary hashes, job IDs, transition and quota evidence in PR. Commit `test(worker): verify restart recovery and bounded execution`, request review and keep unmerged until green.
