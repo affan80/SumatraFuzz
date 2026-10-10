@@ -140,6 +140,35 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result['crashes'][0]['classification'],'untriaged')
         self.assertNotIn('severity',result['crashes'][0])
 
+    def test_untrusted_hang_symlink_cannot_escape_run_directory(self):
+        self.set_observed_findings(hangs=1)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        sample=folder/'id_000001'
+        try:
+            sample.symlink_to(self.h)
+        except (OSError,NotImplementedError):
+            self.skipTest('symlink creation unavailable')
+        with self.assertRaisesRegex(EvidenceError,'Unsafe hangs sample'):
+            collect(**self.kwargs())
+
+    def test_winAfl_crash_readme_is_not_a_replayable_crash(self):
+        self.set_observed_findings(crashes=1)
+        folder=self.run/'crashes'
+        folder.mkdir()
+        (folder/'README.txt').write_text('This folder contains crashes')
+        (folder/'id_000003').write_bytes(b'%PDF-1.4 crash candidate')
+        manifest=collect(**self.kwargs())
+        self.assertEqual([x['path'] for x in manifest['crashes']],['crashes/id_000003'])
+
+    def test_hang_counter_must_equal_saved_artifact_count(self):
+        self.set_observed_findings(hangs=2)
+        folder=self.run/'hangs'
+        folder.mkdir()
+        (folder/'id_000001').write_bytes(b'only one')
+        with self.assertRaisesRegex(EvidenceError,'hangs artifact count'):
+            collect(**self.kwargs())
+
     def test_reported_crash_requires_genuine_crash_file(self):
         self.set_observed_findings(crashes=1)
         with self.assertRaisesRegex(EvidenceError,'crash'):
