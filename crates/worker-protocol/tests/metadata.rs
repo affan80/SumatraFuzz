@@ -26,7 +26,10 @@ fn identifiers_reject_invalid_uuid_strings() {
         let encoded = serde_json::to_string(bad).expect("encode test input");
         assert!(serde_json::from_str::<RunId>(&encoded).is_err(), "{bad}");
         assert!(serde_json::from_str::<WorkerId>(&encoded).is_err(), "{bad}");
-        assert!(serde_json::from_str::<ControllerId>(&encoded).is_err(), "{bad}");
+        assert!(
+            serde_json::from_str::<ControllerId>(&encoded).is_err(),
+            "{bad}"
+        );
     }
 }
 
