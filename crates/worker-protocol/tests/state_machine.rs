@@ -1,9 +1,7 @@
 use serde_json::json;
 use std::num::{NonZeroU64, NonZeroU8};
 use uuid::Uuid;
-use worker_protocol::{
-    valid_transition, CampaignLimits, ControllerId, RunRequest, RunState,
-};
+use worker_protocol::{valid_transition, CampaignLimits, ControllerId, RunRequest, RunState};
 
 fn valid_request() -> RunRequest {
     RunRequest {
@@ -74,8 +72,8 @@ fn requests_reject_cpu_limits_above_100_percent() {
 #[test]
 fn requests_reject_missing_or_malformed_target_hashes_and_empty_bundle() {
     let mut request = valid_request();
-    for hash in ["", "not-a-sha", "A".repeat(63).as_str()] {
-        request.target_lock_sha256 = hash.to_owned();
+    for hash in ["".to_owned(), "not-a-sha".to_owned(), "A".repeat(63)] {
+        request.target_lock_sha256 = hash;
         assert!(request.validate().is_err(), "accepted invalid hash");
     }
     request.target_lock_sha256 = "f".repeat(64);
