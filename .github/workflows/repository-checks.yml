@@ -8,6 +8,31 @@ on:
 permissions:
   contents: read
 jobs:
+  rust-worker:
+    name: Rust worker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Show pinned Rust toolchain
+        run: rustc --version
+      - name: Resolve Cargo lockfile
+        run: cargo generate-lockfile
+      - name: Display first-party dependency lockfile for review
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: cat Cargo.lock
+      - name: Rust worker unit and integration tests
+        run: cargo test --workspace --all-targets
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Rust Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
   target-config:
     name: Target config
     runs-on: ubuntu-latest
