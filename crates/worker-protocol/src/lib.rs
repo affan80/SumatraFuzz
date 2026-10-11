@@ -1,8 +1,17 @@
 //! Canonical SumatraFuzz worker identity and command protocol.
 //! Deliberately free of transport and native process dependencies.
 
+mod errors;
+mod model;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub use errors::WorkerError;
+pub use model::{
+    valid_transition, CampaignLimits, EventType, RunEvent, RunRequest, RunState, RunStatus,
+    StopReason,
+};
 
 /// Stable identity for one concrete execution, never reused across workers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
