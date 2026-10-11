@@ -92,10 +92,16 @@ fn deserialization_rejects_zero_and_missing_resource_limits() {
     ] {
         let mut zero = valid.clone();
         zero["limits"][key] = json!(0);
-        assert!(serde_json::from_value::<RunRequest>(zero).is_err(), "{key}=0");
+        assert!(
+            serde_json::from_value::<RunRequest>(zero).is_err(),
+            "{key}=0"
+        );
         let mut absent = valid.clone();
         absent["limits"].as_object_mut().unwrap().remove(key);
-        assert!(serde_json::from_value::<RunRequest>(absent).is_err(), "{key} missing");
+        assert!(
+            serde_json::from_value::<RunRequest>(absent).is_err(),
+            "{key} missing"
+        );
     }
 }
 

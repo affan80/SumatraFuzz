@@ -83,16 +83,14 @@ impl RunRequest {
             return Err(WorkerError::InvalidConfig);
         }
         if self.target_lock_sha256.len() != 64
-            || !self.target_lock_sha256.bytes().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .target_lock_sha256
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit())
         {
             return Err(WorkerError::InvalidConfig);
         }
-        if self.label.len() > 128
-            || self
-                .label
-                .chars()
-                .any(|c| c.is_control())
-        {
+        if self.label.len() > 128 || self.label.chars().any(|c| c.is_control()) {
             return Err(WorkerError::InvalidConfig);
         }
         Ok(())

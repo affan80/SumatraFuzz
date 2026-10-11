@@ -21,12 +21,8 @@ jobs:
           persist-credentials: false
       - name: Show pinned Rust toolchain
         run: rustc --version
-      - name: Regenerate lockfile for new Rust domain dependencies
-        run: cargo generate-lockfile
-      - name: Display generated lockfile (one-time lock update)
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: cat Cargo.lock
+      - name: Verify locked dependencies
+        run: cargo fetch --locked
       - name: Rust worker unit and integration tests
         run: cargo test --workspace --all-targets --locked
       - name: Rust formatting
