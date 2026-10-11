@@ -21,18 +21,14 @@ jobs:
           persist-credentials: false
       - name: Show pinned Rust toolchain
         run: rustc --version
-      - name: Resolve Cargo lockfile
-        run: cargo generate-lockfile
-      - name: Display first-party dependency lockfile for review
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: cat Cargo.lock
+      - name: Verify locked dependencies
+        run: cargo fetch --locked
       - name: Rust worker unit and integration tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
       - name: Rust formatting
         run: cargo fmt --all --check
       - name: Rust Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
   target-config:
     name: Target config
     runs-on: ubuntu-latest
