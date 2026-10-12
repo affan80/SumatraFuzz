@@ -147,3 +147,24 @@ fn mutated_native_binary_is_denied() {
         Err(WorkerError::UnverifiedToolchain)
     ));
 }
+
+#[test]
+fn forged_matching_client_manifest_cannot_replace_worker_trust_anchor() {
+    let mut f = fixture();
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(&f.policy.target_lock_path).unwrap()).unwrap();
+    // A hostile client can supply a fresh hash but cannot change the
+    // administrator-provisioned worker trust anchor.
+    lock["untrusted_note"] = serde_json::json!("attacker-repacked");
+    let rewritten = serde_json::to_vec(&lock).unwrap();
+    let changed_hash = write(&f.policy.target_lock_path, &rewritten);
+    let mut a4: serde_json::Value =
+        serde_json::from_slice(&fs::read(&f.policy.a4_manifest_path).unwrap()).unwrap();
+    a4["toolchain_lock_sha256"] = serde_json::json!(changed_hash);
+    fs::write(&f.policy.a4_manifest_path, serde_json::to_vec(&a4).unwrap()).unwrap();
+    f.request.target_lock_sha256 = changed_hash;
+    assert!(matches!(
+        verify_and_build_launch(&f.request, &f.policy),
+        Err(WorkerError::UnverifiedToolchain)
+    ));
+}
