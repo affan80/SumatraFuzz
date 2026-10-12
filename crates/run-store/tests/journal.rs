@@ -70,14 +70,29 @@ fn state_transition_and_event_are_atomic_and_replayable() {
         .claim_worker_slot(controller, request, &"a".repeat(64), run)
         .unwrap();
     let first = store
-        .transition_state(run, RunState::Created, RunState::Preparing, EventType::StateChanged)
+        .transition_state(
+            run,
+            RunState::Created,
+            RunState::Preparing,
+            EventType::StateChanged,
+        )
         .unwrap();
     let second = store
-        .transition_state(run, RunState::Preparing, RunState::Running, EventType::StateChanged)
+        .transition_state(
+            run,
+            RunState::Preparing,
+            RunState::Running,
+            EventType::StateChanged,
+        )
         .unwrap();
     assert_eq!((first, second), (1, 2));
     assert!(matches!(
-        store.transition_state(run, RunState::Created, RunState::Completed, EventType::StateChanged),
+        store.transition_state(
+            run,
+            RunState::Created,
+            RunState::Completed,
+            EventType::StateChanged
+        ),
         Err(StoreError::InvalidTransition)
     ));
     let events = store.read_events_after(run, 0, 20).unwrap();

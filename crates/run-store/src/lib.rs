@@ -66,7 +66,9 @@ impl SqliteRunStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA journal_mode = WAL;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA journal_mode = WAL;",
+        )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > 1 {
             return Err(StoreError::UnsupportedVersion);
@@ -75,7 +77,9 @@ impl SqliteRunStore {
         if version == 0 {
             conn.pragma_update(None, "user_version", 1_i64)?;
         }
-        Ok(Self { connection: Mutex::new(conn) })
+        Ok(Self {
+            connection: Mutex::new(conn),
+        })
     }
 
     pub fn claim_worker_slot(
@@ -85,7 +89,9 @@ impl SqliteRunStore {
         payload_digest: &str,
         run_id: RunId,
     ) -> Result<ClaimOutcome, StoreError> {
-        if controller_id.0.is_nil() || request_id.is_nil() || run_id.0.is_nil()
+        if controller_id.0.is_nil()
+            || request_id.is_nil()
+            || run_id.0.is_nil()
             || payload_digest.len() != 64
             || !payload_digest.bytes().all(|c| c.is_ascii_hexdigit())
         {
@@ -106,15 +112,22 @@ impl SqliteRunStore {
             tx.commit()?;
             return Ok(ClaimOutcome::Existing(RunId(saved_id)));
         }
-        let active: Option<String> = tx.query_row(
-            "SELECT run_id FROM worker_slot WHERE slot = 1", [], |r| r.get(0)
-        ).optional()?;
+        let active: Option<String> = tx
+            .query_row("SELECT run_id FROM worker_slot WHERE slot = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
         if active.is_some() {
             return Ok(ClaimOutcome::WorkerBusy);
         }
-        tx.execute("INSERT INTO run_state (run_id, state, last_seq) VALUES (?1, 'created', 0)",
-            params![run_id.0.to_string()])?;
-        tx.execute("INSERT INTO worker_slot (slot, run_id) VALUES (1, ?1)", params![run_id.0.to_string()])?;
+        tx.execute(
+            "INSERT INTO run_state (run_id, state, last_seq) VALUES (?1, 'created', 0)",
+            params![run_id.0.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO worker_slot (slot, run_id) VALUES (1, ?1)",
+            params![run_id.0.to_string()],
+        )?;
         tx.execute("INSERT INTO command_idempotency (controller_id, request_id, payload_digest, run_id) VALUES (?1, ?2, ?3, ?4)",
             params![controller_id.0.to_string(), request_id.to_string(), payload_digest, run_id.0.to_string()])?;
         tx.commit()?;
@@ -133,17 +146,21 @@ impl SqliteRunStore {
         }
         let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let record: Option<(String, i64)> = tx.query_row(
-            "SELECT state, last_seq FROM run_state WHERE run_id = ?1",
-            params![run_id.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?))
-        ).optional()?;
+        let record: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT state, last_seq FROM run_state WHERE run_id = ?1",
+                params![run_id.0.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         let (previous, seq) = record.ok_or(StoreError::InvalidTransition)?;
         if parse_state(&previous)? != expected || seq < 0 {
             return Err(StoreError::InvalidTransition);
         }
         let next_seq = seq.checked_add(1).ok_or(StoreError::Corrupt)?;
         let when = Utc::now().to_rfc3339();
-        let payload = serde_json::json!({"from": state_name(expected), "to": state_name(next)}).to_string();
+        let payload =
+            serde_json::json!({"from": state_name(expected), "to": state_name(next)}).to_string();
         tx.execute(
             "UPDATE run_state SET state = ?1, last_seq = ?2 WHERE run_id = ?3 AND state = ?4 AND last_seq = ?5",
             params![state_name(next), next_seq, run_id.0.to_string(), state_name(expected), seq],
@@ -155,9 +172,14 @@ impl SqliteRunStore {
         )?;
         // Releasing the slot is only legal on an explicit terminal transition.
         // The coordinator must call this only *after* owned native processes stop.
-        if matches!(next, RunState::Completed | RunState::Failed | RunState::Interrupted) {
-            tx.execute("DELETE FROM worker_slot WHERE slot = 1 AND run_id = ?1",
-                params![run_id.0.to_string()])?;
+        if matches!(
+            next,
+            RunState::Completed | RunState::Failed | RunState::Interrupted
+        ) {
+            tx.execute(
+                "DELETE FROM worker_slot WHERE slot = 1 AND run_id = ?1",
+                params![run_id.0.to_string()],
+            )?;
         }
         tx.commit()?;
         u64::try_from(next_seq).map_err(|_| StoreError::Corrupt)
@@ -165,10 +187,13 @@ impl SqliteRunStore {
 
     pub fn run_state(&self, run_id: RunId) -> Result<RunState, StoreError> {
         let conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        let saved: Option<String> = conn.query_row(
-            "SELECT state FROM run_state WHERE run_id = ?1",
-            params![run_id.0.to_string()], |r| r.get(0)
-        ).optional()?;
+        let saved: Option<String> = conn
+            .query_row(
+                "SELECT state FROM run_state WHERE run_id = ?1",
+                params![run_id.0.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
         parse_state(&saved.ok_or(StoreError::InvalidTransition)?)
     }
 
@@ -197,10 +222,17 @@ impl SqliteRunStore {
             let (seq, time, kind, payload) = row?;
             let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt)?;
             let time_utc = DateTime::parse_from_rfc3339(&time)
-                .map_err(|_| StoreError::Corrupt)?.with_timezone(&Utc);
+                .map_err(|_| StoreError::Corrupt)?
+                .with_timezone(&Utc);
             let event_type = serde_json::from_str(&kind).map_err(|_| StoreError::Corrupt)?;
             let payload = serde_json::from_str(&payload).map_err(|_| StoreError::Corrupt)?;
-            events.push(RunEvent { run_id, seq, time_utc, event_type, payload });
+            events.push(RunEvent {
+                run_id,
+                seq,
+                time_utc,
+                event_type,
+                payload,
+            });
         }
         Ok(events)
     }
