@@ -113,7 +113,9 @@ fn verified_launch_builds_explicit_argv_without_shell() {
         fs::canonicalize(&fixture.bundle).unwrap()
     );
     assert_eq!(args.last().map(String::as_str), Some("@@"));
-    assert!(spec.evidence_dir.starts_with(fs::canonicalize(&fixture.policy.output_root).unwrap()));
+    assert!(spec
+        .evidence_dir
+        .starts_with(fs::canonicalize(&fixture.policy.output_root).unwrap()));
 }
 #[test]
 fn changed_target_lock_is_denied_before_spawn() {
