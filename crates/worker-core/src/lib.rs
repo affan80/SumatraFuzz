@@ -212,7 +212,10 @@ pub fn verify_and_build_launch(
     )?;
     // Use the provisioned path here: Windows canonicalize() may add a \\?\\ prefix,
     // which must never be mistaken for an untrusted user-supplied device path.
-    let sibling = policy.harness_path.parent().ok_or(WorkerError::UnverifiedToolchain)?;
+    let sibling = policy
+        .harness_path
+        .parent()
+        .ok_or(WorkerError::UnverifiedToolchain)?;
     verified_binary(
         &sibling.join("PdfFilter.dll"),
         &policy.allowed_binary_root,
