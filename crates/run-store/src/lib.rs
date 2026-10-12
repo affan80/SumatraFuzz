@@ -64,19 +64,40 @@ fn parse_state(value: &str) -> Result<RunState, StoreError> {
 
 impl SqliteRunStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA journal_mode = WAL;",
-        )?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 1 {
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
+
+        // SQLite may return BUSY immediately when two processes simultaneously
+        // activate WAL for a new journal. Retry only this transient contention,
+        // with a finite deadline; never suppress corrupt/invalid database errors.
+        for attempt in 0..16 {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(ref code, _))
+                    if matches!(
+                        code.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && attempt < 15 =>
+                {
+                    std::thread::sleep(Duration::from_millis(80));
+                }
+                Err(error) => return Err(StoreError::Database(error)),
+            }
+        }
+
+        // Version check, DDL and schema-version update must be one transaction:
+        // concurrent initialization must not expose partially migrated tables.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if !(0..=1).contains(&version) {
             return Err(StoreError::UnsupportedVersion);
         }
-        conn.execute_batch(include_str!("../migrations/0001_worker.sql"))?;
+        tx.execute_batch(include_str!("../migrations/0001_worker.sql"))?;
         if version == 0 {
-            conn.pragma_update(None, "user_version", 1_i64)?;
+            tx.pragma_update(None, "user_version", 1_i64)?;
         }
+        tx.commit()?;
         Ok(Self {
             connection: Mutex::new(conn),
         })
