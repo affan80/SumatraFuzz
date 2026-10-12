@@ -169,3 +169,24 @@ fn forged_matching_client_manifest_cannot_replace_worker_trust_anchor() {
         Err(WorkerError::UnverifiedToolchain)
     ));
 }
+
+#[test]
+fn forged_a4_and_harness_hash_cannot_replace_worker_trust_anchor() {
+    let f = fixture();
+    // The toolchain lock is unchanged. An attacker with write access to the
+    // unhashed A4 manifest must not authorize a substituted target executable.
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&fs::read(&f.policy.a4_manifest_path).unwrap()).unwrap();
+    let modified = b"substituted executable";
+    fs::write(&f.policy.harness_path, modified).unwrap();
+    forged["harness_sha256"] = serde_json::json!(hash(modified));
+    fs::write(
+        &f.policy.a4_manifest_path,
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_and_build_launch(&f.request, &f.policy),
+        Err(WorkerError::UnverifiedToolchain)
+    ));
+}
