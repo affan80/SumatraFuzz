@@ -191,19 +191,44 @@ impl SqliteRunStore {
             "INSERT INTO events (run_id, seq, time_utc, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![run_id.0.to_string(), next_seq, when, event_type, payload],
         )?;
-        // Releasing the slot is only legal on an explicit terminal transition.
-        // The coordinator must call this only *after* owned native processes stop.
-        if matches!(
-            next,
-            RunState::Completed | RunState::Failed | RunState::Interrupted
-        ) {
-            tx.execute(
-                "DELETE FROM worker_slot WHERE slot = 1 AND run_id = ?1",
-                params![run_id.0.to_string()],
-            )?;
-        }
         tx.commit()?;
         u64::try_from(next_seq).map_err(|_| StoreError::Corrupt)
+    }
+
+    /// Release a terminal run's lease only once the trusted Windows process
+    /// supervisor has positively confirmed the native process tree is gone.
+    /// The bool is an explicit coordinator assertion, NOT an OS attestation.
+    /// Future B1 coordinator/Job Object integration owns that verification.
+    pub fn release_after_teardown(
+        &self,
+        run_id: RunId,
+        native_process_tree_stopped: bool,
+    ) -> Result<(), StoreError> {
+        if !native_process_tree_stopped {
+            return Err(StoreError::InvalidRequest);
+        }
+        let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT state FROM run_state WHERE run_id = ?1",
+                params![run_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let state = parse_state(&current.ok_or(StoreError::InvalidTransition)?)?;
+        if !matches!(
+            state,
+            RunState::Completed | RunState::Failed | RunState::Interrupted
+        ) {
+            return Err(StoreError::InvalidTransition);
+        }
+        tx.execute(
+            "DELETE FROM worker_slot WHERE slot = 1 AND run_id = ?1",
+            params![run_id.0.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn run_state(&self, run_id: RunId) -> Result<RunState, StoreError> {
