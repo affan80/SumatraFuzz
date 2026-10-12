@@ -20,7 +20,7 @@ struct Fixture {
 }
 fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let dir = tmp.path().to_path_buf();
     let binaries = dir.join("binaries");
     let tools = dir.join("tools");
     let input = dir.join("input");
