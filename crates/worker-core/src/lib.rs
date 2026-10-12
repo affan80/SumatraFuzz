@@ -172,7 +172,10 @@ pub fn verify_and_build_launch(
     policy: &WorkerPolicy,
 ) -> Result<VerifiedRunSpec, WorkerError> {
     request.validate()?;
-    if !request.target_lock_sha256.eq_ignore_ascii_case(&policy.pinned_target_lock_sha256) {
+    if !request
+        .target_lock_sha256
+        .eq_ignore_ascii_case(&policy.pinned_target_lock_sha256)
+    {
         return Err(WorkerError::UnverifiedToolchain);
     }
     check_limits(request.limits, policy.max_limits)?;
