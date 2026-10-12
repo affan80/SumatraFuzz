@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import stat
 from pathlib import Path
 import sys
 from stats import parse_stats, verify_progress, StatsError
@@ -28,6 +29,58 @@ def read_json(p:Path)->dict:
 
 def compare_file(p:Path,expected:str,label:str):
     if digest(p).lower()!=str(expected).lower():raise EvidenceError(f'SHA-256 mismatch for {label}: {p}')
+
+def reject_redirected_path(path: Path):
+    # Keep lexical ancestors: resolve() would hide the redirect being rejected.
+    absolute = path.absolute()
+    for part in (absolute, *absolute.parents):
+        try:
+            attrs = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(attrs.st_mode) or getattr(attrs, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise EvidenceError(f'Unsafe finding path: redirected component {part}')
+
+def finding_inventory(run_dir: Path, kind: str, observed_count: int) -> list[dict]:
+    """Inspect actual WinAFL crash/hang files, never synthesize findings.
+
+    Only WinAFL's id_* artifacts count; an optional README is not a crash.
+    WinAFL writes statistics periodically. A bounded forced stop may leave
+    additional saved artifacts after the last stats snapshot; preserve both
+    observations without changing or inventing the reported counters.
+    """
+    if kind not in ('crashes', 'hangs'):
+        raise EvidenceError(f'Unsupported finding kind: {kind}')
+    folder = run_dir / kind
+    reject_redirected_path(folder)
+    if not folder.exists():
+        if observed_count == 0:
+            return []
+        raise EvidenceError(f'Missing {kind} artifacts for {observed_count} measured findings')
+    if folder.is_symlink() or not folder.is_dir():
+        raise EvidenceError(f'Unsafe or invalid {kind} artifact directory')
+    candidates = sorted(p for p in folder.iterdir() if p.name.startswith('id_'))
+    for candidate in candidates:
+        try:
+            reject_redirected_path(candidate)
+        except EvidenceError as exc:
+            raise EvidenceError(f'Unsafe {kind} sample: {exc}') from exc
+    if any(not p.is_file() for p in candidates):
+        raise EvidenceError(f'Unsafe {kind} sample: nonregular file or symlink')
+    if len(candidates) < observed_count:
+        raise EvidenceError(
+            f'{kind} artifact count {len(candidates)} differs from measured unique findings {observed_count}'
+        )
+    return [
+        {
+            'path': f'{kind}/{p.name}',
+            'sha256': digest(p),
+            'bytes': p.stat().st_size,
+            'classification': 'untriaged',
+            'replay_argv': ['sumatrafuzz-harness.exe', f'{kind}/{p.name}'],
+        }
+        for p in candidates
+    ]
 
 def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,before_stats:Path,after_stats:Path)->dict:
     lock=read_json(toolchain_lock)
@@ -83,6 +136,8 @@ def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,bef
     if not queue_dir.is_dir():raise EvidenceError('Queue directory missing')
     inputs=sorted(p for p in queue_dir.iterdir() if p.is_file() and not p.name.startswith('.'))
     if not inputs:raise EvidenceError('No actual WinAFL queued input files')
+    crashes = finding_inventory(run_dir, 'crashes', final['unique_crashes'])
+    hangs = finding_inventory(run_dir, 'hangs', final['unique_hangs'])
     return {
       'schema_version':1,'source_commit':PIN,
       'start_utc':start.astimezone(timezone.utc).isoformat(),
@@ -95,6 +150,14 @@ def collect(*,run_dir:Path,toolchain_lock:Path,a4_manifest:Path,harness:Path,bef
       'metric_units':'WinAFL execution counts and discovered paths; not source coverage percentage',
       'metrics':final,'first_snapshot':before,'later_snapshot':after,
       'queue':[{'name':p.name,'sha256':digest(p),'bytes':p.stat().st_size} for p in inputs],
+      'crashes': crashes,
+      'hangs': hangs,
+      'finding_counts': {
+          kind: {'reported_in_stats': final[counter], 'saved_artifacts': len(items),
+                 'additional_saved_artifacts': len(items) - final[counter]}
+          for kind, counter, items in (('crashes','unique_crashes',crashes),
+                                      ('hangs','unique_hangs',hangs))
+      },
       'raw_stats_sha256':digest(run_dir/'fuzzer_stats'),
       'binary_hashes':{
          'harness':digest(harness),'PdfFilter.dll':digest(folder/'PdfFilter.dll'),
