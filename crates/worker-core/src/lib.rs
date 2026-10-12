@@ -114,15 +114,22 @@ fn reparse_point(meta: &std::fs::Metadata) -> bool {
 }
 
 fn sha256_file(path: &Path) -> Result<String, WorkerError> {
-    if !fs::metadata(path).map_err(|_| WorkerError::UnverifiedToolchain)?.is_file() {
+    if !fs::metadata(path)
+        .map_err(|_| WorkerError::UnverifiedToolchain)?
+        .is_file()
+    {
         return Err(WorkerError::UnverifiedToolchain);
     }
     let mut stream = File::open(path).map_err(|_| WorkerError::UnverifiedToolchain)?;
     let mut hash = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
     loop {
-        let n = stream.read(&mut buf).map_err(|_| WorkerError::UnverifiedToolchain)?;
-        if n == 0 { break; }
+        let n = stream
+            .read(&mut buf)
+            .map_err(|_| WorkerError::UnverifiedToolchain)?;
+        if n == 0 {
+            break;
+        }
         hash.update(&buf[..n]);
     }
     Ok(format!("{:x}", hash.finalize()))
@@ -164,30 +171,71 @@ pub fn verify_and_build_launch(
 ) -> Result<VerifiedRunSpec, WorkerError> {
     request.validate()?;
     check_limits(request.limits, policy.max_limits)?;
-    let lock_path = verify_path(&policy.target_lock_path, policy.target_lock_path.parent().ok_or(WorkerError::UnverifiedToolchain)?)?;
-    let a4_path = verify_path(&policy.a4_manifest_path, policy.a4_manifest_path.parent().ok_or(WorkerError::UnverifiedToolchain)?)?;
+    let lock_path = verify_path(
+        &policy.target_lock_path,
+        policy
+            .target_lock_path
+            .parent()
+            .ok_or(WorkerError::UnverifiedToolchain)?,
+    )?;
+    let a4_path = verify_path(
+        &policy.a4_manifest_path,
+        policy
+            .a4_manifest_path
+            .parent()
+            .ok_or(WorkerError::UnverifiedToolchain)?,
+    )?;
     file_matches(&lock_path, &request.target_lock_sha256)?;
 
-    let lock: Lock = serde_json::from_reader(File::open(&lock_path).map_err(|_| WorkerError::UnverifiedToolchain)?)
-        .map_err(|_| WorkerError::UnverifiedToolchain)?;
-    let a4: ConfirmedA4 = serde_json::from_reader(File::open(a4_path).map_err(|_| WorkerError::UnverifiedToolchain)?)
-        .map_err(|_| WorkerError::UnverifiedToolchain)?;
+    let lock: Lock = serde_json::from_reader(
+        File::open(&lock_path).map_err(|_| WorkerError::UnverifiedToolchain)?,
+    )
+    .map_err(|_| WorkerError::UnverifiedToolchain)?;
+    let a4: ConfirmedA4 =
+        serde_json::from_reader(File::open(a4_path).map_err(|_| WorkerError::UnverifiedToolchain)?)
+            .map_err(|_| WorkerError::UnverifiedToolchain)?;
     if lock.source_commit != PINNED_SOURCE
         || a4.target_commit != PINNED_SOURCE
         || a4.cycles < 10
         || a4.confirmed_map_nonzero_bytes == 0
-        || !a4.toolchain_lock_sha256.eq_ignore_ascii_case(&request.target_lock_sha256)
+        || !a4
+            .toolchain_lock_sha256
+            .eq_ignore_ascii_case(&request.target_lock_sha256)
     {
         return Err(WorkerError::UnverifiedToolchain);
     }
 
-    let harness = verified_binary(&policy.harness_path, &policy.allowed_binary_root, &a4.harness_sha256)?;
+    let harness = verified_binary(
+        &policy.harness_path,
+        &policy.allowed_binary_root,
+        &a4.harness_sha256,
+    )?;
     let sibling = harness.parent().ok_or(WorkerError::UnverifiedToolchain)?;
-    verified_binary(&sibling.join("PdfFilter.dll"), &policy.allowed_binary_root, &a4.pdf_filter_sha256)?;
-    verified_binary(&sibling.join("libmupdf.dll"), &policy.allowed_binary_root, &a4.mupdf_sha256)?;
-    let executable = verified_binary(&lock.tools.afl_fuzz.path, &policy.allowed_tool_root, &lock.tools.afl_fuzz.sha256)?;
-    let drrun = verified_binary(&lock.tools.drrun.path, &policy.allowed_tool_root, &lock.tools.drrun.sha256)?;
-    let client = verified_binary(&lock.tools.winafl_client.path, &policy.allowed_tool_root, &lock.tools.winafl_client.sha256)?;
+    verified_binary(
+        &sibling.join("PdfFilter.dll"),
+        &policy.allowed_binary_root,
+        &a4.pdf_filter_sha256,
+    )?;
+    verified_binary(
+        &sibling.join("libmupdf.dll"),
+        &policy.allowed_binary_root,
+        &a4.mupdf_sha256,
+    )?;
+    let executable = verified_binary(
+        &lock.tools.afl_fuzz.path,
+        &policy.allowed_tool_root,
+        &lock.tools.afl_fuzz.sha256,
+    )?;
+    let drrun = verified_binary(
+        &lock.tools.drrun.path,
+        &policy.allowed_tool_root,
+        &lock.tools.drrun.sha256,
+    )?;
+    let client = verified_binary(
+        &lock.tools.winafl_client.path,
+        &policy.allowed_tool_root,
+        &lock.tools.winafl_client.sha256,
+    )?;
     let drrun_dir = drrun.parent().ok_or(WorkerError::UnverifiedToolchain)?;
 
     let mut observed = HashSet::new();
@@ -197,7 +245,9 @@ pub fn verify_and_build_launch(
     for module in &a4.confirmed_modules {
         if module.len() > 128
             || !module.to_ascii_lowercase().ends_with(".dll")
-            || !module.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+            || !module
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
             || !observed.insert(module.to_ascii_lowercase())
         {
             return Err(WorkerError::UnverifiedToolchain);
@@ -219,12 +269,19 @@ pub fn verify_and_build_launch(
         return Err(WorkerError::InvalidConfig);
     }
     let mut argv = vec![
-        OsString::from("-i"), input.into_os_string(),
-        OsString::from("-o"), evidence_dir.as_os_str().to_os_string(),
-        OsString::from("-D"), drrun_dir.as_os_str().to_os_string(),
-        OsString::from("-w"), client.into_os_string(),
-        OsString::from("-t"), OsString::from(DEFAULT_TIMEOUT_MS),
-        OsString::from("--"), OsString::from("-covtype"), OsString::from("edge"),
+        OsString::from("-i"),
+        input.into_os_string(),
+        OsString::from("-o"),
+        evidence_dir.as_os_str().to_os_string(),
+        OsString::from("-D"),
+        drrun_dir.as_os_str().to_os_string(),
+        OsString::from("-w"),
+        client.into_os_string(),
+        OsString::from("-t"),
+        OsString::from(DEFAULT_TIMEOUT_MS),
+        OsString::from("--"),
+        OsString::from("-covtype"),
+        OsString::from("edge"),
     ];
     for module in a4.confirmed_modules {
         argv.push(OsString::from("-coverage_module"));
@@ -232,7 +289,10 @@ pub fn verify_and_build_launch(
     }
     argv.extend([
         OsString::from("-target_module"),
-        harness.file_name().ok_or(WorkerError::UnverifiedToolchain)?.to_os_string(),
+        harness
+            .file_name()
+            .ok_or(WorkerError::UnverifiedToolchain)?
+            .to_os_string(),
         OsString::from("-target_method"),
         OsString::from("fuzz_one_file"),
         OsString::from("-fuzz_iterations"),
@@ -243,5 +303,12 @@ pub fn verify_and_build_launch(
         harness.into_os_string(),
         OsString::from("@@"),
     ]);
-    Ok(VerifiedRunSpec { run_id, executable, argv, working_dir: root, limits: request.limits, evidence_dir })
+    Ok(VerifiedRunSpec {
+        run_id,
+        executable,
+        argv,
+        working_dir: root,
+        limits: request.limits,
+        evidence_dir,
+    })
 }

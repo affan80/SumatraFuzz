@@ -21,24 +21,14 @@ jobs:
           persist-credentials: false
       - name: Show pinned Rust toolchain
         run: rustc --version
-      - name: Resolve new test dependencies for RED verification
-        run: cargo generate-lockfile
-      - name: Capture rustfmt and locked resolution for review
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          cargo fmt --all
-          for file in crates/worker-core/src/lib.rs crates/worker-core/tests/verified_launch.rs Cargo.lock; do
-            printf 'SF_FORMAT_BEGIN:%s\\n' "$file"
-            base64 -w0 "$file"
-            printf '\\nSF_FORMAT_END:%s\\n' "$file"
-          done
+      - name: Verify locked dependencies
+        run: cargo fetch --locked
       - name: Rust worker unit and integration tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
       - name: Rust formatting
         run: cargo fmt --all --check
       - name: Rust Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
   target-config:
     name: Target config
     runs-on: ubuntu-latest
