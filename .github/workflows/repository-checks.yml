@@ -23,6 +23,16 @@ jobs:
         run: rustc --version
       - name: Resolve new test dependencies for RED verification
         run: cargo generate-lockfile
+      - name: Capture rustfmt and locked resolution for review
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          cargo fmt --all
+          for file in crates/run-store/src/lib.rs crates/run-store/tests/journal.rs Cargo.lock; do
+            printf 'SF_FORMAT_BEGIN:%s\\n' "$file"
+            base64 -w0 "$file"
+            printf '\\nSF_FORMAT_END:%s\\n' "$file"
+          done
       - name: Rust worker unit and integration tests
         run: cargo test --workspace --all-targets
       - name: Rust formatting
