@@ -20,9 +20,13 @@ fn fresh_and_legacy_version_zero_schema_upgrades_atomically() {
     let store = SqliteRunStore::open(&path).unwrap();
     drop(store);
     let conn = Connection::open(&path).unwrap();
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     let value: String = conn
-        .query_row("SELECT value FROM existing_application_data", [], |row| row.get(0))
+        .query_row("SELECT value FROM existing_application_data", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, 1);
     assert_eq!(value, "retain-me");
