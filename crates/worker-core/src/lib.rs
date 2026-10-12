@@ -21,6 +21,8 @@ const PERSISTENT_ITERATIONS: &str = "1000";
 #[derive(Clone, Debug)]
 pub struct WorkerPolicy {
     pub max_limits: CampaignLimits,
+    /// Administrator-provisioned trusted digest; never a client-supplied trust anchor.
+    pub pinned_target_lock_sha256: String,
     pub target_lock_path: PathBuf,
     pub a4_manifest_path: PathBuf,
     pub harness_path: PathBuf,
@@ -170,6 +172,9 @@ pub fn verify_and_build_launch(
     policy: &WorkerPolicy,
 ) -> Result<VerifiedRunSpec, WorkerError> {
     request.validate()?;
+    if !request.target_lock_sha256.eq_ignore_ascii_case(&policy.pinned_target_lock_sha256) {
+        return Err(WorkerError::UnverifiedToolchain);
+    }
     check_limits(request.limits, policy.max_limits)?;
     let lock_path = verify_path(
         &policy.target_lock_path,
@@ -185,7 +190,7 @@ pub fn verify_and_build_launch(
             .parent()
             .ok_or(WorkerError::UnverifiedToolchain)?,
     )?;
-    file_matches(&lock_path, &request.target_lock_sha256)?;
+    file_matches(&lock_path, &policy.pinned_target_lock_sha256)?;
 
     let lock: Lock = serde_json::from_reader(
         File::open(&lock_path).map_err(|_| WorkerError::UnverifiedToolchain)?,
@@ -200,7 +205,7 @@ pub fn verify_and_build_launch(
         || a4.confirmed_map_nonzero_bytes == 0
         || !a4
             .toolchain_lock_sha256
-            .eq_ignore_ascii_case(&request.target_lock_sha256)
+            .eq_ignore_ascii_case(&policy.pinned_target_lock_sha256)
     {
         return Err(WorkerError::UnverifiedToolchain);
     }

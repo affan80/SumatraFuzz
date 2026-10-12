@@ -74,6 +74,7 @@ fn fixture() -> Fixture {
         _temp: tmp,
         policy: WorkerPolicy {
             max_limits: limits,
+            pinned_target_lock_sha256: digest.clone(),
             target_lock_path: lock_path,
             a4_manifest_path: a4_path,
             harness_path: harness,
