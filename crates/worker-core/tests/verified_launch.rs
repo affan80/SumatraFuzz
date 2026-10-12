@@ -64,6 +64,7 @@ fn fixture() -> Fixture {
         .unwrap(),
     )
     .unwrap();
+    let a4_digest = hash(&fs::read(&a4_path).unwrap());
     let limits = CampaignLimits {
         max_duration_s: NonZeroU64::new(60).unwrap(),
         max_memory_bytes: NonZeroU64::new(256 * 1024 * 1024).unwrap(),
@@ -75,6 +76,7 @@ fn fixture() -> Fixture {
         policy: WorkerPolicy {
             max_limits: limits,
             pinned_target_lock_sha256: digest.clone(),
+            pinned_a4_manifest_sha256: a4_digest,
             target_lock_path: lock_path,
             a4_manifest_path: a4_path,
             harness_path: harness,

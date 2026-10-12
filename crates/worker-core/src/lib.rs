@@ -23,6 +23,8 @@ pub struct WorkerPolicy {
     pub max_limits: CampaignLimits,
     /// Administrator-provisioned trusted digest; never a client-supplied trust anchor.
     pub pinned_target_lock_sha256: String,
+    /// Trusted digest of real A4 evidence, provisioned out of band with the lock.
+    pub pinned_a4_manifest_sha256: String,
     pub target_lock_path: PathBuf,
     pub a4_manifest_path: PathBuf,
     pub harness_path: PathBuf,
@@ -194,6 +196,7 @@ pub fn verify_and_build_launch(
             .ok_or(WorkerError::UnverifiedToolchain)?,
     )?;
     file_matches(&lock_path, &policy.pinned_target_lock_sha256)?;
+    file_matches(&a4_path, &policy.pinned_a4_manifest_sha256)?;
 
     let lock: Lock = serde_json::from_reader(
         File::open(&lock_path).map_err(|_| WorkerError::UnverifiedToolchain)?,
