@@ -104,6 +104,17 @@ fn terminal_transition_releases_worker_slot_for_next_campaign() {
             EventType::StateChanged,
         )
         .unwrap();
+    // A terminal journal entry is NOT proof that the Windows process tree has
+    // stopped. Preserve the exclusive slot until the supervisor confirms it.
+    let blocked = RunId(Uuid::from_u128(46));
+    assert_eq!(
+        store
+            .claim_worker_slot(principal, Uuid::from_u128(7), &"a".repeat(64), blocked)
+            .unwrap(),
+        ClaimOutcome::WorkerBusy
+    );
+    assert!(store.release_after_teardown(old, false).is_err());
+    store.release_after_teardown(old, true).unwrap();
     let next = RunId(Uuid::from_u128(45));
     assert_eq!(
         store
