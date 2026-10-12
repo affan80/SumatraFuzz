@@ -106,9 +106,12 @@ fn verified_launch_builds_explicit_argv_without_shell() {
     assert!(args
         .windows(2)
         .any(|x| x == ["-target_method", "fuzz_one_file"]));
-    assert!(args
-        .windows(2)
-        .any(|x| x == ["-i", fixture.bundle.to_str().unwrap()]));
+    // Windows canonical paths can have an extended-length prefix.
+    let actual_input = args.windows(2).find(|x| x[0] == "-i").unwrap();
+    assert_eq!(
+        PathBuf::from(&actual_input[1]),
+        fs::canonicalize(&fixture.bundle).unwrap()
+    );
     assert_eq!(args.last().map(String::as_str), Some("@@"));
     assert!(spec.evidence_dir.starts_with(&fixture.policy.output_root));
 }
