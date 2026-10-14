@@ -181,7 +181,7 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     .unwrap();
     let previous = a5["argv"].as_array().unwrap();
     assert_eq!(
-        spec.executable(),
+        fs::canonicalize(spec.executable()).unwrap(),
         fs::canonicalize(previous[0].as_str().unwrap()).unwrap()
     );
     let args = spec.argv();
@@ -192,7 +192,7 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
         } // A sealed input snapshot and a new output directory are run-specific.
         let value = evidence.as_str().unwrap();
         if PathBuf::from(value).is_absolute() {
-            assert_eq!(PathBuf::from(arg), fs::canonicalize(value).unwrap());
+            assert_eq!(fs::canonicalize(PathBuf::from(arg)).unwrap(), fs::canonicalize(value).unwrap());
         } else {
             assert_eq!(arg.to_str().unwrap(), value);
         }

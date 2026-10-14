@@ -120,6 +120,36 @@ struct ConfirmedA4 {
     confirmed_modules: Vec<String>,
 }
 
+// WinAFL 1.17 builds a legacy downstream Windows command line; after
+// canonical verification we must not pass the Win32 extended-length \\?\\
+// namespace through that unquoted interface. Retained handles still
+// refer to the same fully verified objects.
+fn native_argv_path(path: &Path) -> Result<PathBuf, WorkerError> {
+    #[cfg(windows)]
+    {
+        let raw = path.to_str().ok_or(WorkerError::UnverifiedToolchain)?;
+        let dos = match raw.strip_prefix(r"\\?\") {
+            Some(stripped) => stripped,
+            None => raw,
+        };
+        let b = dos.as_bytes();
+        if b.len() < 3
+            || !b[0].is_ascii_alphabetic()
+            || b[1] != b':'
+            || b[2] != b'\\'
+            || dos.len() >= 240
+            || dos.starts_with(r"\\")
+        {
+            return Err(WorkerError::UnverifiedToolchain);
+        }
+        Ok(PathBuf::from(dos))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(path.to_path_buf())
+    }
+}
+
 fn safe_absolute(path: &Path) -> bool {
     let text = path.to_string_lossy();
     if !path.is_absolute()
@@ -460,6 +490,7 @@ pub fn verify_and_build_launch(
     }
     let run_id = RunId(Uuid::new_v4());
     let evidence_dir = root.join(run_id.0.to_string());
+    let evidence_arg = native_argv_path(&evidence_dir)?;
     if evidence_dir.exists() {
         return Err(WorkerError::InvalidConfig);
     }
@@ -494,20 +525,26 @@ pub fn verify_and_build_launch(
     }
     corpus.seal()?;
     let input = fs::canonicalize(&corpus.path).map_err(|_| WorkerError::UnverifiedToolchain)?;
+    let input_arg = native_argv_path(&input)?;
     // Keep writable evidence out of WinAFL's unqualified taskkill executable search.
-    let working_dir = executable
-        .parent()
-        .ok_or(WorkerError::UnverifiedToolchain)?
-        .to_path_buf();
+    let working_dir = native_argv_path(
+        executable
+            .parent()
+            .ok_or(WorkerError::UnverifiedToolchain)?,
+    )?;
+    let executable_arg = native_argv_path(&executable)?;
+    let drrun_arg = native_argv_path(drrun_dir)?;
+    let client_arg = native_argv_path(&client)?;
+    let harness_arg = native_argv_path(&harness)?;
     let mut argv = vec![
         OsString::from("-i"),
-        input.into_os_string(),
+        input_arg.into_os_string(),
         OsString::from("-o"),
-        evidence_dir.as_os_str().to_os_string(),
+        evidence_arg.into_os_string(),
         OsString::from("-D"),
-        drrun_dir.as_os_str().to_os_string(),
+        drrun_arg.into_os_string(),
         OsString::from("-w"),
-        client.into_os_string(),
+        client_arg.into_os_string(),
         OsString::from("-t"),
         OsString::from(DEFAULT_TIMEOUT_MS),
         OsString::from("--"),
@@ -531,12 +568,12 @@ pub fn verify_and_build_launch(
         OsString::from("-nargs"),
         OsString::from("1"),
         OsString::from("--"),
-        harness.into_os_string(),
+        harness_arg.into_os_string(),
         OsString::from("@@"),
     ]);
     Ok(VerifiedRunSpec {
         run_id,
-        executable,
+        executable: executable_arg,
         argv,
         working_dir,
         limits: request.limits,

@@ -519,7 +519,7 @@ fn native_working_directory_cannot_search_writable_evidence_for_helpers() {
     let f = fixture();
     let spec = verify_and_build_launch(&f.request, &f.policy).unwrap();
     assert_eq!(
-        spec.working_dir(),
+        fs::canonicalize(spec.working_dir()).unwrap(),
         fs::canonicalize(&f.policy.allowed_tool_root).unwrap()
     );
 }
