@@ -177,6 +177,15 @@ jobs:
         shell: pwsh
         run: |
           pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
+      - name: Build genuine worker argv acceptance test
+        shell: pwsh
+        run: |
+          $messages = @(& cargo test -p worker-core --test native_launch --locked --no-run --message-format=json)
+          if ($LASTEXITCODE -ne 0) { throw 'Worker acceptance test build failed' }
+          $artifacts = @($messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'native_launch' -and $_.executable })
+          if ($artifacts.Count -ne 1) { throw 'Expected one worker acceptance executable' }
+          $null = New-Item -ItemType Directory -Path build/worker -Force
+          Copy-Item -LiteralPath $artifacts[0].executable -Destination build/worker/native-launch-tests.exe
       - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
         timeout-minutes: 22
@@ -195,6 +204,7 @@ jobs:
           path: |
             runs/a6/evidence.json
             runs/native-execution-context.json
+            runs/worker-native-acceptance.json
           if-no-files-found: error
           retention-days: 30
       - name: Save non-sensitive WinAFL counters and run metadata
@@ -210,5 +220,6 @@ jobs:
             external/native-tools/locks/target-lock.json
             runs/native-gate.stdout.log
             runs/native-gate.stderr.log
+            runs/worker-native.stdout.log
           if-no-files-found: warn
           retention-days: 30
