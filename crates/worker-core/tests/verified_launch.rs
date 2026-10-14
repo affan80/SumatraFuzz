@@ -64,6 +64,7 @@ fn fixture() -> Fixture {
         .unwrap(),
     )
     .unwrap();
+    let a4_digest = hash(&fs::read(&a4_path).unwrap());
     let limits = CampaignLimits {
         max_duration_s: NonZeroU64::new(60).unwrap(),
         max_memory_bytes: NonZeroU64::new(256 * 1024 * 1024).unwrap(),
@@ -75,6 +76,7 @@ fn fixture() -> Fixture {
         policy: WorkerPolicy {
             max_limits: limits,
             pinned_target_lock_sha256: digest.clone(),
+            pinned_a4_manifest_sha256: a4_digest,
             target_lock_path: lock_path,
             a4_manifest_path: a4_path,
             harness_path: harness,
@@ -164,6 +166,27 @@ fn forged_matching_client_manifest_cannot_replace_worker_trust_anchor() {
     a4["toolchain_lock_sha256"] = serde_json::json!(changed_hash);
     fs::write(&f.policy.a4_manifest_path, serde_json::to_vec(&a4).unwrap()).unwrap();
     f.request.target_lock_sha256 = changed_hash;
+    assert!(matches!(
+        verify_and_build_launch(&f.request, &f.policy),
+        Err(WorkerError::UnverifiedToolchain)
+    ));
+}
+
+#[test]
+fn forged_a4_and_harness_hash_cannot_replace_worker_trust_anchor() {
+    let f = fixture();
+    // The toolchain lock is unchanged. An attacker with write access to the
+    // unhashed A4 manifest must not authorize a substituted target executable.
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&fs::read(&f.policy.a4_manifest_path).unwrap()).unwrap();
+    let modified = b"substituted executable";
+    fs::write(&f.policy.harness_path, modified).unwrap();
+    forged["harness_sha256"] = serde_json::json!(hash(modified));
+    fs::write(
+        &f.policy.a4_manifest_path,
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         verify_and_build_launch(&f.request, &f.policy),
         Err(WorkerError::UnverifiedToolchain)
