@@ -2,6 +2,9 @@
 //! The worker-core verifier *does not spawn* a native process. Windows Job
 //! Object ownership and quota enforcement are separate B1.5 gates.
 
+mod corpus;
+
+use corpus::CorpusSnapshot;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,6 +49,7 @@ pub struct VerifiedRunSpec {
     evidence_dir: PathBuf,
     // Windows sharing locks must outlive the supervised process, not just verification.
     _guards: Vec<File>,
+    _corpus: CorpusSnapshot,
 }
 
 impl VerifiedRunSpec {
@@ -157,9 +161,6 @@ fn open_guard(path: &Path, directory: bool) -> Result<File, WorkerError> {
         // Deny deletion of ancestors; deny both write and delete on verified files.
         options.share_mode(if directory { 3 } else { 1 });
         options.custom_flags(0x02000000 | 0x00200000); // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-        if directory {
-            options.access_mode(0x80);
-        } // FILE_READ_ATTRIBUTES
     }
     let file = options
         .open(path)
@@ -453,6 +454,16 @@ pub fn verify_and_build_launch(
     if !input.is_dir() {
         return Err(WorkerError::InvalidConfig);
     }
+    let root = verify_path(&policy.output_root, &policy.output_root, &mut guards)?;
+    if !root.is_dir() {
+        return Err(WorkerError::InvalidConfig);
+    }
+    let run_id = RunId(Uuid::new_v4());
+    let evidence_dir = root.join(run_id.0.to_string());
+    if evidence_dir.exists() {
+        return Err(WorkerError::InvalidConfig);
+    }
+    let mut corpus = CorpusSnapshot::create(root.join(format!("{}.seeds", run_id.0)))?;
     let provisioned_input = policy.allowed_input_root.join(&request.input_bundle_id);
     let mut count = 0_u32;
     let mut seed_bytes = 0_u64;
@@ -474,21 +485,20 @@ pub fn verify_and_build_launch(
         if seed_bytes > request.limits.max_disk_bytes.get() {
             return Err(WorkerError::LimitExceeded);
         }
+        let copied = corpus.copy_seed(&verified)?;
         guards.push(file);
+        corpus.files.push(open_guard(&copied, false)?);
     }
     if count == 0 {
         return Err(WorkerError::InvalidConfig);
     }
-    // The supervisor owns seed parsing and actual CPU/memory/disk/time enforcement (#41).
-    let root = verify_path(&policy.output_root, &policy.output_root, &mut guards)?;
-    if !root.is_dir() {
-        return Err(WorkerError::InvalidConfig);
-    }
-    let run_id = RunId(Uuid::new_v4());
-    let evidence_dir = root.join(run_id.0.to_string());
-    if evidence_dir.exists() {
-        return Err(WorkerError::InvalidConfig);
-    }
+    corpus.seal()?;
+    let input = fs::canonicalize(&corpus.path).map_err(|_| WorkerError::UnverifiedToolchain)?;
+    // Keep writable evidence out of WinAFL's unqualified taskkill executable search.
+    let working_dir = executable
+        .parent()
+        .ok_or(WorkerError::UnverifiedToolchain)?
+        .to_path_buf();
     let mut argv = vec![
         OsString::from("-i"),
         input.into_os_string(),
@@ -528,9 +538,10 @@ pub fn verify_and_build_launch(
         run_id,
         executable,
         argv,
-        working_dir: root,
+        working_dir,
         limits: request.limits,
         evidence_dir,
         _guards: guards,
+        _corpus: corpus,
     })
 }

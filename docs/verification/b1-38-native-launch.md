@@ -38,8 +38,21 @@ the returned plan exposes read-only accessors and cannot be freely constructed.
 
 On Windows, open ancestors without delete sharing and verified files without
 write/delete sharing, inspect the opened handle for reparse attributes, and
-keep handles in `VerifiedRunSpec`. Existing writable handles cause verification
-to fail rather than racing a writer. Seed files are held read-only as well.
+keep handles in `VerifiedRunSpec`. Directory opens request read-data access so
+they participate in Windows sharing checks. Existing writable handles cause verification
+to fail rather than racing a writer. Seed files are copied into a private per-run snapshot created with a protected
+Windows DACL. After copying, deny directory mutation and owner WRITE_DAC through
+an OWNER RIGHTS ACE, then retain file locks. This prevents a late `queue`
+junction or new seed from changing what WinAFL reads. A noninherited cleanup
+handle acquired before sealing restores access when the spec is dropped. The
+snapshot is removed after its file handles close; campaign evidence is retained.
+Other processes running under the trusted worker identity must not be hostile:
+same-account process-handle attacks are outside a filesystem verifier boundary.
+
+The current directory is the administrator-provisioned WinAFL binary directory,
+so WinAFL's unqualified `taskkill` fallback does not search writable evidence.
+Keep installation directories administrator-owned and exclude attacker-created
+executables from them.
 The future supervisor must own the spec until every descendant exits; dropping
 it immediately after spawn releases the protection. Unix verification is useful
 for portable tests but does not claim Windows sharing-lock semantics.
@@ -53,8 +66,9 @@ is test teardown and is not the production Job Object runner.
 ## Failure, rollback and recovery
 
 Validation failure returns a typed error before a launch spec exists. Handles
-close through RAII; no subprocess starts and no evidence directory is created
-by the verifier. A new UUID output path never overwrites an existing campaign.
+close through RAII; no subprocess starts. The verifier creates and seals a
+private corpus snapshot, removes it on failure/drop, and does not create the
+campaign evidence directory. A new UUID output path never overwrites an existing campaign.
 The runner must exclusively create/reserve that directory before executing,
 and hold the spec for the whole process tree. Slot ownership and atomic output
 reservation remain supervisor/coordinator responsibilities.
@@ -83,9 +97,22 @@ from this macOS host.
 The unchanged native A4–A6 gates remain required. The additional ignored Rust
 native test is explicitly invoked by that gate as its standard user; a missing
 binary or failed test fails the gate. It compares the entire argv to actual A5
-evidence (apart from the new output directory), runs the Rust-produced command,
+evidence (apart from the sealed input snapshot and new output directory), runs the Rust-produced command,
 requires increasing real WinAFL counters and at least 1,000 executions, and
 checks that the genuine harness remains write-locked through process teardown.
 `worker-native-acceptance.json` contains the source pin, both manifest digests,
 argv, observed counters and forced-stop reason; no PDFs or crash samples are
 uploaded. Final CI links are recorded in the implementing PR.
+
+## Independent review regressions
+
+Independent read-only review found three bypasses in the first candidate.
+[Windows RED run 38633332067](https://github.com/affan80/SumatraFuzz/actions/runs/38633332067/job/116090179482)
+reproduced all three: empty output root replacement, new `queue` directory after
+verification, and a writable native working directory (20 passed / 3 failed).
+The corrected implementation uses participating directory access, a sealed
+snapshot, and a trusted binary working directory. Windows GREEN and native
+results are recorded on the final PR commit.
+
+Windows security semantics reference:
+[OWNER RIGHTS](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers).

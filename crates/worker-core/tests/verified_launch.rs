@@ -130,9 +130,11 @@ fn verified_launch_builds_explicit_argv_without_shell() {
         .any(|x| x == ["-target_method", "fuzz_one_file"]));
     // Windows canonical paths can have an extended-length prefix.
     let actual_input = args.windows(2).find(|x| x[0] == "-i").unwrap();
+    let snapshot = PathBuf::from(&actual_input[1]);
+    assert_ne!(snapshot, fs::canonicalize(&fixture.bundle).unwrap());
     assert_eq!(
-        PathBuf::from(&actual_input[1]),
-        fs::canonicalize(&fixture.bundle).unwrap()
+        fs::read(snapshot.join("a.pdf")).unwrap(),
+        fs::read(fixture.bundle.join("a.pdf")).unwrap()
     );
     assert_eq!(args.last().map(String::as_str), Some("@@"));
     assert!(spec

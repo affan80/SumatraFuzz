@@ -76,12 +76,16 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     )
     .unwrap();
     let previous = a5["argv"].as_array().unwrap();
+    assert_eq!(
+        spec.executable(),
+        fs::canonicalize(previous[0].as_str().unwrap()).unwrap()
+    );
     let args = spec.argv();
     assert_eq!(args.len() + 1, previous.len());
     for (i, (arg, evidence)) in args.iter().zip(&previous[1..]).enumerate() {
-        if i == 3 {
+        if i == 1 || i == 3 {
             continue;
-        } // Each run must get a new output directory.
+        } // A sealed input snapshot and a new output directory are run-specific.
         let value = evidence.as_str().unwrap();
         if PathBuf::from(value).is_absolute() {
             assert_eq!(PathBuf::from(arg), fs::canonicalize(value).unwrap());
