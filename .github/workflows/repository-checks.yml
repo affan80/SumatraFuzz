@@ -21,6 +21,7 @@ jobs:
           persist-credentials: false
       - name: Show pinned Rust toolchain
         run: rustc --version
+
       - name: Verify locked dependencies
         run: cargo fetch --locked
       - name: Rust worker unit and integration tests
