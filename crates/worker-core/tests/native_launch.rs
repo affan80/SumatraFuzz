@@ -71,6 +71,40 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
         .write(true)
         .open(&policy.harness_path)
         .is_err());
+    // Diagnostic-only isolation of the known #85 failure. This is the same
+    // pinned parser and immutable seed snapshot used by the real worker run.
+    // Do not skip or replace the subsequent instrumented WinAFL acceptance.
+    let mut seeds = fs::read_dir(&spec.argv()[1])
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    seeds.sort();
+    assert!(!seeds.is_empty(), "sealed worker input is empty");
+    let seed = &seeds[0];
+    let mut probe = Command::new(&policy.harness_path)
+        .arg(seed)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("launch pinned harness on sealed seed");
+    let probe_begin = Instant::now();
+    loop {
+        if let Some(result) = probe.try_wait().unwrap() {
+            assert!(result.success(), "pinned harness rejected sealed seed: {result}");
+            break;
+        }
+        if probe_begin.elapsed() > Duration::from_secs(20) {
+            let _ = probe.kill();
+            let _ = probe.wait();
+            panic!("pinned harness cannot parse sealed snapshot seed within 20s");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!(
+        "native diagnostic: sealed corpus seed count={}, direct pinned parser elapsed_ms={}",
+        seeds.len(),
+        probe_begin.elapsed().as_millis()
+    );
     let a5: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join("runs/a5/campaign/campaign-metadata.json")).unwrap(),
     )
@@ -108,10 +142,11 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     let stats = spec.evidence_dir().join("fuzzer_stats");
     let mut first = None;
     let count = loop {
-        assert!(
-            process.0.try_wait().unwrap().is_none(),
-            "WinAFL exited early"
-        );
+        if let Some(exit) = process.0.try_wait().unwrap() {
+            let output = fs::read_to_string(root.join("runs/worker-native.stdout.log"))
+                .unwrap_or_else(|_| "native stdout unavailable".to_owned());
+            panic!("WinAFL exited early ({exit}); native diagnostic log: {output}");
+        }
         assert!(
             begin.elapsed() < Duration::from_secs(180),
             "native worker argv did not reach 1000 actual executions"
