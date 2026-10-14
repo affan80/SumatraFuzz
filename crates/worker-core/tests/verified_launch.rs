@@ -566,10 +566,21 @@ fn pinned_winafl_argv_uses_ordinary_local_dos_paths_after_canonical_verification
         spec.argv()[3].to_string_lossy().into_owned(),
         spec.argv()[5].to_string_lossy().into_owned(),
         spec.argv()[7].to_string_lossy().into_owned(),
-        spec.argv()[spec.argv().len() - 2].to_string_lossy().into_owned(),
+        spec.argv()[spec.argv().len() - 2]
+            .to_string_lossy()
+            .into_owned(),
     ] {
-        assert!(!path.starts_with(r"\\?\"), "WinAFL received NT namespace path: {path}");
-        assert!(!path.starts_with(r"\\.\"), "WinAFL received device path: {path}");
-        assert!(Path::new(&path).is_absolute(), "WinAFL received relative path");
+        assert!(
+            !path.starts_with(r"\\?\"),
+            "WinAFL received NT namespace path: {path}"
+        );
+        assert!(
+            !path.starts_with(r"\\.\"),
+            "WinAFL received device path: {path}"
+        );
+        assert!(
+            Path::new(&path).is_absolute(),
+            "WinAFL received relative path"
+        );
     }
 }
