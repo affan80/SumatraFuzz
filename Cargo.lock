@@ -670,7 +670,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
- "windows-sys",
  "worker-protocol",
 ]
 
