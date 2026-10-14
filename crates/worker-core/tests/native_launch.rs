@@ -123,20 +123,29 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     let logdir = root.join("runs/worker-drrun-diagnostic");
     fs::create_dir(&logdir).unwrap();
     let mut drargs = vec![
-        "-c".to_owned(), client.to_owned(),
-        "-debug".to_owned(), "-logdir".to_owned(), logdir.to_string_lossy().into_owned(),
-        "-covtype".to_owned(), "edge".to_owned(),
+        "-c".to_owned(),
+        client.to_owned(),
+        "-debug".to_owned(),
+        "-logdir".to_owned(),
+        logdir.to_string_lossy().into_owned(),
+        "-covtype".to_owned(),
+        "edge".to_owned(),
     ];
     for coverage in a4_evidence["confirmed_modules"].as_array().unwrap() {
         drargs.push("-coverage_module".to_owned());
         drargs.push(coverage.as_str().unwrap().to_owned());
     }
     drargs.extend([
-        "-target_module".to_owned(), "sumatrafuzz-harness.exe".to_owned(),
-        "-target_method".to_owned(), "fuzz_one_file".to_owned(),
-        "-fuzz_iterations".to_owned(), "10".to_owned(),
-        "-nargs".to_owned(), "1".to_owned(),
-        "--".to_owned(), policy.harness_path.to_string_lossy().into_owned(),
+        "-target_module".to_owned(),
+        "sumatrafuzz-harness.exe".to_owned(),
+        "-target_method".to_owned(),
+        "fuzz_one_file".to_owned(),
+        "-fuzz_iterations".to_owned(),
+        "10".to_owned(),
+        "-nargs".to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+        policy.harness_path.to_string_lossy().into_owned(),
         seed.to_string_lossy().into_owned(),
     ]);
     let mut instrumented = Command::new(dr)
@@ -149,7 +158,10 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     let dr_begin = Instant::now();
     loop {
         if let Some(exit) = instrumented.try_wait().unwrap() {
-            assert!(exit.success(), "guarded DynamoRIO diagnostic failed: {exit}");
+            assert!(
+                exit.success(),
+                "guarded DynamoRIO diagnostic failed: {exit}"
+            );
             break;
         }
         if dr_begin.elapsed() > Duration::from_secs(20) {
