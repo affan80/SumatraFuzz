@@ -91,5 +91,18 @@ $lock | Add-Member -NotePropertyName acquisition -NotePropertyValue ([ordered]@{
   winafl_source_commit = $winAflCommit
   winafl_repository = 'https://github.com/googleprojectzero/winafl'
 }) -Force
+# Lock every PE runtime component, including drconfig.exe used by WinAFL shutdown.
+$runtimePaths = @(
+  Get-ChildItem -LiteralPath $drRoot -Recurse -File | Where-Object { $_.Extension -in @('.dll','.exe') -and $_.FullName -match '[\\/](bin64|lib64)[\\/]' }
+  Get-ChildItem -LiteralPath $aflCandidates[0].DirectoryName -File | Where-Object { $_.Extension -in @('.dll','.exe') }
+)
+if ($runtimePaths.Count -lt 1 -or $runtimePaths.Count -gt 512) { throw 'Unexpected native runtime inventory size' }
+$runtimeFiles = @($runtimePaths | Sort-Object -Property FullName -Unique | ForEach-Object {
+  [ordered]@{ path=$_.FullName; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+})
+if (-not ($runtimeFiles | Where-Object { $_.path -eq (Join-Path (Split-Path $drrun -Parent) 'drconfig.exe') })) {
+  throw 'Pinned DynamoRIO drconfig.exe is missing'
+}
+$lock | Add-Member -NotePropertyName runtime_files -NotePropertyValue $runtimeFiles -Force
 $lock | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $lockPath -Encoding utf8
 Write-Output "Real toolchain lock: $lockPath"
