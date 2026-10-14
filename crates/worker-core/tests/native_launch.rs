@@ -90,7 +90,10 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
     let probe_begin = Instant::now();
     loop {
         if let Some(result) = probe.try_wait().unwrap() {
-            assert!(result.success(), "pinned harness rejected sealed seed: {result}");
+            assert!(
+                result.success(),
+                "pinned harness rejected sealed seed: {result}"
+            );
             break;
         }
         if probe_begin.elapsed() > Duration::from_secs(20) {
