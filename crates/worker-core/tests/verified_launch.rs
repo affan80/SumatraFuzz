@@ -549,3 +549,27 @@ fn admitted_corpus_namespace_cannot_gain_a_queue_after_verification() {
         .open(input.join("a.pdf"))
         .is_err());
 }
+
+#[cfg(windows)]
+#[test]
+fn pinned_winafl_argv_uses_ordinary_local_dos_paths_after_canonical_verification() {
+    let f = fixture();
+    let spec = verify_and_build_launch(&f.request, &f.policy).unwrap();
+    // Unlike std::fs::canonicalize(), the successful A5 native launch uses
+    // ordinary D:\\... paths; WinAFL builds an unquoted downstream command.
+    // Retain the canonical verified handles, but never pass the Win32 device
+    // namespace prefix to this pinned legacy native toolchain.
+    for path in [
+        spec.executable().to_string_lossy().into_owned(),
+        spec.working_dir().to_string_lossy().into_owned(),
+        spec.argv()[1].to_string_lossy().into_owned(),
+        spec.argv()[3].to_string_lossy().into_owned(),
+        spec.argv()[5].to_string_lossy().into_owned(),
+        spec.argv()[7].to_string_lossy().into_owned(),
+        spec.argv()[spec.argv().len() - 2].to_string_lossy().into_owned(),
+    ] {
+        assert!(!path.starts_with(r"\\?\"), "WinAFL received NT namespace path: {path}");
+        assert!(!path.starts_with(r"\\.\"), "WinAFL received device path: {path}");
+        assert!(Path::new(&path).is_absolute(), "WinAFL received relative path");
+    }
+}
