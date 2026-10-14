@@ -511,3 +511,39 @@ fn unsafe_downstream_dynamorio_paths_are_rejected() {
     );
     assert!(verify_and_build_launch(&f.request, &f.policy).is_err());
 }
+
+#[test]
+fn native_working_directory_cannot_search_writable_evidence_for_helpers() {
+    let f = fixture();
+    let spec = verify_and_build_launch(&f.request, &f.policy).unwrap();
+    assert_eq!(
+        spec.working_dir(),
+        fs::canonicalize(&f.policy.allowed_tool_root).unwrap()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_output_root_cannot_be_replaced_while_verified() {
+    let f = fixture();
+    let spec = verify_and_build_launch(&f.request, &f.policy).unwrap();
+    let moved = f.policy.output_root.with_extension("moved");
+    assert!(fs::rename(&f.policy.output_root, &moved).is_err());
+    drop(spec);
+    fs::rename(&f.policy.output_root, moved).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn admitted_corpus_namespace_cannot_gain_a_queue_after_verification() {
+    let f = fixture();
+    let spec = verify_and_build_launch(&f.request, &f.policy).unwrap();
+    let args = spec.argv();
+    let input = PathBuf::from(&args[1]);
+    assert!(fs::create_dir(input.join("queue")).is_err());
+    assert!(fs::write(input.join("new.pdf"), b"unverified").is_err());
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(input.join("a.pdf"))
+        .is_err());
+}
