@@ -108,6 +108,61 @@ fn genuine_native_launch_matches_a5_and_preserves_file_guards() {
         seeds.len(),
         probe_begin.elapsed().as_millis()
     );
+
+    // A4 ran DynamoRIO without the worker's long-lived file guards. Run one
+    // *genuine* instrumented invocation WITH those guards to isolate whether
+    // DR initialization is blocked before WinAFL's persistent-mode handshake.
+    let lock: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("external/native-tools/locks/target-lock.json")).unwrap(),
+    )
+    .unwrap();
+    let dr = lock["tools"]["drrun"]["path"].as_str().unwrap();
+    let client = lock["tools"]["winafl_client"]["path"].as_str().unwrap();
+    let a4_evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(&policy.a4_manifest_path).unwrap()).unwrap();
+    let logdir = root.join("runs/worker-drrun-diagnostic");
+    fs::create_dir(&logdir).unwrap();
+    let mut drargs = vec![
+        "-c".to_owned(), client.to_owned(),
+        "-debug".to_owned(), "-logdir".to_owned(), logdir.to_string_lossy().into_owned(),
+        "-covtype".to_owned(), "edge".to_owned(),
+    ];
+    for coverage in a4_evidence["confirmed_modules"].as_array().unwrap() {
+        drargs.push("-coverage_module".to_owned());
+        drargs.push(coverage.as_str().unwrap().to_owned());
+    }
+    drargs.extend([
+        "-target_module".to_owned(), "sumatrafuzz-harness.exe".to_owned(),
+        "-target_method".to_owned(), "fuzz_one_file".to_owned(),
+        "-fuzz_iterations".to_owned(), "10".to_owned(),
+        "-nargs".to_owned(), "1".to_owned(),
+        "--".to_owned(), policy.harness_path.to_string_lossy().into_owned(),
+        seed.to_string_lossy().into_owned(),
+    ]);
+    let mut instrumented = Command::new(dr)
+        .args(&drargs)
+        .current_dir(spec.working_dir())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start guarded, genuinely instrumented DynamoRIO diagnostic");
+    let dr_begin = Instant::now();
+    loop {
+        if let Some(exit) = instrumented.try_wait().unwrap() {
+            assert!(exit.success(), "guarded DynamoRIO diagnostic failed: {exit}");
+            break;
+        }
+        if dr_begin.elapsed() > Duration::from_secs(20) {
+            let _ = instrumented.kill();
+            let _ = instrumented.wait();
+            panic!("guarded DynamoRIO diagnostic exceeded 20s");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!(
+        "native diagnostic: guarded DynamoRIO ten-cycle elapsed_ms={}",
+        dr_begin.elapsed().as_millis()
+    );
     let a5: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join("runs/a5/campaign/campaign-metadata.json")).unwrap(),
     )
