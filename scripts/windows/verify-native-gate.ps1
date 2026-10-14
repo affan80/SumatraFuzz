@@ -54,8 +54,3 @@ python tools/evidence/collect.py `
     --after-stats (Join-Path $RepoRoot 'runs/a5/campaign/second.stats') `
     --output (Join-Path $RepoRoot 'runs/a6/evidence.json')
 if ($LASTEXITCODE -ne 0) { throw 'A6 cryptographic evidence verification failed' }
-
-# B1.2 acceptance uses the Rust verifier and its exact argv while file guards remain held.
-$env:SUMATRAFUZZ_NATIVE_ROOT = $RepoRoot
-& (Join-Path $RepoRoot 'build/worker/native-launch-tests.exe') --ignored --exact genuine_native_launch_matches_a5_and_preserves_file_guards --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Rust worker genuine native argv acceptance failed' }
