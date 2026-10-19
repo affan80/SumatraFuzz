@@ -12,6 +12,7 @@ import {
 const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const profile = {
   workerId: '11111111-1111-4111-8111-111111111111',
+  controllerId: '22222222-2222-4222-8222-222222222222',
   baseUrl: 'https://worker.example.test',
   workerFingerprint: `${'AA:'.repeat(31)}AA`,
   controllerCertificatePem: '-----BEGIN CERTIFICATE-----\nclient-cert\n-----END CERTIFICATE-----',
@@ -69,6 +70,47 @@ describe('signed worker pairing bundles', () => {
         new Date(8 * 24 * 60 * 60 * 1000),
       ),
     ).toThrow(/validity window/);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['nil', '00000000-0000-0000-0000-000000000000'],
+    ['malformed', 'controller-one'],
+  ])('rejects a %s signed controller UUID', (_name, controllerId) => {
+    const overrides = { controllerId };
+    const bundle = makeBundle({ profileOverrides: overrides });
+
+    expect(() =>
+      verifyWorkerPairingBundle(
+        bundle,
+        publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      ),
+    ).toThrow(/worker profile is invalid/);
+  });
+
+  it('rejects a controller UUID changed after the signed bundle was created', () => {
+    const valid = JSON.parse(makeBundle().toString()) as {
+      payload: string;
+      signature: string;
+      format: string;
+    };
+    const payload = JSON.parse(Buffer.from(valid.payload, 'base64').toString('utf8')) as {
+      profile: Record<string, unknown>;
+    };
+    payload.profile.controllerId = '33333333-3333-4333-8333-333333333333';
+    const tampered = Buffer.from(
+      JSON.stringify({
+        ...valid,
+        payload: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      }),
+    );
+
+    expect(() =>
+      verifyWorkerPairingBundle(
+        tampered,
+        publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      ),
+    ).toThrow(/signature/);
   });
 
   it('rejects unsigned, modified, and incorrectly signed bundle contents', () => {

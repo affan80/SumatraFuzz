@@ -5,8 +5,10 @@ import { createDesktopWorkerController } from '../src/main/worker-controller.js'
 import type { WorkerProfile } from '../src/main/worker-profile-store.js';
 
 const workerId = '11111111-1111-4111-8111-111111111111';
+const controllerId = '22222222-2222-4222-8222-222222222222';
 const profile: WorkerProfile = {
   workerId,
+  controllerId,
   baseUrl: 'https://worker.example.test',
   workerFingerprint: 'a'.repeat(64),
   controllerCertificatePem: '-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----',

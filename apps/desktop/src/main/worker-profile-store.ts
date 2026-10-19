@@ -1,16 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { normalizeCertificateFingerprint, validateWorkerUrl } from '@sumatrafuzz/worker-client';
 import { isNonNilUuid } from '@sumatrafuzz/worker-protocol';
 
-const FORMAT = 'sumatrafuzz-worker-profile-v1';
+const FORMAT = 'sumatrafuzz-worker-profile-v2';
 const MAX_PROFILE_BYTES = 512 * 1024;
 const MAX_ENVELOPE_BYTES = MAX_PROFILE_BYTES + 4096;
 const MAX_ROTATION_RETRIES = 3;
 
 export interface WorkerProfile {
   readonly workerId: string;
+  readonly controllerId: string;
   readonly baseUrl: string;
   readonly workerFingerprint: string;
   readonly controllerCertificatePem: string;
@@ -35,6 +36,7 @@ export interface WorkerProfileStore {
 
 export interface WorkerProfileStoreOptions {
   readonly filePath: string;
+  readonly legacyFilePath?: string;
   readonly safeStorage: SafeStorageAdapter;
   readonly platform?: NodeJS.Platform;
 }
@@ -46,6 +48,7 @@ export function validateWorkerProfile(value: unknown): WorkerProfile {
   const candidate = value as Record<string, unknown>;
   const expectedKeys = [
     'workerId',
+    'controllerId',
     'baseUrl',
     'workerFingerprint',
     'controllerCertificatePem',
@@ -58,6 +61,8 @@ export function validateWorkerProfile(value: unknown): WorkerProfile {
     keys.some((key, index) => key !== expectedKeys[index]) ||
     typeof candidate.workerId !== 'string' ||
     !isNonNilUuid(candidate.workerId) ||
+    typeof candidate.controllerId !== 'string' ||
+    !isNonNilUuid(candidate.controllerId) ||
     typeof candidate.baseUrl !== 'string' ||
     typeof candidate.workerFingerprint !== 'string' ||
     typeof candidate.controllerCertificatePem !== 'string' ||
@@ -88,6 +93,7 @@ export function validateWorkerProfile(value: unknown): WorkerProfile {
 
   const profile: WorkerProfile = {
     workerId: candidate.workerId,
+    controllerId: candidate.controllerId,
     baseUrl: candidate.baseUrl,
     workerFingerprint,
     controllerCertificatePem: candidate.controllerCertificatePem,
@@ -128,6 +134,7 @@ function decodeEnvelope(contents: Buffer): Buffer {
 
 export function createWorkerProfileStore({
   filePath,
+  legacyFilePath,
   safeStorage,
   platform = process.platform,
 }: WorkerProfileStoreOptions): WorkerProfileStore {
@@ -182,6 +189,22 @@ export function createWorkerProfileStore({
           'code' in error &&
           error.code === 'ENOENT'
         ) {
+          if (legacyFilePath) {
+            try {
+              await lstat(legacyFilePath);
+              // A legacy profile lacks a signed controller identity. Leave it intact and require re-pairing.
+              return null;
+            } catch (legacyError) {
+              if (
+                typeof legacyError !== 'object' ||
+                legacyError === null ||
+                !('code' in legacyError) ||
+                legacyError.code !== 'ENOENT'
+              ) {
+                throw legacyError;
+              }
+            }
+          }
           return null;
         }
         throw error;
@@ -212,7 +235,11 @@ export function createWorkerProfileStore({
       await writeEncrypted(JSON.stringify(profile));
     },
     async clear() {
-      await rm(filePath, { force: true });
+      await Promise.all(
+        [filePath, legacyFilePath]
+          .filter((candidate): candidate is string => Boolean(candidate))
+          .map((candidate) => rm(candidate, { force: true })),
+      );
     },
   };
 }

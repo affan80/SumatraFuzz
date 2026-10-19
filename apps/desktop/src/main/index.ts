@@ -68,7 +68,8 @@ void app
     installRendererProtocol();
     denyPermissions();
     const profileStore = createWorkerProfileStore({
-      filePath: path.join(app.getPath('userData'), 'worker-profile.v1.enc'),
+      filePath: path.join(app.getPath('userData'), 'worker-profile.v2.enc'),
+      legacyFilePath: path.join(app.getPath('userData'), 'worker-profile.v1.enc'),
       safeStorage,
     });
     workerController = createDesktopWorkerController({

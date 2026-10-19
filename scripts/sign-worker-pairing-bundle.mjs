@@ -67,6 +67,7 @@ async function main() {
   } catch {
     throw new Error('profile input must be valid JSON');
   }
+  // The shared profile validator requires controllerId, which is covered by the bundle signature.
   const bundle = createWorkerPairingBundle(profile, privateKey);
   const temporaryPath = `${destination}.${randomUUID()}.tmp`;
   let temporaryCreated = false;

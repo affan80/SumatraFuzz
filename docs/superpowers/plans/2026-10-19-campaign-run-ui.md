@@ -36,12 +36,13 @@
 **Files:**
 - Modify: `apps/desktop/src/main/worker-bundle.ts`
 - Modify: `apps/desktop/src/main/worker-profile-store.ts`
+- Modify: `apps/desktop/src/main/index.ts`
 - Modify: `scripts/sign-worker-pairing-bundle.mjs`
 - Modify: `README.md`
 - Modify: `apps/desktop/test/worker-bundle.test.ts`
 - Modify: `apps/desktop/test/worker-profile-store.test.ts`
 
-**Interfaces:** `WorkerProfile.controllerId: string` is a non-nil UUID. Signed bundle payloads carry the profile field under the existing Ed25519 envelope. A new encrypted profile format/path stores the field; a legacy profile remains untouched and requires re-pairing.
+**Interfaces:** `WorkerProfile.controllerId: string` is a non-nil UUID. Signed bundle payloads carry the profile field under the existing Ed25519 envelope. The desktop writes `worker-profile.v2.enc`, detects but never loads or rewrites `worker-profile.v1.enc`, and requires signed re-pairing when only the legacy file exists.
 
 - [ ] **Step 1: Write failing tests** for missing, nil, malformed and tampered `controllerId`; assert the signature covers it and the profile validator accepts a valid UUID.
 - [ ] **Step 2: Run focused tests and confirm failure.** Run: `npx vitest run apps/desktop/test/worker-bundle.test.ts apps/desktop/test/worker-profile-store.test.ts`.
