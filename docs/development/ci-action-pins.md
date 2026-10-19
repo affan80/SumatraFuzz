@@ -98,11 +98,14 @@ correctness boundary.
 
 The journal PR's exact-commit run 39199281160 measured about 298 seconds for
 the real-parser job and 802 seconds for native instrumentation/acceptance.
-Those required jobs dominate the critical path. This update targets duplicate
-runs, dependency downloads and repeat Rust compilation; the new exact-commit
-run will show whether it helps. The native Windows gate remains the main
-wall-clock cost. Cold caches can add overhead. No native test duration,
-execution threshold or assertion is reduced.
+Those required jobs dominate the critical path. On CI run 39201869051, the cold
+Linux and Windows Rust jobs took 52 and 60 seconds. Re-running those jobs at the
+same commit with exact cache hits took 15 and 42 seconds. The observed Rust-job
+reductions were 37 seconds on Linux and 18 seconds on Windows; runner and cache
+transfer variation can change these values. The full workflow remains dominated
+by the native Windows gate, so no comparable end-to-end reduction is claimed.
+Cold caches can add overhead. No native test duration, execution threshold or
+assertion is reduced.
 
 #68 still requires effective branch-protection verification, security/dependency
 scanning, tool provenance and SBOM/license review, later lifecycle/API gates,
