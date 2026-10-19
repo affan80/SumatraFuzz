@@ -8,7 +8,7 @@ import {
   DebugLogError,
   inspectDebugLog,
 } from '@sumatrafuzz/instrumentation/verify-debug';
-import { parseWinAflStats, StatsError, verifyProgress, type WinAflStats } from './stats.js';
+import { parseWinAflStats, StatsError, verifyProgress, type WinAflStats } from './stats.ts';
 
 const PIN = '16c59fde8b824ab54c56f23aef910a6fdd874ad0';
 const MAX_JSON_BYTES = 1024 * 1024;

@@ -40,7 +40,7 @@ if (Test-Path -LiteralPath $OutputDir) { throw 'Refusing to overwrite an existin
 $null=New-Item -ItemType Directory -Path $OutputDir -Force
 $debugTool = $lock.tools.drrun.path
 $client = $lock.tools.winafl_client.path
-$pythonScript = (Resolve-Path (Join-Path $PSScriptRoot '../../tools/instrumentation/verify_debug.py')).Path
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $harnessName = [IO.Path]::GetFileName($HarnessExe)
 & $HarnessExe $InputPdf
 if ($LASTEXITCODE -ne 0) { throw 'Genuine A3 parser rejected debug seed before instrumentation' }
@@ -55,7 +55,7 @@ if ($LASTEXITCODE -ne 0) { throw "DynamoRIO discovery run failed: $LASTEXITCODE"
 $files=@(Get-ChildItem -LiteralPath $discoveryDir -File -Recurse | Where-Object {$_.Name -like '*proc.log'})
 if ($files.Count -ne 1) { throw "Expected one real WinAFL debug log; got $($files.Count)" }
 $discoveryJson=Join-Path $OutputDir 'discovery.json'
-& python $pythonScript --log $files[0].FullName --out $discoveryJson --expected-cycles 10 --discovery-only
+& node --experimental-strip-types (Join-Path $repoRoot 'scripts/windows/verify-debug.ts') --log $files[0].FullName --out $discoveryJson --expected-cycles 10 --discovery-only
 if ($LASTEXITCODE -ne 0) { throw 'Real module discovery failed' }
 $observed=Get-Content -LiteralPath $discoveryJson -Raw | ConvertFrom-Json
 $modules=@($observed.confirmed_coverage_modules)
@@ -73,7 +73,7 @@ if ($LASTEXITCODE -ne 0) { throw "DynamoRIO coverage confirmation failed: $LASTE
 $confirmed=@(Get-ChildItem -LiteralPath $confirmationDir -File -Recurse | Where-Object {$_.Name -like '*proc.log'})
 if ($confirmed.Count -ne 1) { throw 'Expected one real confirmed WinAFL debug log' }
 $confirmedJson=Join-Path $OutputDir 'confirmed.json'
-& python $pythonScript --log $confirmed[0].FullName --out $confirmedJson --expected-cycles 10
+& node --experimental-strip-types (Join-Path $repoRoot 'scripts/windows/verify-debug.ts') --log $confirmed[0].FullName --out $confirmedJson --expected-cycles 10
 if ($LASTEXITCODE -ne 0) { throw 'No genuine repeated parser instrumentation/coverage' }
 $record=Get-Content -LiteralPath $confirmedJson -Raw | ConvertFrom-Json
 if ($record.bitmap_nonzero_bytes -lt 1) { throw 'Empty edge feedback map' }
