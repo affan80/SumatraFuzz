@@ -11,7 +11,7 @@ const baseStatus = {
   worker_id: workerId,
   max_limits: {
     max_duration_s: 300,
-    max_memory_bytes: 1024,
+    max_memory_bytes: 64 * 1024 * 1024,
     max_disk_bytes: 2048,
     max_cpu_percent: 80,
   },
@@ -60,6 +60,12 @@ describe('campaign renderer view mapping', () => {
   });
 
   it('rejects malformed policy limits and worker-mismatched run summaries', () => {
+    expect(
+      parseCampaignStatus({
+        ...baseStatus,
+        max_limits: { ...baseStatus.max_limits, max_memory_bytes: 16 * 1024 * 1024 - 1 },
+      }),
+    ).toBeNull();
     expect(
       parseCampaignStatus({
         ...baseStatus,

@@ -210,7 +210,7 @@ campaignForm.addEventListener('submit', async (event) => {
   if (
     !Object.values(limits).every(Number.isSafeInteger) ||
     limits.max_duration_s < 1 ||
-    limits.max_memory_bytes < 1 ||
+    limits.max_memory_bytes < 16 * 1024 * 1024 ||
     limits.max_disk_bytes < 1 ||
     limits.max_cpu_percent < 1 ||
     limits.max_cpu_percent > 100
@@ -236,6 +236,7 @@ stopButton.addEventListener('click', async () => {
   status.textContent = 'Requesting campaign stop…';
   try {
     await window.sumatraFuzz.stopActiveRun();
+    renderStatus(await window.sumatraFuzz.getCampaignStatus());
     status.textContent = 'Campaign stop requested.';
   } catch {
     status.textContent = 'Campaign stop could not be confirmed.';

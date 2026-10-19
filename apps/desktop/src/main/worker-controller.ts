@@ -4,7 +4,12 @@ import type {
   WorkerCapabilities,
   WorkerClient,
 } from '@sumatrafuzz/worker-client';
-import { type RunRequest, type RunStatus, validateRunRequest } from '@sumatrafuzz/worker-protocol';
+import {
+  MIN_CAMPAIGN_MEMORY_BYTES,
+  type RunRequest,
+  type RunStatus,
+  validateRunRequest,
+} from '@sumatrafuzz/worker-protocol';
 import type { DesktopIpcHandlers, RunDraft } from './ipc.js';
 import { verifyWorkerPairingBundle } from './worker-bundle.js';
 import type { WorkerProfile, WorkerProfileStore } from './worker-profile-store.js';
@@ -240,9 +245,14 @@ export function createDesktopWorkerController({
       }
       const { client, profile } = await requireClient();
       const capabilities = await client.capabilities();
-      const run = await guardedClientCall(client, () => client.activeRun());
-      activeRunId = run?.run_id ?? null;
-      if (!run) campaignLabel = null;
+      const run = await guardedClientCall(client, () =>
+        activeRunId ? client.getRun(activeRunId) : client.activeRun(),
+      );
+      if (!activeRunId && run) activeRunId = run.run_id;
+      if (!run) {
+        activeRunId = null;
+        campaignLabel = null;
+      }
       const currentImport =
         importedBundle?.workerId === profile.workerId &&
         importedBundle.controllerId === profile.controllerId
@@ -273,8 +283,13 @@ export function createDesktopWorkerController({
           throw new Error('import a PDF bundle for the currently paired worker first');
         }
         const active = await guardedClientCall(client, () => client.activeRun());
-        activeRunId = active?.run_id ?? null;
-        if (activeRunId) throw new Error('a campaign is already active');
+        if (active) throw new Error('a campaign is already active');
+        if (draft.limits.max_memory_bytes < MIN_CAMPAIGN_MEMORY_BYTES) {
+          throw new RangeError('campaign memory limit is below the native minimum');
+        }
+        if (draft.limits.max_disk_bytes !== capabilities.max_limits.max_disk_bytes) {
+          throw new RangeError('campaign disk limit must match the worker volume quota');
+        }
         for (const key of [
           'max_duration_s',
           'max_memory_bytes',
@@ -305,13 +320,6 @@ export function createDesktopWorkerController({
         const runId = activeRunId;
         if (!runId) return null;
         const status = await guardedClientCall(client, () => client.stopRun(runId));
-        if (
-          status.state !== 'running' &&
-          status.state !== 'stopping' &&
-          status.state !== 'preparing'
-        ) {
-          activeRunId = null;
-        }
         return status;
       });
     },

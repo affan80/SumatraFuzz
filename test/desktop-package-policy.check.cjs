@@ -48,6 +48,7 @@ test('desktop package policy accepts only the worker runtime and required app as
   const findings = findForbiddenPackageEntries([
     'package.json',
     'dist/src/main/index.js',
+    'dist/preload.cjs',
     'dist/renderer/app.js',
     'dist/resources/worker-bundle-signing-key.pem',
     'node_modules/@sumatrafuzz/worker-client/package.json',
@@ -60,4 +61,11 @@ test('desktop package policy accepts only the worker runtime and required app as
     'node_modules/@sinclair/typebox/build/esm/index.mjs',
   ]);
   assert.deepEqual(findings, []);
+});
+
+test('desktop package policy rejects unbundled preload source and allows its CommonJS bundle', async () => {
+  const { findForbiddenPackageEntries } = await import('../scripts/check-desktop-package.mjs');
+  const findings = findForbiddenPackageEntries(['dist/preload.cjs', 'dist/src/preload/index.js']);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /preload source/i);
 });

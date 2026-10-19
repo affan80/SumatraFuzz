@@ -10,7 +10,16 @@ const desktopPackage = JSON.parse(readFileSync(path.join(desktopRoot, 'package.j
 
 test('desktop package main, preload and renderer resolve to built files', () => {
   assert.equal(existsSync(path.join(desktopRoot, desktopPackage.main)), true);
-  assert.equal(existsSync(path.join(desktopRoot, 'dist', 'src', 'preload', 'index.js')), true);
+  const preloadPath = path.join(desktopRoot, 'dist', 'preload.cjs');
+  assert.equal(existsSync(preloadPath), true, 'sandboxed preload must be bundled as CommonJS');
+  const preload = readFileSync(preloadPath, 'utf8');
+  assert.match(preload, /require\(["']electron["']\)/);
+  assert.doesNotMatch(preload, /^\s*(?:import|export)\s/m);
+  const main = readFileSync(path.join(desktopRoot, 'dist', 'src', 'main', 'index.js'), 'utf8');
+  assert.match(main, /dist', 'preload\.cjs/);
+  const html = readFileSync(path.join(desktopRoot, 'dist', 'renderer', 'index.html'), 'utf8');
+  assert.match(html, /id="limit-memory"[^>]*min="16777216"/);
+  assert.match(html, /id="limit-disk"[^>]*readonly/);
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'index.html')), true);
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'app.js')), true);
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'campaign-poller.js')), true);

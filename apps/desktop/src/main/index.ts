@@ -120,7 +120,7 @@ void app
     });
     await workerController.restore();
     registerDesktopIpc(ipcMain as unknown as DesktopIpcRegistrar, workerController);
-    createMainWindow(path.join(app.getAppPath(), 'dist', 'src', 'preload', 'index.js'));
+    createMainWindow(path.join(app.getAppPath(), 'dist', 'preload.cjs'));
   })
   .catch(() => {
     dialog.showErrorBox(

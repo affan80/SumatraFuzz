@@ -52,7 +52,7 @@ function workerClient(id = workerId, authenticatedControllerId = controllerId): 
       target_lock_sha256: 'b'.repeat(64),
       max_limits: {
         max_duration_s: 10,
-        max_memory_bytes: 100,
+        max_memory_bytes: 64 * 1024 * 1024,
         max_disk_bytes: 200,
         max_cpu_percent: 20,
       },
@@ -136,7 +136,7 @@ describe('desktop worker controller pairing', () => {
       target_lock_sha256: 'b'.repeat(64),
       max_limits: {
         max_duration_s: 10,
-        max_memory_bytes: 100,
+        max_memory_bytes: 64 * 1024 * 1024,
         max_disk_bytes: 200,
         max_cpu_percent: 20,
       },
@@ -204,7 +204,7 @@ describe('desktop worker controller pairing', () => {
       label: 'nightly',
       limits: {
         max_duration_s: 10,
-        max_memory_bytes: 100,
+        max_memory_bytes: 64 * 1024 * 1024,
         max_disk_bytes: 200,
         max_cpu_percent: 20,
       },
@@ -229,7 +229,7 @@ describe('desktop worker controller pairing', () => {
         label: 'too large',
         limits: {
           max_duration_s: 11,
-          max_memory_bytes: 100,
+          max_memory_bytes: 64 * 1024 * 1024,
           max_disk_bytes: 200,
           max_cpu_percent: 20,
         },
@@ -243,12 +243,38 @@ describe('desktop worker controller pairing', () => {
         label: 'stale',
         limits: {
           max_duration_s: 10,
-          max_memory_bytes: 100,
+          max_memory_bytes: 64 * 1024 * 1024,
           max_disk_bytes: 200,
           max_cpu_percent: 20,
         },
       }),
     ).rejects.toThrow(/no worker is paired/i);
+  });
+
+  it('rejects native memory below its minimum and disk limits below the provisioned quota', async () => {
+    const { controller, client } = setup({ selected: signedBundle() });
+    await controller.pairWorker();
+    await controller.importInputBundle();
+    const limits = {
+      max_duration_s: 10,
+      max_memory_bytes: 64 * 1024 * 1024,
+      max_disk_bytes: 200,
+      max_cpu_percent: 20,
+    };
+
+    await expect(
+      controller.startCampaign({
+        label: 'too little memory',
+        limits: { ...limits, max_memory_bytes: 1024 },
+      }),
+    ).rejects.toThrow(/native minimum/i);
+    await expect(
+      controller.startCampaign({
+        label: 'unprovisioned disk limit',
+        limits: { ...limits, max_disk_bytes: 199 },
+      }),
+    ).rejects.toThrow(/worker volume quota/i);
+    expect(client.startRun).not.toHaveBeenCalled();
   });
 
   it('recovers the active run after restoring the profile and stops only that run', async () => {
@@ -271,6 +297,43 @@ describe('desktop worker controller pairing', () => {
     expect(client.activeRun).toHaveBeenCalledOnce();
     await controller.stopActiveRun();
     expect(client.stopRun).toHaveBeenCalledWith(runId);
+  });
+
+  it('keeps the last run outcome visible after the worker clears its active slot', async () => {
+    const { controller, client } = setup({ selected: signedBundle() });
+    await controller.pairWorker();
+    await controller.importInputBundle();
+    vi.mocked(client.startRun).mockResolvedValue({
+      run_id: runId,
+      worker_id: workerId,
+      state: 'running',
+      last_event_seq: 1n,
+      stop_reason: null,
+    });
+    await controller.startCampaign({
+      label: 'nightly',
+      limits: {
+        max_duration_s: 10,
+        max_memory_bytes: 64 * 1024 * 1024,
+        max_disk_bytes: 200,
+        max_cpu_percent: 20,
+      },
+    });
+
+    vi.mocked(client.activeRun).mockResolvedValue(null);
+    vi.mocked(client.getRun).mockResolvedValue({
+      run_id: runId,
+      worker_id: workerId,
+      state: 'completed',
+      last_event_seq: 4n,
+      stop_reason: 'time_limit',
+    });
+
+    await expect(controller.getCampaignStatus()).resolves.toMatchObject({
+      campaign_label: 'nightly',
+      active_run: { run_id: runId, state: 'completed', stop_reason: 'time_limit' },
+    });
+    expect(client.getRun).toHaveBeenCalledWith(runId);
   });
 
   it('closes a pairing client and clears its profile when shutdown races with persistence', async () => {

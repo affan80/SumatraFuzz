@@ -59,9 +59,10 @@
           <label for="limit-duration">Maximum duration (seconds)</label>
           <input id="limit-duration" name="max_duration_s" type="number" min="1" step="1" required />
           <label for="limit-memory">Maximum memory (bytes)</label>
-          <input id="limit-memory" name="max_memory_bytes" type="number" min="1" step="1" required />
+          <input id="limit-memory" name="max_memory_bytes" type="number" min="16777216" step="1" required />
           <label for="limit-disk">Maximum disk (bytes)</label>
-          <input id="limit-disk" name="max_disk_bytes" type="number" min="1" step="1" required />
+          <input id="limit-disk" name="max_disk_bytes" type="number" min="1" step="1" readonly required />
+          <p>Disk quota is fixed by the paired worker’s provisioned volume.</p>
           <label for="limit-cpu">Maximum CPU (%)</label>
           <input id="limit-cpu" name="max_cpu_percent" type="number" min="1" max="100" step="1" required />
           <button id="start-campaign" type="submit" disabled>Start campaign</button>

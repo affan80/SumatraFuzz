@@ -12,9 +12,12 @@ import {
 import {
   asControllerId,
   asRunId,
+  MIN_CAMPAIGN_MEMORY_BYTES,
   type RunRequest,
   type RunState,
   type StopReason,
+  WorkerError,
+  WorkerProtocolError,
 } from '@sumatrafuzz/worker-protocol';
 import { WorkerQuotaMonitor } from './quota-monitor.js';
 import type { WorkerApiHandlers, WorkerEventRecord } from './server.js';
@@ -147,6 +150,12 @@ export class WorkerRunCoordinator implements WorkerApiHandlers {
         status: 403,
       });
     }
+    if (request.limits.max_memory_bytes < MIN_CAMPAIGN_MEMORY_BYTES) {
+      throw new WorkerProtocolError(WorkerError.InvalidConfig);
+    }
+    if (request.limits.max_disk_bytes !== this.config.policy.maxLimits.max_disk_bytes) {
+      throw new WorkerProtocolError(WorkerError.InvalidConfig);
+    }
     const controller = asControllerId(controllerId);
     const digest = requestDigest(request);
     const prior = this.config.store.findRequest(controller, request.request_id);
@@ -216,16 +225,22 @@ export class WorkerRunCoordinator implements WorkerApiHandlers {
     reason: StopReason = 'requested',
   ): Promise<unknown> {
     this.requireOwnership(controllerId, runId);
-    this.quotaMonitor.stop(asRunId(runId));
     const active = this.active.get(runId);
     const current = this.config.store.runState(asRunId(runId));
     if (current === 'completed' || current === 'failed' || current === 'interrupted') {
+      this.quotaMonitor.stop(asRunId(runId));
       return this.getRun(controllerId, runId);
     }
     if (current !== 'running' && current !== 'stopping')
       conflict('run is not in a stoppable state');
+    let transitionFailed = false;
     if (current === 'running') {
-      this.config.store.transitionState(asRunId(runId), 'running', 'stopping', 'state_changed');
+      try {
+        this.config.store.transitionState(asRunId(runId), 'running', 'stopping', 'state_changed');
+      } catch {
+        // Still terminate the native job if journaling the stopping state fails.
+        transitionFailed = true;
+      }
     }
     let receipt = this.config.store.teardownReceipt(asRunId(runId));
     if (!receipt) {
@@ -243,6 +258,16 @@ export class WorkerRunCoordinator implements WorkerApiHandlers {
         receipt = { ...nativeReceipt, stopReason: reason };
         active.receipt = receipt;
       }
+    }
+    if (transitionFailed) {
+      try {
+        this.config.store.transitionState(asRunId(runId), 'running', 'stopping', 'state_changed');
+      } catch {
+        // A durable teardown receipt keeps the worker slot reserved for startup reconciliation.
+        throw new Error('could not persist stopping state after native teardown');
+      }
+    }
+    if (!this.config.store.teardownReceipt(asRunId(runId))) {
       this.config.store.recordTeardownReceipt(asRunId(runId), receipt);
     }
     let next: Extract<RunState, 'completed' | 'failed'> =
@@ -257,6 +282,7 @@ export class WorkerRunCoordinator implements WorkerApiHandlers {
     }
     this.config.store.finalizeAfterTeardown(asRunId(runId), next, artifacts, receipt);
     this.active.delete(runId);
+    this.quotaMonitor.stop(asRunId(runId));
     return this.getRun(controllerId, runId);
   }
 

@@ -1,10 +1,20 @@
 import { cp, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const rendererOutput = path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'renderer');
 const resourcesOutput = path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'resources');
+await build({
+  entryPoints: [path.join(repositoryRoot, 'apps', 'desktop', 'src', 'preload', 'index.ts')],
+  outfile: path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'preload.cjs'),
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  external: ['electron'],
+});
 await mkdir(rendererOutput, { recursive: true });
 await mkdir(resourcesOutput, { recursive: true });
 await cp(

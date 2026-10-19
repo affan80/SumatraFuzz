@@ -47,13 +47,14 @@ await copyRuntimeFiles(
   path.join(stageRoot, 'dist', 'renderer'),
   new Set(['.js', '.html']),
 );
-for (const output of ['src/main', 'src/preload']) {
+for (const output of ['src/main']) {
   await copyRuntimeFiles(
     path.join(appRoot, 'dist', output),
     path.join(stageRoot, 'dist', output),
     new Set(['.js']),
   );
 }
+await copySelected(path.join(appRoot, 'dist'), path.join(stageRoot, 'dist'), ['preload.cjs']);
 await copySelected(path.join(appRoot, 'dist'), path.join(stageRoot, 'dist'), [
   'resources/worker-bundle-signing-key.pem',
 ]);

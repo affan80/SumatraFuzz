@@ -1,4 +1,8 @@
-import type { CampaignLimits, RunStatus } from '@sumatrafuzz/worker-protocol';
+import {
+  type CampaignLimits,
+  MIN_CAMPAIGN_MEMORY_BYTES,
+  type RunStatus,
+} from '@sumatrafuzz/worker-protocol';
 import { isTrustedAppDocumentUrl } from './window-security.js';
 
 export interface DesktopIpcEvent {
@@ -83,7 +87,7 @@ function validateRunDraft(value: unknown): RunDraft {
     !Number.isSafeInteger(limits.max_duration_s) ||
     (limits.max_duration_s as number) < 1 ||
     !Number.isSafeInteger(limits.max_memory_bytes) ||
-    (limits.max_memory_bytes as number) < 1 ||
+    (limits.max_memory_bytes as number) < MIN_CAMPAIGN_MEMORY_BYTES ||
     !Number.isSafeInteger(limits.max_disk_bytes) ||
     (limits.max_disk_bytes as number) < 1 ||
     !Number.isInteger(limits.max_cpu_percent) ||

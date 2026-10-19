@@ -1,4 +1,5 @@
 const MAX_EXPANDED_BYTES = 64 * 1024 * 1024;
+const MIN_CAMPAIGN_MEMORY_BYTES = 16 * 1024 * 1024;
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n;
 const RUN_STATES = new Set([
   'created',
@@ -67,7 +68,7 @@ function parseLimits(value: unknown): CampaignViewStatus['policyLimits'] {
     !Number.isSafeInteger(value.max_duration_s) ||
     (value.max_duration_s as number) < 1 ||
     !Number.isSafeInteger(value.max_memory_bytes) ||
-    (value.max_memory_bytes as number) < 1 ||
+    (value.max_memory_bytes as number) < MIN_CAMPAIGN_MEMORY_BYTES ||
     !Number.isSafeInteger(value.max_disk_bytes) ||
     (value.max_disk_bytes as number) < 1 ||
     !Number.isInteger(value.max_cpu_percent) ||

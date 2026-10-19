@@ -182,6 +182,42 @@ describe('worker run coordinator', () => {
     store.close();
   });
 
+  it('rejects a memory limit below native bounds before claiming the worker slot', async () => {
+    const { coordinator, store, verifyLaunch } = await setup();
+    const invalid = {
+      ...request(),
+      limits: { ...request().limits, max_memory_bytes: 1024 },
+    } as ReturnType<typeof request>;
+
+    await expect(coordinator.startRun(controllerId, invalid)).rejects.toThrow(/invalid_config/i);
+    await expect(
+      coordinator.startRun(controllerId, {
+        ...request(),
+        limits: { ...request().limits, max_disk_bytes: request().limits.max_disk_bytes - 1 },
+      }),
+    ).rejects.toThrow(/invalid_config/i);
+    expect(verifyLaunch).not.toHaveBeenCalled();
+    expect(store.activeRunSnapshot()).toBeNull();
+    store.close();
+  });
+
+  it('attempts native teardown when the first stopping-state journal write fails', async () => {
+    const { coordinator, store, supervisor } = await setup();
+    await coordinator.startRun(controllerId, request());
+    const transition = vi.spyOn(store, 'transitionState').mockImplementationOnce(() => {
+      throw new Error('temporary journal failure');
+    });
+
+    await expect(coordinator.stopRun(controllerId, runId)).resolves.toMatchObject({
+      state: 'completed',
+    });
+    expect(supervisor.stopJob).toHaveBeenCalledOnce();
+    expect(store.activeRunSnapshot()).toBeNull();
+    expect(transition).toHaveBeenCalledTimes(2);
+    transition.mockRestore();
+    store.close();
+  });
+
   it('finishes journaled teardown after a service restart without relaunching the run', async () => {
     const { coordinator, makeCoordinator, store, supervisor } = await setup();
     await coordinator.startRun(controllerId, request());

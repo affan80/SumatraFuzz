@@ -70,9 +70,12 @@ export function findForbiddenPackageEntries(entries) {
       /(?:\.map$|\.ts$|\.tsx$|\.mts$|\.cts$|\.d\.(?:ts|mts|cts)$|\.pdb$|package-lock\.json$|(?:^|\/)(?:\.github|scripts|docs|\.git)(?:\/|$))/i.test(
         entry,
       ) ||
+      /(?:^|\/)dist\/src\/preload(?:\/|$)/i.test(entry) ||
       sourceDirectory
     ) {
-      findings.push(`${original}: build-only or source file`);
+      findings.push(
+        `${original}: ${/dist\/src\/preload/i.test(entry) ? 'preload source is forbidden; use the bundled CommonJS preload' : 'build-only or source file'}`,
+      );
       continue;
     }
     const allowed =
@@ -82,7 +85,7 @@ export function findForbiddenPackageEntries(entries) {
     else if (
       entry.startsWith('dist/') &&
       path.posix.extname(entry) !== '' &&
-      !/\.(?:js|html|pem)$/i.test(entry)
+      !/\.(?:js|cjs|html|pem)$/i.test(entry)
     ) {
       findings.push(`${original}: unexpected desktop asset type`);
     }
@@ -125,6 +128,15 @@ export async function inspectDesktopAsar(asarPath) {
   }
   if (!entries.some((entry) => normalizeEntry(entry) === 'dist/src/main/index.js')) {
     findings.push('dist/src/main/index.js: desktop main entry point is missing');
+  }
+  const preloadPath = 'dist/preload.cjs';
+  if (!entries.some((entry) => normalizeEntry(entry) === preloadPath)) {
+    findings.push(`${preloadPath}: bundled CommonJS preload is missing`);
+  } else {
+    const preload = extractFile(asarPath, preloadPath).toString('utf8');
+    if (!/require\(["']electron["']\)/.test(preload) || /^\s*(?:import|export)\s/m.test(preload)) {
+      findings.push(`${preloadPath}: sandboxed preload must be bundled as CommonJS`);
+    }
   }
   if (findings.length) throw new Error(`desktop package policy failed:\n${findings.join('\n')}`);
   return entries;

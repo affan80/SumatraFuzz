@@ -11,6 +11,7 @@ export {
   EventTypeSchema,
   encodeSequence,
   isNonNilUuid,
+  MIN_CAMPAIGN_MEMORY_BYTES,
   type RunEvent,
   RunEventSchema,
   type RunId,

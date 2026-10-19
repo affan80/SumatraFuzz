@@ -6,7 +6,7 @@ const draft = {
   label: 'security test',
   limits: {
     max_duration_s: 60,
-    max_memory_bytes: 1024,
+    max_memory_bytes: 64 * 1024 * 1024,
     max_disk_bytes: 1024,
     max_cpu_percent: 50,
   },
@@ -98,6 +98,17 @@ describe('Electron IPC security', () => {
     expect(ipc.calls).toEqual([
       ['start', { ...draft, limits: { ...draft.limits, max_disk_bytes: Number.MAX_SAFE_INTEGER } }],
     ]);
+  });
+
+  it('rejects memory limits below the native supervisor minimum', async () => {
+    const ipc = registeredIpc();
+    await expect(
+      ipc.handlers.get('sf:campaigns:start')?.(ipc.event(), {
+        ...draft,
+        limits: { ...draft.limits, max_memory_bytes: 16 * 1024 * 1024 - 1 },
+      }),
+    ).rejects.toThrow(/campaign limits/i);
+    expect(ipc.calls).toEqual([]);
   });
 
   it('uses fixed channels and gives the renderer no run-ID lookup or stop authority', async () => {
