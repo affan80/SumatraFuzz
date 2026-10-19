@@ -1,0 +1,13 @@
+{
+  "name": "@sumatrafuzz/evidence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sumatrafuzz/instrumentation": "0.1.0"
+  },
+  "exports": {
+    "./collect": "./src/collect.ts",
+    "./stats": "./src/stats.ts"
+  }
+}
