@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "packages/worker-protocol" },
+    { "path": "packages/worker-client" },
     { "path": "packages/worker-core" },
     { "path": "packages/run-store" },
     { "path": "packages/instrumentation" },

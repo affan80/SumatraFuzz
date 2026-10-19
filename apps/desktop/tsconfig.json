@@ -7,5 +7,8 @@
     "tsBuildInfoFile": "../../.cache/tsbuild/desktop.tsbuildinfo"
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "references": [{ "path": "../../packages/worker-protocol" }]
+  "references": [
+    { "path": "../../packages/worker-protocol" },
+    { "path": "../../packages/worker-client" }
+  ]
 }
