@@ -13,12 +13,14 @@
     "format:check": "biome check .",
     "lint": "biome lint .",
     "typecheck": "tsc -b --pretty false",
+    "desktop:build": "tsc -b apps/desktop && node scripts/build-desktop.mjs",
     "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
     "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
     "native:supervisor:contract": "cmake -S native/worker-supervisor -B build/worker-supervisor && cmake --build build/worker-supervisor --config Debug && ctest --test-dir build/worker-supervisor -C Debug --output-on-failure",
+    "audit:production": "npm audit --omit=dev --audit-level=moderate",
     "test": "vitest run && node --test test/*.check.cjs",
     "test:watch": "vitest",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm audit --audit-level=high"
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
   },
   "dependencies": {
     "@sinclair/typebox": "0.34.52",

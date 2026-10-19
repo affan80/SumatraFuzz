@@ -41,9 +41,13 @@ jobs:
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck
+      - name: Build Electron desktop shell
+        run: npm run desktop:build
       - name: Tests
         run: npm test
       - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: Full dependency audit
         run: npm audit --audit-level=high
   rust-worker:
     name: Rust worker (${{ matrix.os }})
