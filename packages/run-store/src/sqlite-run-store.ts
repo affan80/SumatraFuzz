@@ -218,6 +218,22 @@ export class SqliteRunStore {
     }
   }
 
+  ownsRun(controllerId: ControllerId, runId: RunId): boolean {
+    assertUuid(controllerId);
+    assertUuid(runId);
+    try {
+      return Boolean(
+        this.db
+          .prepare(
+            'SELECT 1 AS owned FROM command_idempotency WHERE controller_id = ? AND run_id = ? LIMIT 1',
+          )
+          .get(controllerId, runId),
+      );
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
   transitionState(runId: RunId, expected: RunState, next: RunState, eventType: EventType): bigint {
     assertUuid(runId);
     assertEventType(eventType);

@@ -103,6 +103,21 @@ describe('worker slot and transactional journal', () => {
     store.close();
   });
 
+  it('binds every stored run to its creating controller for object-level authorization', async () => {
+    const directory = await makeDir();
+    const store = SqliteRunStore.open(path.join(directory, 'run-ownership.db'));
+    const value = ids();
+    claim(store);
+    expect(store.ownsRun(value.controllerId, value.runId)).toBe(true);
+    expect(store.ownsRun(asControllerId('a11ce030-0000-4000-8000-000000000030'), value.runId)).toBe(
+      false,
+    );
+    expect(store.ownsRun(value.controllerId, asRunId('a11ce031-0000-4000-8000-000000000031'))).toBe(
+      false,
+    );
+    store.close();
+  });
+
   it('keeps the exclusive slot across reopen and returns busy for a second claim', async () => {
     const directory = await makeDir();
     const file = path.join(directory, 'slot.db');

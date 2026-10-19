@@ -6,6 +6,7 @@
     { "path": "packages/run-store" },
     { "path": "packages/instrumentation" },
     { "path": "packages/evidence" },
-    { "path": "scripts/windows" }
+    { "path": "scripts/windows" },
+    { "path": "apps/worker-service" }
   ]
 }
