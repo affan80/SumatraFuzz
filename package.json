@@ -51,5 +51,8 @@
     "vite": "7.3.7",
     "vitest": "5.0.5",
     "yazl": "3.3.1"
+  },
+  "overrides": {
+    "global-agent": "4.1.3"
   }
 }
