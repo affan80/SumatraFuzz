@@ -1,6 +1,8 @@
+import type { PeerCertificate } from 'node:tls';
 import { describe, expect, it } from 'vitest';
 import {
   createWorkerClient,
+  createWorkerIdentityVerifier,
   normalizeCertificateFingerprint,
   validateWorkerUrl,
   verifyPinnedWorkerCertificate,
@@ -51,6 +53,19 @@ describe('authenticated worker client', () => {
     expect(() => verifyPinnedWorkerCertificate('a'.repeat(64), 'b'.repeat(64))).toThrow(
       /identity/i,
     );
+  });
+
+  it('checks both the TLS hostname and paired certificate fingerprint', () => {
+    const verify = createWorkerIdentityVerifier(fingerprint);
+    const certificateIdentity = {
+      subjectaltname: 'IP Address:127.0.0.1',
+      fingerprint256: fingerprint.toUpperCase().match(/.{2}/g)?.join(':') ?? '',
+    } as PeerCertificate;
+    expect(verify('127.0.0.1', certificateIdentity)).toBeUndefined();
+    expect(verify('worker.example', certificateIdentity)).toBeInstanceOf(Error);
+    expect(
+      verify('127.0.0.1', { ...certificateIdentity, fingerprint256: 'b'.repeat(64) }),
+    ).toBeInstanceOf(Error);
   });
 
   it('sends mTLS protocol and idempotency headers and validates returned run status', async () => {

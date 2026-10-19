@@ -1,5 +1,6 @@
 export {
   createWorkerClient,
+  createWorkerIdentityVerifier,
   normalizeCertificateFingerprint,
   validateWorkerUrl,
   verifyPinnedWorkerCertificate,

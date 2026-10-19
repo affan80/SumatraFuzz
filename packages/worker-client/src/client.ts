@@ -108,6 +108,22 @@ export function verifyPinnedWorkerCertificate(expected: string, actual: string):
   }
 }
 
+export function createWorkerIdentityVerifier(
+  expectedFingerprint: string,
+): (host: string, cert: PeerCertificate) => Error | undefined {
+  const expected = normalizeCertificateFingerprint(expectedFingerprint);
+  return (host, cert) => {
+    const hostnameError = checkServerIdentity(host, cert);
+    if (hostnameError) return hostnameError;
+    try {
+      verifyPinnedWorkerCertificate(expected, cert.fingerprint256 ?? '');
+    } catch {
+      return new Error('worker certificate identity does not match the paired fingerprint');
+    }
+    return undefined;
+  };
+}
+
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
   return (
@@ -220,7 +236,7 @@ function createHttpsTransport(config: WorkerClientConfig, baseUrl: URL): WorkerH
   ) {
     throw new TypeError('worker client requires controller and CA certificates');
   }
-  const expectedFingerprint = normalizeCertificateFingerprint(config.workerFingerprint);
+  const verifyIdentity = createWorkerIdentityVerifier(config.workerFingerprint);
   const timeoutMs = config.timeoutMs ?? 15_000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
     throw new RangeError('worker request timeout is invalid');
@@ -233,16 +249,7 @@ function createHttpsTransport(config: WorkerClientConfig, baseUrl: URL): WorkerH
     maxSockets: 4,
     rejectUnauthorized: true,
     minVersion: 'TLSv1.2',
-    checkServerIdentity: (host: string, cert: PeerCertificate) => {
-      const identityError = checkServerIdentity(host, cert);
-      if (identityError) return identityError;
-      try {
-        verifyPinnedWorkerCertificate(expectedFingerprint, cert.fingerprint256 ?? '');
-      } catch {
-        return new Error('worker certificate identity does not match the paired fingerprint');
-      }
-      return undefined;
-    },
+    checkServerIdentity: verifyIdentity,
   });
   const timeoutMsValue = timeoutMs;
   return {
