@@ -44,7 +44,7 @@
     "electron-builder": "26.17.0",
     "node-addon-api": "8.9.2",
     "node-gyp": "13.1.0",
-    "typescript": "6.0.3",
+    "typescript": "7.0.2",
     "vite": "7.3.7",
     "vitest": "5.0.5",
     "yazl": "3.3.1"
