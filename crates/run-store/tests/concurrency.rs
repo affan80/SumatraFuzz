@@ -61,7 +61,7 @@ fn simultaneous_claims_share_one_durable_worker_slot() {
 }
 
 #[test]
-fn terminal_transition_releases_worker_slot_for_next_campaign() {
+fn terminal_transition_retains_slot_until_explicit_teardown_assertion() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteRunStore::open(&dir.path().join("next.db")).unwrap();
     let principal = ControllerId(Uuid::from_u128(1));
@@ -100,7 +100,7 @@ fn terminal_transition_releases_worker_slot_for_next_campaign() {
         .transition_state(
             old,
             RunState::Stopping,
-            RunState::Completed,
+            RunState::Interrupted,
             EventType::StateChanged,
         )
         .unwrap();
