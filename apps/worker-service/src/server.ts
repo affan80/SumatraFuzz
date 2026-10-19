@@ -63,6 +63,7 @@ export interface WorkerServerConfig {
   readonly handlers: WorkerApiHandlers;
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
   readonly inputRoot: string;
+  readonly ensureInputCapacity: (bytesToWrite: number) => Promise<void>;
   readonly maxRequestBytes?: number;
 }
 
@@ -118,6 +119,28 @@ async function body(request: import('node:http').IncomingMessage, limit: number)
     pieces.push(chunk);
   }
   return Buffer.concat(pieces, length);
+}
+
+export interface ExclusiveRequestGate {
+  tryAcquire(): (() => void) | undefined;
+}
+
+/** A small synchronous gate prevents concurrent uploads from retaining multiple archives in RAM. */
+export function createExclusiveRequestGate(): ExclusiveRequestGate {
+  let acquired = false;
+  return {
+    tryAcquire() {
+      if (acquired) return undefined;
+      acquired = true;
+      let released = false;
+      return () => {
+        if (!released) {
+          released = true;
+          acquired = false;
+        }
+      };
+    },
+  };
 }
 
 export function parseArtifactRange(
@@ -226,6 +249,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       throw new TypeError('duplicate paired certificate fingerprint');
     pairedControllers.set(normalized, controllerId);
   }
+  if (typeof config.ensureInputCapacity !== 'function')
+    throw new TypeError('input bundle disk capacity check is required');
+  const inputImportGate = createExclusiveRequestGate();
 
   const server: HttpsServer = createHttpsServer(
     {
@@ -264,15 +290,26 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           return;
         }
         if (request.method === 'POST' && url.pathname === '/v1/input-bundles') {
-          json(
-            response,
-            201,
-            await importInputBundle(
-              config.inputRoot,
-              controllerId,
-              await body(request, requestLimit),
-            ),
-          );
+          const release = inputImportGate.tryAcquire();
+          if (!release) {
+            request.resume();
+            json(response, 429, { error: 'another input bundle import is already in progress' });
+            return;
+          }
+          try {
+            json(
+              response,
+              201,
+              await importInputBundle(
+                config.inputRoot,
+                controllerId,
+                await body(request, requestLimit),
+                { ensureCapacity: config.ensureInputCapacity },
+              ),
+            );
+          } finally {
+            release();
+          }
           return;
         }
         if (request.method === 'POST' && url.pathname === '/v1/runs') {
