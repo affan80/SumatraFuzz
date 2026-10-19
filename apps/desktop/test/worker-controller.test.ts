@@ -124,4 +124,31 @@ describe('desktop worker controller pairing', () => {
     expect(client.close).toHaveBeenCalledOnce();
     await expect(controller.listWorkers()).rejects.toThrow(/no worker is paired/);
   });
+
+  it('closes a pairing client and clears its profile when shutdown races with persistence', async () => {
+    let finishSave!: () => void;
+    const save = vi.fn(() => new Promise<void>((resolve) => (finishSave = resolve)));
+    const clear = vi.fn(async () => undefined);
+    const client = workerClient();
+    const controller = createDesktopWorkerController({
+      profileStore: {
+        load: vi.fn(async () => null),
+        save,
+        clear,
+      },
+      loadTrustedSigningPublicKey: async () => publicKeyPem,
+      selectBundle: async () => signedBundle(),
+      createClient: () => client,
+    });
+
+    const pairing = controller.pairWorker();
+    await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+    controller.close();
+    finishSave();
+
+    await expect(pairing).rejects.toThrow(/controller is closed/);
+    expect(clear).toHaveBeenCalledOnce();
+    expect(client.close).toHaveBeenCalledOnce();
+    await expect(controller.listWorkers()).rejects.toThrow(/no worker is paired/);
+  });
 });

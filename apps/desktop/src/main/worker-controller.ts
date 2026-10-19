@@ -37,6 +37,14 @@ export function createDesktopWorkerController({
   let activeClient: WorkerClient | null = null;
   let closed = false;
   let mutationQueue: Promise<void> = Promise.resolve();
+  const pendingClients = new Set<WorkerClient>();
+  const closedClients = new WeakSet<WorkerClient>();
+
+  const closeClient = (client: WorkerClient): void => {
+    if (closedClients.has(client)) return;
+    closedClients.add(client);
+    client.close();
+  };
 
   const serializeMutation = <T>(operation: () => Promise<T>): Promise<T> => {
     const current = mutationQueue.then(operation, operation);
@@ -51,7 +59,7 @@ export function createDesktopWorkerController({
     if (!activeClient || !activeProfile) throw new Error('no worker is paired');
     const capabilities = await activeClient.capabilities();
     if (capabilities.worker_id !== activeProfile.workerId) {
-      activeClient.close();
+      closeClient(activeClient);
       activeClient = null;
       activeProfile = null;
       throw new Error('authenticated worker identity does not match the paired worker identity');
@@ -79,6 +87,7 @@ export function createDesktopWorkerController({
         const trustedKey = await loadTrustedSigningPublicKey();
         const verified = verifyWorkerPairingBundle(bundleBytes, trustedKey, now());
         const candidate = createClient(verified.profile);
+        pendingClients.add(candidate);
         let capabilities: WorkerCapabilities;
         try {
           capabilities = await candidate.capabilities();
@@ -87,12 +96,18 @@ export function createDesktopWorkerController({
           }
           if (closed) throw new Error('worker controller is closed');
           await profileStore.save(verified.profile);
+          if (closed) {
+            await profileStore.clear();
+            throw new Error('worker controller is closed');
+          }
         } catch (error) {
-          candidate.close();
+          closeClient(candidate);
           throw error;
+        } finally {
+          pendingClients.delete(candidate);
         }
 
-        activeClient?.close();
+        if (activeClient) closeClient(activeClient);
         activeProfile = verified.profile;
         activeClient = candidate;
         return {
@@ -107,7 +122,7 @@ export function createDesktopWorkerController({
       return serializeMutation(async () => {
         if (closed) throw new Error('worker controller is closed');
         await profileStore.clear();
-        activeClient?.close();
+        if (activeClient) closeClient(activeClient);
         activeClient = null;
         activeProfile = null;
       });
@@ -131,7 +146,9 @@ export function createDesktopWorkerController({
     },
     close() {
       closed = true;
-      activeClient?.close();
+      for (const client of pendingClients) closeClient(client);
+      pendingClients.clear();
+      if (activeClient) closeClient(activeClient);
       activeClient = null;
       activeProfile = null;
     },
