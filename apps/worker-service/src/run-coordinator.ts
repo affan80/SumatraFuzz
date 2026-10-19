@@ -125,13 +125,20 @@ export class WorkerRunCoordinator implements WorkerApiHandlers {
     }
   }
 
-  async capabilities(): Promise<unknown> {
+  async capabilities(controllerId: string): Promise<unknown> {
     return {
       worker_id: this.config.workerId,
+      controller_id: controllerId,
       protocol_version: 1,
       target_lock_sha256: this.config.policy.pinnedTargetLockSha256,
       max_limits: this.config.policy.maxLimits,
     };
+  }
+
+  async activeRun(controllerId: string): Promise<unknown> {
+    const active = this.config.store.activeRunSnapshot();
+    if (!active || active.controllerId.toLowerCase() !== controllerId.toLowerCase()) return null;
+    return this.getRun(controllerId, active.runId);
   }
 
   async startRun(controllerId: string, request: RunRequest): Promise<unknown> {

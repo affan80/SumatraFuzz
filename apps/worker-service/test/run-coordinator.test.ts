@@ -103,6 +103,25 @@ afterEach(async () => {
 });
 
 describe('worker run coordinator', () => {
+  it('returns authenticated capabilities and only the caller-owned active run', async () => {
+    const { coordinator, store } = await setup();
+
+    await expect(coordinator.capabilities(controllerId)).resolves.toMatchObject({
+      controller_id: controllerId,
+      worker_id: '66666666-6666-4666-8666-666666666666',
+    });
+    await expect(coordinator.activeRun(controllerId)).resolves.toBeNull();
+
+    await coordinator.startRun(controllerId, request());
+    await expect(coordinator.activeRun(controllerId)).resolves.toMatchObject({
+      run_id: runId,
+      worker_id: '66666666-6666-4666-8666-666666666666',
+      state: 'running',
+    });
+    await expect(coordinator.activeRun(otherController)).resolves.toBeNull();
+    store.close();
+  });
+
   it('claims one durable slot, replays the same command, and rejects a competing run', async () => {
     const { coordinator, store, supervisor, verifyLaunch } = await setup();
     const start = request();
