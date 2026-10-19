@@ -3,6 +3,7 @@ export type {
   NativeSupervisorBinding,
   NativeTeardownReceipt,
   ResourceSample,
+  VolumeUsageSample,
 } from './native-supervisor.js';
 export { ProcessError, WindowsJobSupervisor } from './native-supervisor.js';
 export {

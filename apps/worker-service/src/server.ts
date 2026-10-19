@@ -4,10 +4,12 @@ import type { SqliteRunStore } from '@sumatrafuzz/run-store';
 import {
   asControllerId,
   asRunId,
+  isNonNilUuid,
   type RunRequest,
   validateRunRequest,
 } from '@sumatrafuzz/worker-protocol';
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
+import { importInputBundle, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
 
 export interface WorkerEventRecord {
@@ -25,7 +27,6 @@ export interface ArtifactChunk {
 
 export interface WorkerApiHandlers {
   capabilities(controllerId: string): Promise<unknown>;
-  importInputBundle(controllerId: string, archive: Buffer): Promise<unknown>;
   startRun(controllerId: string, request: RunRequest): Promise<unknown>;
   getRun(controllerId: string, runId: string): Promise<unknown>;
   stopRun(controllerId: string, runId: string): Promise<unknown>;
@@ -61,6 +62,7 @@ export interface WorkerServerConfig {
   readonly revokedFingerprints?: ReadonlySet<string>;
   readonly handlers: WorkerApiHandlers;
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
+  readonly inputRoot: string;
   readonly maxRequestBytes?: number;
 }
 
@@ -69,13 +71,13 @@ export interface WorkerServer {
   close(): Promise<void>;
 }
 
-const DEFAULT_MAX_REQUEST_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = MAX_ARCHIVE_BYTES;
 const MAX_ARTIFACT_CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_PAGE_SIZE = 500;
 const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const WORKER_PROTOCOL_VERSION = '1';
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FINGERPRINT = /^[0-9a-f]{64}$/i;
+const MAX_SQLITE_SEQUENCE = '9223372036854775807';
 
 function peerIdentity(peer: PeerCertificate, authorized: boolean): PeerCertificateIdentity | null {
   if (!peer.fingerprint256 || !peer.valid_from || !peer.valid_to) return null;
@@ -147,6 +149,15 @@ export function validateStartRequest(
   idempotencyKey: string | string[] | undefined,
   pairedControllerId: string,
 ): RunRequest {
+  if (typeof payload === 'object' && payload !== null) {
+    const candidate = payload as { request_id?: unknown; controller_id?: unknown };
+    if (
+      (typeof candidate.request_id === 'string' && !isNonNilUuid(candidate.request_id)) ||
+      (typeof candidate.controller_id === 'string' && !isNonNilUuid(candidate.controller_id))
+    ) {
+      throw Object.assign(new Error('run request IDs must be non-nil UUIDs'), { status: 400 });
+    }
+  }
   let request: RunRequest;
   try {
     request = validateRunRequest(payload);
@@ -162,6 +173,17 @@ export function validateStartRequest(
     });
   }
   return request;
+}
+
+export function parseEventSequence(value: string): string {
+  if (
+    !/^(0|[1-9][0-9]*)$/.test(value) ||
+    value.length > MAX_SQLITE_SEQUENCE.length ||
+    (value.length === MAX_SQLITE_SEQUENCE.length && value > MAX_SQLITE_SEQUENCE)
+  ) {
+    throw Object.assign(new Error('invalid event replay sequence'), { status: 400 });
+  }
+  return value;
 }
 
 export function parseEventPageLimit(value: string | null): number {
@@ -187,14 +209,18 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) {
     throw new RangeError('invalid worker service port');
   }
-  if (!UUID.test(config.workerId)) throw new TypeError('worker ID must be a UUID');
+  if (!isNonNilUuid(config.workerId)) throw new TypeError('worker ID must be a non-nil UUID');
   const requestLimit = config.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
-  if (!Number.isSafeInteger(requestLimit) || requestLimit < 1024)
+  if (
+    !Number.isSafeInteger(requestLimit) ||
+    requestLimit < 1024 ||
+    requestLimit > MAX_ARCHIVE_BYTES
+  )
     throw new RangeError('invalid request size limit');
   const pairedControllers = new Map<string, string>();
   for (const [fingerprint, controllerId] of config.pairedControllers) {
     const normalized = fingerprint.replaceAll(':', '').toLowerCase();
-    if (!FINGERPRINT.test(normalized) || !UUID.test(controllerId))
+    if (!FINGERPRINT.test(normalized) || !isNonNilUuid(controllerId))
       throw new TypeError('invalid paired controller certificate record');
     if (pairedControllers.has(normalized))
       throw new TypeError('duplicate paired certificate fingerprint');
@@ -220,7 +246,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           config.revokedFingerprints ?? new Set(),
         );
         const controllerId = pairedControllers.get(fingerprint);
-        if (!controllerId || !UUID.test(controllerId))
+        if (!controllerId || !isNonNilUuid(controllerId))
           throw new Error('paired controller identity is invalid');
         assertProtocolVersion(request.headers['x-sf-protocol-version']);
         if (
@@ -241,7 +267,8 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           json(
             response,
             201,
-            await config.handlers.importInputBundle(
+            await importInputBundle(
+              config.inputRoot,
               controllerId,
               await body(request, requestLimit),
             ),
@@ -264,7 +291,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           json(response, 202, await config.handlers.startRun(controllerId, runRequest));
           return;
         }
-        if (segments[0] === 'v1' && segments[1] === 'runs' && UUID.test(segments[2] ?? '')) {
+        if (segments[0] === 'v1' && segments[1] === 'runs' && isNonNilUuid(segments[2] ?? '')) {
           const runId = segments[2] as string;
           if (!config.store.ownsRun(asControllerId(controllerId), asRunId(runId))) {
             throw Object.assign(new Error('run not found'), { status: 404 });
@@ -279,9 +306,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           }
           if (request.method === 'GET' && segments.length === 4 && segments[3] === 'events') {
             const after = url.searchParams.get('after') ?? request.headers['last-event-id'] ?? '0';
-            if (typeof after !== 'string' || !/^(0|[1-9][0-9]*)$/.test(after)) {
+            if (typeof after !== 'string')
               throw Object.assign(new Error('invalid event replay sequence'), { status: 400 });
-            }
+            parseEventSequence(after);
             const limit = parseEventPageLimit(url.searchParams.get('limit'));
             const events = await config.handlers.eventsAfter(controllerId, runId, after, limit);
             if (events.length > limit)

@@ -28,12 +28,17 @@ test('Windows supervisor bounds and tears down a child process tree', {
   for (const method of [
     'launchSuspended',
     'sampleJob',
+    'sampleVolumeUsage',
     'stopJob',
     'protectSecret',
     'unprotectSecret',
   ])
     assert.equal(typeof supervisor[method], 'function');
   const bytes = readFileSync(probePath);
+  const volumeUsage = supervisor.sampleVolumeUsage(__dirname);
+  assert.ok(Number.isSafeInteger(volumeUsage.quota_bytes) && volumeUsage.quota_bytes > 0);
+  assert.ok(Number.isSafeInteger(volumeUsage.available_bytes) && volumeUsage.available_bytes >= 0);
+  assert.equal(volumeUsage.used_bytes + volumeUsage.available_bytes, volumeUsage.quota_bytes);
   const proof = {
     path: probePath,
     root: path.dirname(probePath),
