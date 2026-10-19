@@ -46,7 +46,7 @@ export function isAllowedRendererRequest(method: string, value: string): boolean
     const url = new URL(value);
     return (
       isTrustedAppUrl(value) &&
-      url.pathname === '/index.html' &&
+      ['/index.html', '/app.js'].includes(url.pathname) &&
       url.search === '' &&
       url.hash === ''
     );

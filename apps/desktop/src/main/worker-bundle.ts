@@ -4,7 +4,7 @@ import { validateWorkerProfile, type WorkerProfile } from './worker-profile-stor
 
 const BUNDLE_FORMAT = 'sumatrafuzz-worker-pairing-bundle-v1';
 const PAYLOAD_FORMAT = 'sumatrafuzz-worker-pairing-payload-v1';
-const MAX_BUNDLE_BYTES = 1024 * 1024;
+export const MAX_BUNDLE_BYTES = 1024 * 1024;
 const MAX_SIGNING_KEY_FILE_BYTES = 16 * 1024;
 const MAX_BUNDLE_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
@@ -138,32 +138,4 @@ export function verifyWorkerPairingBundle(
   }
 
   return { profile: validateWorkerProfile(payload.profile), issuedAt, expiresAt };
-}
-
-export interface WorkerPairingService {
-  importBundle(bundleBytes: Buffer): Promise<{
-    readonly workerId: string;
-    readonly baseUrl: string;
-    readonly workerFingerprint: string;
-    readonly expiresAt: Date;
-  }>;
-}
-
-export function createWorkerPairingService(
-  trustedSigningPublicKeyPem: string,
-  profileStore: { save(profile: WorkerProfile): Promise<void> },
-  now: () => Date = () => new Date(),
-): WorkerPairingService {
-  return {
-    async importBundle(bundleBytes) {
-      const verified = verifyWorkerPairingBundle(bundleBytes, trustedSigningPublicKeyPem, now());
-      await profileStore.save(verified.profile);
-      return {
-        workerId: verified.profile.workerId,
-        baseUrl: verified.profile.baseUrl,
-        workerFingerprint: verified.profile.workerFingerprint,
-        expiresAt: verified.expiresAt,
-      };
-    },
-  };
 }

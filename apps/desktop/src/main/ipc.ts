@@ -13,12 +13,21 @@ export interface DesktopIpcRegistrar {
 
 export interface DesktopIpcHandlers {
   listWorkers(): Promise<readonly unknown[]>;
+  pairWorker(): Promise<unknown>;
+  unpairWorker(): Promise<void>;
   startRun(request: RunRequest): Promise<unknown>;
   getRun(runId: string): Promise<unknown>;
   stopRun(runId: string): Promise<unknown>;
 }
 
-const CHANNELS = ['sf:workers:list', 'sf:runs:start', 'sf:runs:get', 'sf:runs:stop'] as const;
+const CHANNELS = [
+  'sf:workers:list',
+  'sf:workers:pair',
+  'sf:workers:unpair',
+  'sf:runs:start',
+  'sf:runs:get',
+  'sf:runs:stop',
+] as const;
 
 function assertTrustedMainFrame(event: DesktopIpcEvent): void {
   const frame = event.senderFrame;
@@ -46,6 +55,16 @@ export function registerDesktopIpc(
     assertTrustedMainFrame(event);
     expectArgumentCount(args, 0);
     return handlers.listWorkers();
+  });
+  ipcMain.handle('sf:workers:pair', async (event, ...args) => {
+    assertTrustedMainFrame(event);
+    expectArgumentCount(args, 0);
+    return handlers.pairWorker();
+  });
+  ipcMain.handle('sf:workers:unpair', async (event, ...args) => {
+    assertTrustedMainFrame(event);
+    expectArgumentCount(args, 0);
+    await handlers.unpairWorker();
   });
   ipcMain.handle('sf:runs:start', async (event, ...args) => {
     assertTrustedMainFrame(event);

@@ -36,13 +36,16 @@ describe('Electron window security', () => {
     }
   });
 
-  it('serves only the exact renderer document for GET requests', () => {
+  it('serves only exact packaged renderer resources for GET requests', () => {
     expect(isAllowedRendererRequest('GET', 'app://renderer/index.html')).toBe(true);
+    expect(isAllowedRendererRequest('GET', 'app://renderer/app.js')).toBe(true);
     for (const [method, url] of [
       ['POST', 'app://renderer/index.html'],
       ['GET', 'app://renderer/../../secret'],
       ['GET', 'app://renderer/index.html?file=secret'],
       ['GET', 'app://renderer/index.html#fragment'],
+      ['GET', 'app://renderer/app.js?file=secret'],
+      ['GET', 'app://renderer/not-allowlisted.js'],
       ['GET', 'app://attacker/index.html'],
     ]) {
       expect(isAllowedRendererRequest(method as string, url as string)).toBe(false);

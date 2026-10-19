@@ -6,6 +6,8 @@ export interface DesktopIpcTransport {
 
 export interface SumatraFuzzApi {
   listWorkers(): Promise<readonly unknown[]>;
+  pairWorker(): Promise<unknown>;
+  unpairWorker(): Promise<void>;
   startRun(request: RunRequest): Promise<unknown>;
   getRun(runId: string): Promise<unknown>;
   stopRun(runId: string): Promise<unknown>;
@@ -14,6 +16,10 @@ export interface SumatraFuzzApi {
 export function createSumatraFuzzApi(transport: DesktopIpcTransport): SumatraFuzzApi {
   return Object.freeze({
     listWorkers: async () => (await transport.invoke('sf:workers:list')) as readonly unknown[],
+    pairWorker: async () => transport.invoke('sf:workers:pair'),
+    unpairWorker: async () => {
+      await transport.invoke('sf:workers:unpair');
+    },
     startRun: async (request: RunRequest) => transport.invoke('sf:runs:start', request),
     getRun: async (runId: string) => transport.invoke('sf:runs:get', runId),
     stopRun: async (runId: string) => transport.invoke('sf:runs:stop', runId),

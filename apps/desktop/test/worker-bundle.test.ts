@@ -2,9 +2,8 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
-  createWorkerPairingService,
   loadTrustedWorkerBundleSigningKey,
   verifyWorkerPairingBundle,
 } from '../src/main/worker-bundle.js';
@@ -84,25 +83,6 @@ describe('signed worker pairing bundles', () => {
 
     expect(() => verifyWorkerPairingBundle(expired, key)).toThrow(/validity window/);
     expect(() => verifyWorkerPairingBundle(unsafe, key)).toThrow(/HTTPS origin/);
-  });
-
-  it('persists credentials only after verification and returns no certificate material', async () => {
-    const key = publicKey.export({ type: 'spki', format: 'pem' }).toString();
-    const save = vi.fn(async () => undefined);
-    const pairing = createWorkerPairingService(key, { save });
-    const result = await pairing.importBundle(makeBundle());
-
-    expect(save).toHaveBeenCalledWith({ ...profile, workerFingerprint: 'a'.repeat(64) });
-    expect(result).toEqual({
-      workerId: profile.workerId,
-      baseUrl: profile.baseUrl,
-      workerFingerprint: 'a'.repeat(64),
-      expiresAt: expect.any(Date),
-    });
-    expect(JSON.stringify(result)).not.toContain('client-key');
-
-    await expect(pairing.importBundle(Buffer.from('{}'))).rejects.toThrow(/bundle/);
-    expect(save).toHaveBeenCalledOnce();
   });
 
   it('loads only a valid Ed25519 public key from the build-time trust file', async () => {

@@ -28,6 +28,13 @@ function registeredIpc() {
     },
     {
       listWorkers: async () => [],
+      pairWorker: async () => {
+        calls.push(['pair']);
+        return { cancelled: true };
+      },
+      unpairWorker: async () => {
+        calls.push(['unpair']);
+      },
       startRun: async (value) => {
         calls.push(['start', value]);
         return { accepted: true };
@@ -62,6 +69,20 @@ describe('Electron IPC security', () => {
     expect(ipc.calls).toEqual([]);
   });
 
+  it('only opens the certificate picker from the trusted main frame with no arguments', async () => {
+    const ipc = registeredIpc();
+    const handler = ipc.handlers.get('sf:workers:pair');
+    await expect(handler?.(ipc.event({ url: 'https://attacker.invalid' }))).rejects.toThrow(
+      /untrusted renderer/i,
+    );
+    await expect(handler?.(ipc.event(), 'C:\\secrets\\private.pem')).rejects.toThrow(
+      /argument count/i,
+    );
+    expect(ipc.calls).toEqual([]);
+    await expect(handler?.(ipc.event())).resolves.toEqual({ cancelled: true });
+    expect(ipc.calls).toEqual([['pair']]);
+  });
+
   it('validates exact run schemas and rejects path, shell, and extra fields', async () => {
     const ipc = registeredIpc();
     const handler = ipc.handlers.get('sf:runs:start');
@@ -84,6 +105,8 @@ describe('Electron IPC security', () => {
     ipc.dispose();
     expect(ipc.removed).toEqual([
       'sf:workers:list',
+      'sf:workers:pair',
+      'sf:workers:unpair',
       'sf:runs:start',
       'sf:runs:get',
       'sf:runs:stop',
@@ -99,10 +122,20 @@ describe('Electron IPC security', () => {
       },
     });
 
-    expect(Object.keys(api).sort()).toEqual(['getRun', 'listWorkers', 'startRun', 'stopRun']);
+    expect(Object.keys(api).sort()).toEqual([
+      'getRun',
+      'listWorkers',
+      'pairWorker',
+      'startRun',
+      'stopRun',
+      'unpairWorker',
+    ]);
     expect('send' in api).toBe(false);
     expect('invoke' in api).toBe(false);
     await api.listWorkers();
     expect(invoked).toEqual([['sf:workers:list']]);
+    await api.pairWorker();
+    await api.unpairWorker();
+    expect(invoked.slice(1)).toEqual([['sf:workers:pair'], ['sf:workers:unpair']]);
   });
 });

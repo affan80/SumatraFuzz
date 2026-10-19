@@ -7,6 +7,19 @@
     <title>SumatraFuzz</title>
   </head>
   <body>
-    <main id="root" aria-label="SumatraFuzz desktop"></main>
+    <main id="root" aria-label="SumatraFuzz desktop">
+      <h1>SumatraFuzz</h1>
+      <p>Pair a private Windows worker by importing its signed certificate bundle.</p>
+      <p id="status" role="status" aria-live="polite">Checking worker connection…</p>
+      <dl id="worker-details" hidden>
+        <dt>Worker ID</dt>
+        <dd id="worker-id"></dd>
+        <dt>Endpoint</dt>
+        <dd id="worker-endpoint"></dd>
+      </dl>
+      <button id="pair-worker" type="button">Import signed pairing bundle</button>
+      <button id="unpair-worker" type="button" disabled>Unpair worker</button>
+    </main>
+    <script type="module" src="app.js"></script>
   </body>
 </html>
