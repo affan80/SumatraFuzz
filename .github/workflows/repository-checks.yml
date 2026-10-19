@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   rust-worker:
     name: Rust worker (${{ matrix.os }})
@@ -16,25 +19,36 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-2022]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Show pinned Rust toolchain
         run: rustc --version
-
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Cache Cargo dependencies and Rust build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            ~/.cargo/git/checkouts
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
       - name: Verify locked dependencies
         run: cargo fetch --locked
       - name: Rust worker unit and integration tests
         run: cargo test --workspace --all-targets --locked
-      - name: Rust formatting
-        run: cargo fmt --all --check
       - name: Rust Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
   target-config:
     name: Target config
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Verify source pin
@@ -57,7 +71,7 @@ jobs:
     name: Windows Pester
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Install Pester 5
@@ -88,7 +102,7 @@ jobs:
     name: Native C++ contract
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Configure Windows x64 harness contract
@@ -106,7 +120,7 @@ jobs:
     needs: [target-config, windows-tests, native-contract, debug-evidence-unit]
     timeout-minutes: 55
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Clone pinned SumatraPDF 3.6.1rel source
@@ -123,7 +137,7 @@ jobs:
           if (-not $msbuild) { throw 'MSBuild unavailable' }
           pwsh -File scripts/windows/build-harness.ps1 -SumatraSource (Resolve-Path external/sumatrapdf).Path -MSBuildPath $msbuild -Configuration Release
       - name: Publish verified pinned SumatraPDF artifacts for instrumentation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-a3-native-${{ github.run_id }}
           path: |
@@ -136,7 +150,7 @@ jobs:
     name: DynamoRIO debug evidence parser
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Reject incomplete fake, crashed and empty instrumentation records
@@ -151,7 +165,7 @@ jobs:
     needs: [windows-tests, debug-evidence-unit, native-real-engine]
     timeout-minutes: 55
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Check out pinned SumatraPDF 3.6.1rel
@@ -162,7 +176,7 @@ jobs:
           $sha = (& git -C external/sumatrapdf rev-parse HEAD).Trim()
           if ($sha -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0') { throw 'Pinned Sumatra source drift' }
       - name: Load genuine CTest-verified pinned SumatraPDF binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: verified-a3-native-${{ github.run_id }}
           path: build/a3/Release
@@ -182,7 +196,7 @@ jobs:
         shell: pwsh
         timeout-minutes: 22
         run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: a4-genuine-dynamorio-debug-${{ github.run_id }}
@@ -190,7 +204,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
       - name: Upload verified A6 manifest (no crash or queue inputs)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: a6-verified-summary-${{ github.run_id }}
           path: |
@@ -200,7 +214,7 @@ jobs:
           retention-days: 30
       - name: Save non-sensitive WinAFL counters and run metadata
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: a5-winafl-counters-${{ github.run_id }}
           path: |
