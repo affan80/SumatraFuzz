@@ -1,4 +1,4 @@
-import { isNonNilUuid, type RunRequest, validateRunRequest } from '@sumatrafuzz/worker-protocol';
+import type { CampaignLimits, RunStatus } from '@sumatrafuzz/worker-protocol';
 import { isTrustedAppDocumentUrl } from './window-security.js';
 
 export interface DesktopIpcEvent {
@@ -15,18 +15,25 @@ export interface DesktopIpcHandlers {
   listWorkers(): Promise<readonly unknown[]>;
   pairWorker(): Promise<unknown>;
   unpairWorker(): Promise<void>;
-  startRun(request: RunRequest): Promise<unknown>;
-  getRun(runId: string): Promise<unknown>;
-  stopRun(runId: string): Promise<unknown>;
+  importInputBundle(): Promise<unknown>;
+  getCampaignStatus(): Promise<unknown>;
+  startCampaign(draft: RunDraft): Promise<RunStatus>;
+  stopActiveRun(): Promise<RunStatus | null>;
+}
+
+export interface RunDraft {
+  readonly label: string;
+  readonly limits: CampaignLimits;
 }
 
 const CHANNELS = [
   'sf:workers:list',
   'sf:workers:pair',
   'sf:workers:unpair',
-  'sf:runs:start',
-  'sf:runs:get',
-  'sf:runs:stop',
+  'sf:campaigns:import',
+  'sf:campaigns:status',
+  'sf:campaigns:start',
+  'sf:campaigns:stop',
 ] as const;
 
 function assertTrustedMainFrame(event: DesktopIpcEvent): void {
@@ -40,11 +47,60 @@ function expectArgumentCount(args: readonly unknown[], expected: number): void {
   if (args.length !== expected) throw new TypeError('IPC request has an invalid argument count');
 }
 
-function expectRunId(value: unknown): string {
-  if (typeof value !== 'string' || !isNonNilUuid(value)) {
-    throw new TypeError('IPC run ID must be a non-nil UUID');
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const keys = [...expected].sort();
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+function validateRunDraft(value: unknown): RunDraft {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('campaign draft is invalid');
   }
-  return value;
+  const candidate = value as Record<string, unknown>;
+  if (
+    !exactKeys(candidate, ['label', 'limits']) ||
+    typeof candidate.label !== 'string' ||
+    candidate.label.length > 128 ||
+    [...candidate.label].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    }) ||
+    typeof candidate.limits !== 'object' ||
+    candidate.limits === null ||
+    Array.isArray(candidate.limits)
+  ) {
+    throw new TypeError('campaign draft is invalid');
+  }
+  const limits = candidate.limits as Record<string, unknown>;
+  if (
+    !exactKeys(limits, [
+      'max_duration_s',
+      'max_memory_bytes',
+      'max_disk_bytes',
+      'max_cpu_percent',
+    ]) ||
+    !Number.isSafeInteger(limits.max_duration_s) ||
+    (limits.max_duration_s as number) < 1 ||
+    !Number.isSafeInteger(limits.max_memory_bytes) ||
+    (limits.max_memory_bytes as number) < 1 ||
+    !Number.isSafeInteger(limits.max_disk_bytes) ||
+    (limits.max_disk_bytes as number) < 1 ||
+    !Number.isInteger(limits.max_cpu_percent) ||
+    (limits.max_cpu_percent as number) < 1 ||
+    (limits.max_cpu_percent as number) > 100
+  ) {
+    throw new TypeError('campaign limits are invalid');
+  }
+  return {
+    label: candidate.label,
+    limits: {
+      max_duration_s: limits.max_duration_s as number,
+      max_memory_bytes: limits.max_memory_bytes as number,
+      max_disk_bytes: limits.max_disk_bytes as number,
+      max_cpu_percent: limits.max_cpu_percent as number,
+    },
+  };
 }
 
 export function registerDesktopIpc(
@@ -66,20 +122,25 @@ export function registerDesktopIpc(
     expectArgumentCount(args, 0);
     await handlers.unpairWorker();
   });
-  ipcMain.handle('sf:runs:start', async (event, ...args) => {
+  ipcMain.handle('sf:campaigns:import', async (event, ...args) => {
     assertTrustedMainFrame(event);
-    expectArgumentCount(args, 1);
-    return handlers.startRun(validateRunRequest(args[0]));
+    expectArgumentCount(args, 0);
+    return handlers.importInputBundle();
   });
-  ipcMain.handle('sf:runs:get', async (event, ...args) => {
+  ipcMain.handle('sf:campaigns:status', async (event, ...args) => {
     assertTrustedMainFrame(event);
-    expectArgumentCount(args, 1);
-    return handlers.getRun(expectRunId(args[0]));
+    expectArgumentCount(args, 0);
+    return handlers.getCampaignStatus();
   });
-  ipcMain.handle('sf:runs:stop', async (event, ...args) => {
+  ipcMain.handle('sf:campaigns:start', async (event, ...args) => {
     assertTrustedMainFrame(event);
     expectArgumentCount(args, 1);
-    return handlers.stopRun(expectRunId(args[0]));
+    return handlers.startCampaign(validateRunDraft(args[0]));
+  });
+  ipcMain.handle('sf:campaigns:stop', async (event, ...args) => {
+    assertTrustedMainFrame(event);
+    expectArgumentCount(args, 0);
+    return handlers.stopActiveRun();
   });
 
   return () => {

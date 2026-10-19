@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createWorkerClient } from '@sumatrafuzz/worker-client';
 import { app, dialog, ipcMain, protocol, safeStorage, session } from 'electron';
+import { readInputBundleFile } from './input-bundle-file.js';
 import { type DesktopIpcRegistrar, registerDesktopIpc } from './ipc.js';
 import { createMainWindow } from './window.js';
 import { isAllowedRendererRequest, secureResponseHeaders } from './window-security.js';
@@ -88,6 +89,17 @@ void app
         const [selectedPath] = selection.filePaths;
         if (!selectedPath) return null;
         return readWorkerBundleFile(selectedPath);
+      },
+      selectInputBundle: async () => {
+        const selection = await dialog.showOpenDialog({
+          title: 'Import PDF input bundle',
+          filters: [{ name: 'PDF ZIP bundle', extensions: ['zip'] }],
+          properties: ['openFile'],
+        });
+        if (selection.canceled || selection.filePaths.length !== 1) return null;
+        const [selectedPath] = selection.filePaths;
+        if (!selectedPath) return null;
+        return readInputBundleFile(selectedPath);
       },
       createClient: (profile) =>
         createWorkerClient({

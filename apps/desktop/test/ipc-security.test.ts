@@ -1,20 +1,15 @@
-import type { RunRequest } from '@sumatrafuzz/worker-protocol';
 import { describe, expect, it } from 'vitest';
 import { type DesktopIpcEvent, registerDesktopIpc } from '../src/main/ipc.js';
 import { createSumatraFuzzApi } from '../src/preload/api.js';
 
-const request: RunRequest = {
-  request_id: '22222222-2222-4222-8222-222222222222' as RunRequest['request_id'],
-  controller_id: '33333333-3333-4333-8333-333333333333' as RunRequest['controller_id'],
-  input_bundle_id: 'seed-set-1',
-  target_lock_sha256: 'a'.repeat(64),
+const draft = {
+  label: 'security test',
   limits: {
     max_duration_s: 60,
     max_memory_bytes: 1024,
     max_disk_bytes: 1024,
     max_cpu_percent: 50,
   },
-  label: 'security test',
 };
 
 function registeredIpc() {
@@ -35,12 +30,13 @@ function registeredIpc() {
       unpairWorker: async () => {
         calls.push(['unpair']);
       },
-      startRun: async (value) => {
+      importInputBundle: async () => ({ input_bundle_id: 'private-id' }),
+      getCampaignStatus: async () => ({ connection_state: 'connected' }),
+      startCampaign: async (value) => {
         calls.push(['start', value]);
-        return { accepted: true };
+        return { accepted: true } as never;
       },
-      getRun: async (runId) => ({ runId }),
-      stopRun: async (runId) => ({ runId, stopped: true }),
+      stopActiveRun: async () => ({ stopped: true }) as never,
     },
   );
   const mainFrame = { url: 'app://renderer/index.html' };
@@ -54,20 +50,20 @@ function registeredIpc() {
 describe('Electron IPC security', () => {
   it('rejects cross-origin and subframe IPC before calling application handlers', async () => {
     const ipc = registeredIpc();
-    const handler = ipc.handlers.get('sf:runs:start');
+    const handler = ipc.handlers.get('sf:campaigns:start');
     expect(handler).toBeDefined();
 
-    await expect(
-      handler?.(ipc.event({ url: 'https://attacker.invalid' }), request),
-    ).rejects.toThrow(/untrusted renderer/i);
+    await expect(handler?.(ipc.event({ url: 'https://attacker.invalid' }), draft)).rejects.toThrow(
+      /untrusted renderer/i,
+    );
     await expect(
       handler?.(
         { sender: { mainFrame: ipc.mainFrame }, senderFrame: { url: 'app://renderer/frame.html' } },
-        request,
+        draft,
       ),
     ).rejects.toThrow(/untrusted renderer/i);
     ipc.mainFrame.url = 'app://renderer/app.js';
-    await expect(handler?.(ipc.event(), request)).rejects.toThrow(/untrusted renderer/i);
+    await expect(handler?.(ipc.event(), draft)).rejects.toThrow(/untrusted renderer/i);
     expect(ipc.calls).toEqual([]);
   });
 
@@ -85,33 +81,44 @@ describe('Electron IPC security', () => {
     expect(ipc.calls).toEqual([['pair']]);
   });
 
-  it('validates exact run schemas and rejects path, shell, and extra fields', async () => {
+  it('accepts only a label and limits for a campaign start', async () => {
     const ipc = registeredIpc();
-    const handler = ipc.handlers.get('sf:runs:start');
+    const handler = ipc.handlers.get('sf:campaigns:start');
     await expect(
-      handler?.(ipc.event(), { ...request, shell: 'calc.exe', path: '/tmp/secret' }),
+      handler?.(ipc.event(), { ...draft, shell: 'calc.exe', path: '/tmp/secret' }),
     ).rejects.toThrow();
+    await expect(handler?.(ipc.event(), draft, 'extra')).rejects.toThrow(/argument count/i);
     expect(ipc.calls).toEqual([]);
-    await expect(handler?.(ipc.event(), request)).resolves.toEqual({ accepted: true });
-    expect(ipc.calls).toEqual([['start', request]]);
+    await expect(
+      handler?.(ipc.event(), {
+        ...draft,
+        limits: { ...draft.limits, max_disk_bytes: Number.MAX_SAFE_INTEGER },
+      }),
+    ).resolves.toEqual({ accepted: true });
+    expect(ipc.calls).toEqual([
+      ['start', { ...draft, limits: { ...draft.limits, max_disk_bytes: Number.MAX_SAFE_INTEGER } }],
+    ]);
   });
 
-  it('uses only fixed channel names and validates run identifiers', async () => {
+  it('uses fixed channels and gives the renderer no run-ID lookup or stop authority', async () => {
     const ipc = registeredIpc();
+    expect(ipc.handlers.has('sf:runs:get')).toBe(false);
+    expect(ipc.handlers.has('sf:runs:stop')).toBe(false);
     await expect(
-      ipc.handlers.get('sf:runs:get')?.(ipc.event(), '../../etc/passwd'),
-    ).rejects.toThrow(/UUID/i);
-    await expect(
-      ipc.handlers.get('sf:runs:get')?.(ipc.event(), '44444444-4444-4444-8444-444444444444'),
-    ).resolves.toEqual({ runId: '44444444-4444-4444-8444-444444444444' });
+      ipc.handlers.get('sf:campaigns:stop')?.(ipc.event(), 'forged-run-id'),
+    ).rejects.toThrow(/argument count/i);
+    await expect(ipc.handlers.get('sf:campaigns:stop')?.(ipc.event())).resolves.toEqual({
+      stopped: true,
+    });
     ipc.dispose();
     expect(ipc.removed).toEqual([
       'sf:workers:list',
       'sf:workers:pair',
       'sf:workers:unpair',
-      'sf:runs:start',
-      'sf:runs:get',
-      'sf:runs:stop',
+      'sf:campaigns:import',
+      'sf:campaigns:status',
+      'sf:campaigns:start',
+      'sf:campaigns:stop',
     ]);
   });
 
@@ -125,11 +132,12 @@ describe('Electron IPC security', () => {
     });
 
     expect(Object.keys(api).sort()).toEqual([
-      'getRun',
+      'getCampaignStatus',
+      'importInputBundle',
       'listWorkers',
       'pairWorker',
-      'startRun',
-      'stopRun',
+      'startCampaign',
+      'stopActiveRun',
       'unpairWorker',
     ]);
     expect('send' in api).toBe(false);
@@ -138,6 +146,17 @@ describe('Electron IPC security', () => {
     expect(invoked).toEqual([['sf:workers:list']]);
     await api.pairWorker();
     await api.unpairWorker();
-    expect(invoked.slice(1)).toEqual([['sf:workers:pair'], ['sf:workers:unpair']]);
+    await api.importInputBundle();
+    await api.getCampaignStatus();
+    await api.startCampaign(draft);
+    await api.stopActiveRun();
+    expect(invoked.slice(1)).toEqual([
+      ['sf:workers:pair'],
+      ['sf:workers:unpair'],
+      ['sf:campaigns:import'],
+      ['sf:campaigns:status'],
+      ['sf:campaigns:start', draft],
+      ['sf:campaigns:stop'],
+    ]);
   });
 });
