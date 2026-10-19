@@ -28,6 +28,8 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
+      - name: Build SQLite binding from locked source
+        run: npm run native:sqlite:build
       - name: Formatting
         run: npm run format:check
       - name: Lint

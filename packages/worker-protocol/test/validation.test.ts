@@ -92,4 +92,16 @@ describe('wire schema and sequence precision', () => {
     expect(status.last_event_seq).toBe(BigInt(sequence));
     expect(event.seq).toBe(BigInt(sequence));
   });
+
+  it('validates native teardown as an explicit journal event', () => {
+    expect(
+      validateRunEvent({
+        run_id: 'a11ce021-0000-4000-8000-000000000021',
+        seq: '1',
+        time_utc: '2026-10-19T12:00:00.000Z',
+        event_type: 'process_teardown',
+        payload: { jobId: 'job-1', remainingProcesses: 0 },
+      }).event_type,
+    ).toBe('process_teardown');
+  });
 });

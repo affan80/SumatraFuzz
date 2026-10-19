@@ -33,6 +33,7 @@ test('Node CI runs in both operating systems and keeps the lockfile cache scoped
   assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
   assert.match(workflow, /cache: npm/);
   assert.match(workflow, /npm run typecheck/);
+  assert.match(workflow, /npm run native:sqlite:build/);
   assert.match(workflow, /npm audit --audit-level=high/);
 });
 

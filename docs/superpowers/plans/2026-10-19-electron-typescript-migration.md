@@ -17,6 +17,7 @@
 - Execute untrusted PDFs only in isolated, nonadministrator Windows x64 workers.
 - Use structured argv, never shell-concatenated commands; only allowlisted, provenance-verified binaries may launch.
 - Permit one active campaign per worker; worker SQLite is authoritative, state/event/lease mutations are atomic, request retries are idempotent, and recovery never silently relaunches.
+- Persist the native teardown receipt as a `process_teardown` event in the same transaction that releases the one-slot lease.
 - Provision the worker as a nonadministrator Windows service with a dedicated service SID and a dedicated NTFS data volume. In v1, `max_disk_bytes` is the administrator-provisioned hard quota for the worker data volume; a run request must equal that worker quota. This uses the OS-enforced cap for all service-owned run data instead of claiming that polling alone can impose a strict per-run disk limit.
 - Keep SQLite in WAL mode with foreign keys and `synchronous=FULL`; retain the 5-second busy timeout and bounded transient WAL initialization retry behavior.
 - Keep local worker transport on loopback and remote worker transport on an explicit private/VPN interface; require mutual TLS and explicit pairing in both modes.
@@ -88,7 +89,7 @@ Each workstream is a focused PR into `dev` under its existing tracker: #90 worke
 ### Task 3: Provenance, policy and verified launch specification (#90)
 
 **Files:**
-- Create: `packages/worker-core/package.json`, `src/policy.ts`, `src/verified-launch.ts`, `src/path-verification.ts`, `test/verified-launch.test.ts`, `test/path-verification.test.ts`
+- Create: `packages/worker-core/package.json`, `src/policy.ts`, `src/verified-launch.ts`, `src/path-verification.ts`, `test/verified-launch.test.ts`
 - Consume: `@sumatrafuzz/worker-protocol` from Task 2.
 
 **Interfaces:**
@@ -96,10 +97,10 @@ Each workstream is a focused PR into `dev` under its existing tracker: #90 worke
 - `VerifiedRunSpec`: `runId`, verified executable, frozen `argv: readonly string[]`, working directory, limits and evidence directory.
 - `verifyAndBuildLaunch(request: RunRequest, policy: WorkerPolicy): Promise<VerifiedRunSpec>`; does not spawn.
 
-- [ ] **Step 1: Port existing verified-launch tests** for wrong client lock digest, forged client-supplied trust anchors, mutated native binaries, unknown bundles and ceilings.
-- [ ] **Step 2: Run `npm test -- --run --project @sumatrafuzz/worker-core`;** verify the trust cases fail before implementation.
-- [ ] **Step 3: Implement SHA-256 streaming, canonical containment and Windows reparse-point checks for trusted roots/files; verify pinned source commit `16c59fde8b824ab54c56f23aef910a6fdd874ad0`, A4 cycles ≥10 and nonzero confirmed map; reject malformed identities and any limit above administrator ceilings.** Preserve legacy WinAFL ordinary DOS-path argv behavior while keeping canonical paths for trust checks.
-- [ ] **Step 4: Test reordered JSON, case-insensitive hex, symlink/reparse ancestors, changed-after-verification hashes, UNC/device paths, `\\?\` argv, path traversal and missing A4 fields;** all invalid cases must fail closed.
+- [x] **Step 1: Port existing verified-launch tests** for wrong client lock digest, forged client-supplied trust anchors, mutated native binaries, unknown bundles and ceilings.
+- [x] **Step 2: Run `npm test -- --run --project @sumatrafuzz/worker-core`;** verify the trust cases fail before implementation.
+- [x] **Step 3: Implement SHA-256 streaming, canonical containment and Windows reparse-point checks for trusted roots/files; verify pinned source commit `16c59fde8b824ab54c56f23aef910a6fdd874ad0`, A4 cycles ≥10 and nonzero confirmed map; reject malformed identities and any limit above administrator ceilings.** Preserve legacy WinAFL ordinary DOS-path argv behavior while keeping canonical paths for trust checks.
+- [x] **Step 4: Test reordered JSON, case-insensitive hex, symlink/reparse ancestors, changed-after-verification hashes, UNC/device paths, `\\?\` argv, path traversal and missing A4 fields;** all invalid cases must fail closed.
 - [ ] **Step 5: Run worker-core tests on Linux and Windows CI;** add no process spawn in this package.
 - [ ] **Step 6: Commit** `feat(worker): port provenance-checked launch policy`.
 
@@ -116,10 +117,10 @@ Each workstream is a focused PR into `dev` under its existing tracker: #90 worke
 - `releaseAfterTeardown(runId: RunId, receipt: TeardownReceipt): void`; receipt fields are `jobId: string`, `stoppedAtUtc: string`, `remainingProcesses: number`, `exitCode: number | null`, and `stopReason: StopReason`.
 - `runState(runId: RunId): RunState`; `readEventsAfter(runId: RunId, seq: bigint, limit: number): RunEvent[]`.
 
-- [ ] **Step 1: Port tests** for fresh/legacy version-0 migration, corruption refusal without byte overwrite, injected write rollback, bounded replay, idempotent matching retry, conflicting payload rejection, one durable active slot, terminal release only with teardown receipt, CAS mismatch, unsupported version, and concurrent claims across independent connections.
-- [ ] **Step 2: Run `npm test -- --run --project @sumatrafuzz/run-store`;** verify expected missing API/database failures.
-- [ ] **Step 3: Implement `better-sqlite3` transactions with `BEGIN IMMEDIATE`;** enable safe-integer mode so SQLite `INTEGER` values are returned as `bigint`; apply foreign keys, WAL, `synchronous=FULL`, 5-second busy timeout and at most 16 WAL activation attempts with 80 ms delay on BUSY/LOCKED only. Preserve `user_version=1`; reject newer schema, malformed rows, missing active lease and missing event tail. Accept only replay limits 1–10,000 and test sequence values above `Number.MAX_SAFE_INTEGER` without loss.
-- [ ] **Step 4: Require claim, idempotency record and lease to commit atomically;** state CAS and event sequence/payload commit atomically; `Completed` can only originate from `Stopping`; slot release requires terminal state and a `TeardownReceipt` with `remainingProcesses: 0`.
+- [x] **Step 1: Port tests** for fresh/legacy version-0 migration, corruption refusal without byte overwrite, injected write rollback, bounded replay, idempotent matching retry, conflicting payload rejection, one durable active slot, terminal release only with teardown receipt, CAS mismatch, unsupported version, and concurrent claims across independent connections.
+- [x] **Step 2: Run `npm test -- --run --project @sumatrafuzz/run-store`;** verify expected missing API/database failures.
+- [x] **Step 3: Implement `better-sqlite3` transactions with `BEGIN IMMEDIATE`;** enable safe-integer mode so SQLite `INTEGER` values are returned as `bigint`; apply foreign keys, WAL, `synchronous=FULL`, 5-second busy timeout and at most 16 WAL activation attempts with 80 ms delay on BUSY/LOCKED only. Preserve `user_version=1`; reject newer schema, malformed rows, missing active lease and missing event tail. Accept only replay limits 1–10,000 and test sequence values above `Number.MAX_SAFE_INTEGER` without loss.
+- [x] **Step 4: Require claim, idempotency record and lease to commit atomically;** state CAS and event sequence/payload commit atomically; `Completed` can only originate from `Stopping`; slot release requires terminal state and a `TeardownReceipt` with `remainingProcesses: 0` and persists it in the same transaction.
 - [ ] **Step 5: Run the store suite repeatedly on Linux and Windows** and run the process-exit/reopen and `SQLITE_FULL` rollback tests.
 - [ ] **Step 6: Commit** `feat(store): port authoritative worker journal to TypeScript`.
 

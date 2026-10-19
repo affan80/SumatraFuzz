@@ -1,4 +1,8 @@
 {
   "files": [],
-  "references": [{ "path": "packages/worker-protocol" }]
+  "references": [
+    { "path": "packages/worker-protocol" },
+    { "path": "packages/worker-core" },
+    { "path": "packages/run-store" }
+  ]
 }

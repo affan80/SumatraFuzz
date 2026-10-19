@@ -62,6 +62,7 @@ export const RunStatusSchema = Type.Object(
 
 export const EventTypeSchema = Type.Union([
   Type.Literal('state_changed'),
+  Type.Literal('process_teardown'),
   Type.Literal('metric_sample'),
   Type.Literal('evidence_finalized'),
   Type.Literal('error'),
