@@ -289,7 +289,10 @@ Napi::Value SampleJob(const Napi::CallbackInfo& info) {
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG elapsed = std::max<ULONGLONG>(1, now - job.previous_sample_ms);
     const ULONGLONG cpu = static_cast<ULONGLONG>(accounting.TotalUserTime.QuadPart + accounting.TotalKernelTime.QuadPart);
-    const double cpu_percent = static_cast<double>(cpu - job.previous_cpu_100ns) / (elapsed * 10000.0) * 100.0;
+    const DWORD processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (processor_count == 0 || cpu < job.previous_cpu_100ns) throw std::runtime_error("invalid job CPU accounting sample");
+    const double cpu_percent = static_cast<double>(cpu - job.previous_cpu_100ns) /
+                               (elapsed * 10000.0 * static_cast<double>(processor_count)) * 100.0;
     job.previous_sample_ms = now;
     job.previous_cpu_100ns = cpu;
     Napi::Object sample = Napi::Object::New(env);
