@@ -3,6 +3,8 @@
   "references": [
     { "path": "packages/worker-protocol" },
     { "path": "packages/worker-core" },
-    { "path": "packages/run-store" }
+    { "path": "packages/run-store" },
+    { "path": "packages/instrumentation" },
+    { "path": "packages/evidence" }
   ]
 }

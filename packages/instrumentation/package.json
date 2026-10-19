@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./fixtures": "./src/fixtures.ts",
     "./verify-debug": "./src/verify-debug.ts",
     "./seed": "./src/seed.ts"
   }

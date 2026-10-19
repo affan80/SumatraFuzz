@@ -195,7 +195,7 @@ describe('A6 evidence collection', () => {
       afterStats: input.after,
     });
     expect(evidence.hangs).toHaveLength(2);
-    expect(evidence.hangs[0].classification).toBe('untriaged');
+    expect(evidence.hangs[0]?.classification).toBe('untriaged');
     expect(evidence.finding_counts.hangs).toEqual({
       reported_in_stats: 1,
       saved_artifacts: 2,

@@ -19,7 +19,10 @@ export function parseWinAflStats(text: string): WinAflStats {
     if (!line.trim()) continue;
     const match = /^\s*([A-Za-z_][A-Za-z_0-9]*)\s*:\s*(.*?)\s*$/.exec(line);
     if (!match) throw new StatsError('Malformed fuzzer_stats line');
-    const [, key, value] = match;
+    const key = match[1];
+    const value = match[2];
+    if (key === undefined || value === undefined)
+      throw new StatsError('Malformed fuzzer_stats line');
     if (fields.has(key)) throw new StatsError(`Duplicate fuzzer_stats field: ${key}`);
     fields.set(key, value);
   }

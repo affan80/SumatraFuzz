@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import { createReadStream } from 'node:fs';
-import { lstat, readdir, readFile, type Stats } from 'node:fs/promises';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   type DebugEvidence,
@@ -161,13 +162,16 @@ export async function findingInventory(
   const items: FindingEvidence[] = [];
   for (let i = 0; i < paths.length; i++) {
     const candidate = paths[i];
+    const name = names[i];
+    if (candidate === undefined || name === undefined)
+      throw new EvidenceError('Finding inventory changed unexpectedly');
     const fileInfo = await lstat(candidate);
     items.push({
-      path: `${kind}/${names[i]}`,
+      path: `${kind}/${name}`,
       sha256: await digest(candidate, runDir),
       bytes: fileInfo.size,
       classification: 'untriaged',
-      replay_argv: ['sumatrafuzz-harness.exe', `${kind}/${names[i]}`],
+      replay_argv: ['sumatrafuzz-harness.exe', `${kind}/${name}`],
     });
   }
   return items;

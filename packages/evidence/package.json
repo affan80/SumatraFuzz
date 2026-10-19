@@ -7,6 +7,7 @@
     "@sumatrafuzz/instrumentation": "0.1.0"
   },
   "exports": {
+    "./collect": "./src/collect.ts",
     "./stats": "./src/stats.ts"
   }
 }

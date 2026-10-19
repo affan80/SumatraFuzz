@@ -42,7 +42,11 @@ export function inspectDebugLog(
     throw new DebugLogError('WinAFL debug did not confirm normal loop exit');
   if (/^(?:WARNING:|Exception caught:|crashed\b)/im.test(prefix))
     throw new DebugLogError('Exception or warning reported by WinAFL');
-  const loaded = [...prefix.matchAll(/^Module loaded, ([^\r\n]+)\r?$/gim)].map((match) => match[1]);
+  const loaded: string[] = [];
+  for (const match of prefix.matchAll(/^Module loaded, ([^\r\n]+)\r?$/gim)) {
+    const name = match[1];
+    if (name !== undefined) loaded.push(name);
+  }
   const byName = new Map(loaded.map((name) => [name.toLowerCase(), name]));
   const parserModules = ['PdfFilter.dll', 'libmupdf.dll'];
   const missing = parserModules.filter((name) => !byName.has(name.toLowerCase()));
