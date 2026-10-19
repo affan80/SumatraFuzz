@@ -1,6 +1,11 @@
 //! Worker-local, transactional SQLite journal and exclusive worker slot.
 //! This module deliberately has no network or native-process responsibilities.
 
+mod integrity;
+
+#[cfg(test)]
+mod tests;
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{path::Path, sync::Mutex, time::Duration};
@@ -93,7 +98,7 @@ impl SqliteRunStore {
         if !(0..=1).contains(&version) {
             return Err(StoreError::UnsupportedVersion);
         }
-        tx.execute_batch(include_str!("../migrations/0001_worker.sql"))?;
+        integrity::initialize(&tx, version)?;
         if version == 0 {
             tx.pragma_update(None, "user_version", 1_i64)?;
         }
@@ -120,6 +125,7 @@ impl SqliteRunStore {
         }
         let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        integrity::validate_lease(&tx)?;
         let earlier: Option<(String, String)> = tx.query_row(
             "SELECT payload_digest, run_id FROM command_idempotency WHERE controller_id = ?1 AND request_id = ?2",
             params![controller_id.0.to_string(), request_id.to_string()],
@@ -130,6 +136,7 @@ impl SqliteRunStore {
                 return Err(StoreError::IdempotencyConflict);
             }
             let saved_id = Uuid::parse_str(&recorded_run).map_err(|_| StoreError::Corrupt)?;
+            integrity::validate_run(&tx, &recorded_run)?;
             tx.commit()?;
             return Ok(ClaimOutcome::Existing(RunId(saved_id)));
         }
@@ -155,6 +162,10 @@ impl SqliteRunStore {
         Ok(ClaimOutcome::New(run_id))
     }
 
+    /// Append a lifecycle transition and its event atomically.
+    /// `Completed` is deliberately unavailable here: this generic API has no
+    /// trusted stop/finalization authority. B1 supervisor integration must add
+    /// that contract before successful completion can be recorded.
     pub fn transition_state(
         &self,
         run_id: RunId,
@@ -162,11 +173,13 @@ impl SqliteRunStore {
         next: RunState,
         kind: EventType,
     ) -> Result<u64, StoreError> {
-        if !valid_transition(expected, next) {
+        if !valid_transition(expected, next) || next == RunState::Completed {
             return Err(StoreError::InvalidTransition);
         }
         let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        integrity::validate_lease(&tx)?;
+        integrity::validate_run(&tx, &run_id.0.to_string())?;
         let record: Option<(String, i64)> = tx
             .query_row(
                 "SELECT state, last_seq FROM run_state WHERE run_id = ?1",
@@ -209,6 +222,8 @@ impl SqliteRunStore {
         }
         let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        integrity::validate_lease(&tx)?;
+        integrity::validate_run(&tx, &run_id.0.to_string())?;
         let current: Option<String> = tx
             .query_row(
                 "SELECT state FROM run_state WHERE run_id = ?1",
@@ -249,11 +264,15 @@ impl SqliteRunStore {
         seq: u64,
         limit: u32,
     ) -> Result<Vec<RunEvent>, StoreError> {
-        if limit == 0 || limit > 10_000 {
+        if limit == 0 || limit > 10_000 || seq > i64::MAX as u64 {
             return Err(StoreError::InvalidRequest);
         }
-        let conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        let mut stmt = conn.prepare(
+        let mut conn = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        // A deferred read transaction keeps validation and the page in one WAL
+        // snapshot even if a second connection commits while replay is read.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        integrity::validate_run(&tx, &run_id.0.to_string())?;
+        let mut stmt = tx.prepare(
             "SELECT seq, time_utc, event_type, payload FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
         )?;
         let rows = stmt.query_map(params![run_id.0.to_string(), seq, limit], |r| {
