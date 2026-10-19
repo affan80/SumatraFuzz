@@ -22,6 +22,11 @@ export interface ImportedInputBundle {
   readonly expanded_bytes: number;
 }
 
+export interface InputBundleImportOptions {
+  /** Recheck the worker volume before each extracted file is created. */
+  readonly ensureCapacity?: (bytesToWrite: number) => Promise<void>;
+}
+
 function reject(message: string): never {
   throw Object.assign(new Error(message), { status: 400 });
 }
@@ -42,6 +47,7 @@ export async function importInputBundle(
   inputRoot: string,
   controllerId: string,
   archive: Buffer,
+  options: InputBundleImportOptions = {},
 ): Promise<ImportedInputBundle> {
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(controllerId)) {
     throw new TypeError('controller ID must be a UUID');
@@ -107,6 +113,7 @@ export async function importInputBundle(
       }
       expanded += entry.uncompressedSize;
       if (expanded > MAX_EXPANDED_BYTES) reject('input bundle exceeds expanded-size policy');
+      await options.ensureCapacity?.(entry.uncompressedSize);
 
       let actual = 0;
       let checksum = 0;

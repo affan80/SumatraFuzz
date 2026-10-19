@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertProtocolVersion,
+  createExclusiveRequestGate,
   createWorkerServer,
   parseArtifactRange,
   parseEventPageLimit,
@@ -10,6 +11,16 @@ import {
 } from '../src/server.js';
 
 describe('worker API contract', () => {
+  it('permits only one in-flight input import and releases the gate after completion', () => {
+    const gate = createExclusiveRequestGate();
+    const release = gate.tryAcquire();
+
+    expect(release).toBeTypeOf('function');
+    expect(gate.tryAcquire()).toBeUndefined();
+    release?.();
+    expect(gate.tryAcquire()).toBeTypeOf('function');
+  });
+
   it('rejects absent, malformed, and unsupported protocol versions', () => {
     for (const version of [undefined, ['1'], '2', '01']) {
       expect(() => assertProtocolVersion(version)).toThrow(/protocol version/i);
@@ -101,6 +112,7 @@ describe('worker API contract', () => {
       ca: Buffer.alloc(0),
       pairedControllers: new Map<string, string>(),
       inputRoot: '/unused',
+      ensureInputCapacity: async () => {},
       store: { ownsRun: () => false },
       handlers: {} as never,
     };

@@ -88,6 +88,12 @@ export async function createWorkerApplication(
       handlers: coordinator,
       store,
       inputRoot: config.inputRoot,
+      ensureInputCapacity: async (bytesToWrite) => {
+        const usedBytes = await measureWorkerVolumeUsedBytes();
+        if (usedBytes + bytesToWrite > config.policy.maxLimits.max_disk_bytes) {
+          throw Object.assign(new Error('worker disk limit would be exceeded'), { status: 507 });
+        }
+      },
       ...(config.maxRequestBytes === undefined ? {} : { maxRequestBytes: config.maxRequestBytes }),
     });
     return {
