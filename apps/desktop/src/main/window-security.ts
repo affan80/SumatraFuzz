@@ -3,6 +3,12 @@ import type { BrowserWindowConstructorOptions } from 'electron';
 export const DESKTOP_APP_URL = 'app://renderer/index.html';
 export const DESKTOP_APP_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'; worker-src 'none'; media-src 'none'";
+const RENDERER_PATHS = [
+  '/index.html',
+  '/app.js',
+  '/campaign-poller.js',
+  '/campaign-view-model.js',
+] as const;
 
 export interface GuardedWebContents {
   setWindowOpenHandler(handler: () => { action: 'deny' }): void;
@@ -46,7 +52,7 @@ export function isAllowedRendererRequest(method: string, value: string): boolean
     const url = new URL(value);
     return (
       isTrustedAppUrl(value) &&
-      ['/index.html', '/app.js'].includes(url.pathname) &&
+      (RENDERER_PATHS as readonly string[]).includes(url.pathname) &&
       url.search === '' &&
       url.hash === ''
     );

@@ -52,6 +52,8 @@ describe('Electron window security', () => {
   it('serves only exact packaged renderer resources for GET requests', () => {
     expect(isAllowedRendererRequest('GET', 'app://renderer/index.html')).toBe(true);
     expect(isAllowedRendererRequest('GET', 'app://renderer/app.js')).toBe(true);
+    expect(isAllowedRendererRequest('GET', 'app://renderer/campaign-poller.js')).toBe(true);
+    expect(isAllowedRendererRequest('GET', 'app://renderer/campaign-view-model.js')).toBe(true);
     for (const [method, url] of [
       ['POST', 'app://renderer/index.html'],
       ['GET', 'app://renderer/../../secret'],

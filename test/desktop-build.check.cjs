@@ -13,6 +13,11 @@ test('desktop package main, preload and renderer resolve to built files', () => 
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'src', 'preload', 'index.js')), true);
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'index.html')), true);
   assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'app.js')), true);
+  assert.equal(existsSync(path.join(desktopRoot, 'dist', 'renderer', 'campaign-poller.js')), true);
+  assert.equal(
+    existsSync(path.join(desktopRoot, 'dist', 'renderer', 'campaign-view-model.js')),
+    true,
+  );
   assert.equal(
     existsSync(path.join(desktopRoot, 'dist', 'resources', 'worker-bundle-signing-key.pem')),
     true,

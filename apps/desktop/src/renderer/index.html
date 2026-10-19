@@ -11,14 +11,71 @@
       <h1>SumatraFuzz</h1>
       <p>Pair a private Windows worker by importing its signed certificate bundle.</p>
       <p id="status" role="status" aria-live="polite">Checking worker connection…</p>
-      <dl id="worker-details" hidden>
-        <dt>Worker ID</dt>
-        <dd id="worker-id"></dd>
-        <dt>Endpoint</dt>
-        <dd id="worker-endpoint"></dd>
-      </dl>
-      <button id="pair-worker" type="button">Import signed pairing bundle</button>
-      <button id="unpair-worker" type="button" disabled>Unpair worker</button>
+
+      <section aria-labelledby="worker-heading">
+        <h2 id="worker-heading">Worker</h2>
+        <dl id="worker-details" hidden>
+          <dt>Worker ID</dt>
+          <dd id="worker-id"></dd>
+          <dt>Connection</dt>
+          <dd id="worker-connection"></dd>
+        </dl>
+        <button id="pair-worker" type="button">Import signed pairing bundle</button>
+        <button id="unpair-worker" type="button" disabled>Unpair worker</button>
+      </section>
+
+      <section aria-labelledby="policy-heading">
+        <h2 id="policy-heading">Worker policy ceilings</h2>
+        <dl id="policy-details" hidden>
+          <dt>Maximum duration (seconds)</dt>
+          <dd id="policy-duration"></dd>
+          <dt>Maximum memory (bytes)</dt>
+          <dd id="policy-memory"></dd>
+          <dt>Maximum disk (bytes)</dt>
+          <dd id="policy-disk"></dd>
+          <dt>Maximum CPU (%)</dt>
+          <dd id="policy-cpu"></dd>
+        </dl>
+      </section>
+
+      <section aria-labelledby="input-heading">
+        <h2 id="input-heading">Campaign input</h2>
+        <button id="import-input" type="button" disabled>Import PDF ZIP bundle</button>
+        <dl id="input-summary" hidden>
+          <dt>Validated PDF files</dt>
+          <dd id="input-file-count"></dd>
+          <dt>Archive SHA-256</dt>
+          <dd id="input-hash"></dd>
+          <dt>Expanded bytes</dt>
+          <dd id="input-expanded-bytes"></dd>
+        </dl>
+      </section>
+
+      <section aria-labelledby="campaign-heading">
+        <h2 id="campaign-heading">Campaign</h2>
+        <form id="campaign-form">
+          <label for="campaign-label">Campaign label</label>
+          <input id="campaign-label" name="label" type="text" maxlength="128" />
+          <label for="limit-duration">Maximum duration (seconds)</label>
+          <input id="limit-duration" name="max_duration_s" type="number" min="1" step="1" required />
+          <label for="limit-memory">Maximum memory (bytes)</label>
+          <input id="limit-memory" name="max_memory_bytes" type="number" min="1" step="1" required />
+          <label for="limit-disk">Maximum disk (bytes)</label>
+          <input id="limit-disk" name="max_disk_bytes" type="number" min="1" step="1" required />
+          <label for="limit-cpu">Maximum CPU (%)</label>
+          <input id="limit-cpu" name="max_cpu_percent" type="number" min="1" max="100" step="1" required />
+          <button id="start-campaign" type="submit" disabled>Start campaign</button>
+        </form>
+        <button id="stop-campaign" type="button" disabled>Stop active campaign</button>
+        <dl id="run-details" hidden>
+          <dt>Campaign label</dt>
+          <dd id="run-label"></dd>
+          <dt>Run state</dt>
+          <dd id="run-state"></dd>
+          <dt>Stop reason</dt>
+          <dd id="run-stop-reason"></dd>
+        </dl>
+      </section>
     </main>
     <script type="module" src="app.js"></script>
   </body>

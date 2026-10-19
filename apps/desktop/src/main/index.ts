@@ -30,13 +30,21 @@ protocol.registerSchemesAsPrivileged([
 
 function installRendererProtocol(): void {
   const rendererRoot = path.join(app.getAppPath(), 'dist', 'renderer');
+  const rendererFiles: Readonly<Record<string, string>> = {
+    '/index.html': 'index.html',
+    '/app.js': 'app.js',
+    '/campaign-poller.js': 'campaign-poller.js',
+    '/campaign-view-model.js': 'campaign-view-model.js',
+  };
   protocol.handle('app', async (request) => {
     if (!isAllowedRendererRequest(request.method, request.url)) {
       return new Response('Not found', { status: 404 });
     }
     const url = new URL(request.url);
-    const isScript = url.pathname === '/app.js';
-    const resourcePath = path.join(rendererRoot, isScript ? 'app.js' : 'index.html');
+    const filename = rendererFiles[url.pathname];
+    if (!filename) return new Response('Not found', { status: 404 });
+    const isScript = filename.endsWith('.js');
+    const resourcePath = path.join(rendererRoot, filename);
     return new Response(await readFile(resourcePath), {
       headers: secureResponseHeaders({
         'content-type': isScript ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',

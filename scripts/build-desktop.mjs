@@ -15,6 +15,12 @@ await cp(
   path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'src', 'renderer', 'app.js'),
   path.join(rendererOutput, 'app.js'),
 );
+for (const filename of ['campaign-poller.js', 'campaign-view-model.js']) {
+  await cp(
+    path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'src', 'renderer', filename),
+    path.join(rendererOutput, filename),
+  );
+}
 await cp(
   path.join(repositoryRoot, 'apps', 'desktop', 'resources', 'worker-bundle-signing-key.pem'),
   path.join(resourcesOutput, 'worker-bundle-signing-key.pem'),
