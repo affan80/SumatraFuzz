@@ -126,10 +126,14 @@ export async function importInputBundle(
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0);
       const output = path.join(staging, entry.fileName);
       const handle = await open(output, flags, 0o600);
-      await pipeline(await zip.openReadStreamPromise(entry), limiter, handle.createWriteStream());
+      try {
+        await pipeline(await zip.openReadStreamPromise(entry), limiter, handle.createWriteStream());
+      } finally {
+        await handle.close();
+      }
       if (actual !== entry.uncompressedSize) reject('input bundle entry size mismatch');
       if (checksum >>> 0 !== entry.crc32) reject('input bundle entry CRC mismatch');
-      const syncHandle = await open(output, 'r');
+      const syncHandle = await open(output, 'r+');
       try {
         await syncHandle.sync();
       } finally {
