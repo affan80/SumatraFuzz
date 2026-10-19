@@ -1,0 +1,9 @@
+{
+  "name": "@sumatrafuzz/evidence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./stats": "./src/stats.ts"
+  }
+}

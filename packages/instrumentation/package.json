@@ -1,0 +1,10 @@
+{
+  "name": "@sumatrafuzz/instrumentation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./verify-debug": "./src/verify-debug.ts",
+    "./seed": "./src/seed.ts"
+  }
+}
