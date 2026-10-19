@@ -5,10 +5,12 @@ import path from 'node:path';
 import { WorkerError } from '@sumatrafuzz/worker-protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  ProcessError,
   rejectSpecialWindowsPath,
   verifyAndBuildLaunch,
   verifyFileProofs,
   verifyPathWithinRoot,
+  WindowsJobSupervisor,
   type WorkerPolicy,
 } from '../src/index.js';
 
@@ -141,6 +143,37 @@ describe('verified launch specification', () => {
     await expect(verifyFileProofs(spec.fileProofs)).rejects.toMatchObject({
       code: WorkerError.UnverifiedToolchain,
     });
+  });
+
+  it('does not call the native supervisor when a proof changes after specification creation', async () => {
+    const { policy, request, harnessPath } = await fixture();
+    const spec = await verifyAndBuildLaunch(request, policy);
+    let launchCalled = false;
+    const supervisor = new WindowsJobSupervisor({
+      launchSuspended: () => {
+        launchCalled = true;
+        return { id: 'job', processId: 12 };
+      },
+      stopJob: () => ({
+        jobId: 'job',
+        stoppedAtUtc: new Date().toISOString(),
+        remainingProcesses: 0,
+        exitCode: 0,
+        stopReason: 'requested',
+      }),
+      sampleJob: () => ({ cpu_percent: 0, memory_bytes: 0, process_count: 0 }),
+      protectSecret: (value) => value,
+      unprotectSecret: (value) => value,
+    });
+    await writeFile(harnessPath, 'changed before native launch');
+    await expect(supervisor.launchSuspended(spec)).rejects.toBeInstanceOf(ProcessError);
+    expect(launchCalled).toBe(false);
+  });
+
+  it('refuses to initialize the Windows native supervisor on another platform', () => {
+    if (process.platform !== 'win32' || process.arch !== 'x64') {
+      expect(() => new WindowsJobSupervisor()).toThrow(ProcessError);
+    }
   });
 
   it('rejects a rewritten lock and matching forged A4 document', async () => {

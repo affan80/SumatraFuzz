@@ -1,3 +1,10 @@
+export type {
+  JobHandle,
+  NativeSupervisorBinding,
+  NativeTeardownReceipt,
+  ResourceSample,
+} from './native-supervisor.js';
+export { ProcessError, WindowsJobSupervisor } from './native-supervisor.js';
 export {
   rejectSpecialWindowsPath,
   toOrdinaryWindowsPath,
