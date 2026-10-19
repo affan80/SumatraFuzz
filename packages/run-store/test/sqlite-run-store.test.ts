@@ -96,6 +96,11 @@ describe('worker slot and transactional journal', () => {
     const store = SqliteRunStore.open(path.join(directory, 'journal.db'));
     const value = ids();
     expect(claim(store)).toEqual({ kind: 'new', runId: value.runId });
+    expect(store.findRequest(value.controllerId, value.requestId)).toEqual({
+      runId: value.runId,
+      payloadDigest: 'a'.repeat(64),
+    });
+    expect(store.runSnapshot(value.runId)).toEqual({ state: 'created', lastSequence: 0n });
     expect(claim(store)).toEqual({ kind: 'existing', runId: value.runId });
     expect(() =>
       store.claimWorkerSlot(value.controllerId, value.requestId, 'b'.repeat(64), value.runId),
@@ -288,6 +293,66 @@ describe('worker slot and transactional journal', () => {
         nextRunId,
       ),
     ).toEqual({ kind: 'new', runId: nextRunId });
+    store.close();
+  });
+
+  it('atomically publishes finalized artifacts, terminal events, teardown, and slot release', async () => {
+    const directory = await makeDir();
+    const store = SqliteRunStore.open(path.join(directory, 'atomic-finalization.db'));
+    const value = ids();
+    claim(store);
+    store.transitionState(value.runId, 'created', 'preparing', 'state_changed');
+    store.transitionState(value.runId, 'preparing', 'running', 'state_changed');
+    store.transitionState(value.runId, 'running', 'stopping', 'state_changed');
+    const receipt = {
+      jobId: 'job-1',
+      stoppedAtUtc: '2026-10-19T12:00:00.000Z',
+      remainingProcesses: 0,
+      exitCode: 0,
+      stopReason: 'requested' as const,
+    };
+    const artifact = {
+      artifactId: 'artifact-1',
+      sha256: 'c'.repeat(64),
+      relativePath: 'stats/fuzzer_stats',
+      sizeBytes: 20,
+    };
+    store.recordTeardownReceipt(value.runId, receipt);
+    expect(() =>
+      store.finalizeAfterTeardown(
+        value.runId,
+        'completed',
+        [{ ...artifact, relativePath: '../outside' }],
+        receipt,
+      ),
+    ).toThrow(StoreError);
+    expect(store.runState(value.runId)).toBe('stopping');
+    expect(store.finalArtifacts(value.runId)).toEqual([]);
+    expect(store.readEventsAfter(value.runId, 0n, 10)).toHaveLength(4);
+    expect(
+      store.claimWorkerSlot(
+        asControllerId('a11ce021-0000-4000-8000-000000000021'),
+        'a11ce022-0000-4000-8000-000000000022',
+        'd'.repeat(64),
+        asRunId('a11ce023-0000-4000-8000-000000000023'),
+      ),
+    ).toEqual({ kind: 'worker_busy' });
+
+    store.finalizeAfterTeardown(value.runId, 'completed', [artifact], receipt);
+    expect(store.runState(value.runId)).toBe('completed');
+    expect(store.finalArtifacts(value.runId)).toEqual([artifact]);
+    expect(store.readEventsAfter(value.runId, 4n, 10).map((event) => event.event_type)).toEqual([
+      'evidence_finalized',
+      'state_changed',
+    ]);
+    expect(
+      store.claimWorkerSlot(
+        asControllerId('a11ce021-0000-4000-8000-000000000021'),
+        'a11ce022-0000-4000-8000-000000000022',
+        'd'.repeat(64),
+        asRunId('a11ce023-0000-4000-8000-000000000023'),
+      ),
+    ).toMatchObject({ kind: 'new' });
     store.close();
   });
 

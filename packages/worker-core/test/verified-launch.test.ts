@@ -162,8 +162,14 @@ describe('verified launch specification', () => {
         stopReason: 'requested',
       }),
       sampleJob: () => ({ cpu_percent: 0, memory_bytes: 0, process_count: 0 }),
+      sampleVolumeUsage: () => ({ quota_bytes: 1, available_bytes: 1, used_bytes: 0 }),
       protectSecret: (value) => value,
       unprotectSecret: (value) => value,
+    });
+    expect(supervisor.sampleVolumeUsage('unused')).toEqual({
+      quota_bytes: 1,
+      available_bytes: 1,
+      used_bytes: 0,
     });
     await writeFile(harnessPath, 'changed before native launch');
     await expect(supervisor.launchSuspended(spec)).rejects.toBeInstanceOf(ProcessError);

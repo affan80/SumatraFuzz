@@ -358,6 +358,34 @@ Napi::Value SampleJob(const Napi::CallbackInfo& info) {
   } catch (const std::exception& error) { throw NativeError(env, error.what()); }
 }
 
+Napi::Value SampleVolumeUsage(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  try {
+    if (info.Length() != 1) throw std::runtime_error("worker-volume directory required");
+    const std::wstring directory = Wide(info[0], "worker-volume directory");
+    if (!IsOrdinaryLocalPath(directory)) throw std::runtime_error("worker volume must be an ordinary local path");
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      throw std::runtime_error("worker-volume directory is unavailable or redirected");
+    }
+    ULARGE_INTEGER available{}, quota{}, volume_free{};
+    if (!GetDiskFreeSpaceExW(directory.c_str(), &available, &quota, &volume_free)) {
+      throw std::runtime_error("could not sample worker-volume quota");
+    }
+    constexpr ULONGLONG max_safe_integer = 9007199254740991ULL;
+    if (quota.QuadPart == 0 || available.QuadPart > quota.QuadPart ||
+        quota.QuadPart > max_safe_integer) {
+      throw std::runtime_error("worker-volume quota is unavailable or exceeds supported bounds");
+    }
+    Napi::Object sample = Napi::Object::New(env);
+    sample.Set("quota_bytes", static_cast<double>(quota.QuadPart));
+    sample.Set("available_bytes", static_cast<double>(available.QuadPart));
+    sample.Set("used_bytes", static_cast<double>(quota.QuadPart - available.QuadPart));
+    return sample;
+  } catch (const std::exception& error) { throw NativeError(env, error.what()); }
+}
+
 Napi::Value ProtectSecret(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() != 1 || !info[0].IsBuffer()) throw Napi::TypeError::New(env, "secret must be a Buffer");
@@ -387,12 +415,14 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("launchSuspended", Napi::Function::New(env, LaunchSuspended));
   exports.Set("stopJob", Napi::Function::New(env, StopJob));
   exports.Set("sampleJob", Napi::Function::New(env, SampleJob));
+  exports.Set("sampleVolumeUsage", Napi::Function::New(env, SampleVolumeUsage));
   exports.Set("protectSecret", Napi::Function::New(env, ProtectSecret));
   exports.Set("unprotectSecret", Napi::Function::New(env, UnprotectSecret));
 #else
   exports.Set("launchSuspended", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
   exports.Set("stopJob", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
   exports.Set("sampleJob", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
+  exports.Set("sampleVolumeUsage", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
 #endif
   return exports;
 }

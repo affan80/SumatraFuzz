@@ -4,6 +4,7 @@ import {
   createWorkerServer,
   parseArtifactRange,
   parseEventPageLimit,
+  parseEventSequence,
   serializeBoundedJson,
   validateStartRequest,
 } from '../src/server.js';
@@ -45,6 +46,13 @@ describe('worker API contract', () => {
     expect(() =>
       validateStartRequest({ ...request, controller_id: undefined }, requestId, controllerId),
     ).toThrow(/protocol validation/i);
+    expect(() =>
+      validateStartRequest(
+        { ...request, request_id: '00000000-0000-0000-0000-000000000000' },
+        '00000000-0000-0000-0000-000000000000',
+        controllerId,
+      ),
+    ).toThrow(/non-nil UUID/i);
   });
 
   it('supports bounded single byte ranges and rejects traversal-like or multi-range values', () => {
@@ -67,6 +75,14 @@ describe('worker API contract', () => {
     }
   });
 
+  it('accepts only event sequences representable by the SQLite journal', () => {
+    expect(parseEventSequence('0')).toBe('0');
+    expect(parseEventSequence('9223372036854775807')).toBe('9223372036854775807');
+    for (const value of ['-1', '00', '9223372036854775808', '9'.repeat(100)]) {
+      expect(() => parseEventSequence(value)).toThrow(/event replay sequence/i);
+    }
+  });
+
   it('serializes bigint values and rejects oversized JSON responses', () => {
     expect(serializeBoundedJson({ sequence: 12n })).toBe('{"sequence":"12"}\n');
     expect(() => serializeBoundedJson({ data: 'x'.repeat(4 * 1024 * 1024) })).toThrow(
@@ -84,6 +100,7 @@ describe('worker API contract', () => {
       cert: Buffer.alloc(0),
       ca: Buffer.alloc(0),
       pairedControllers: new Map<string, string>(),
+      inputRoot: '/unused',
       store: { ownsRun: () => false },
       handlers: {} as never,
     };
@@ -95,6 +112,12 @@ describe('worker API contract', () => {
       createWorkerServer({
         ...base,
         pairedControllers: new Map([['not-a-fingerprint', '11111111-1111-4111-8111-111111111111']]),
+      }),
+    ).rejects.toThrow(/paired controller/i);
+    await expect(
+      createWorkerServer({
+        ...base,
+        pairedControllers: new Map([['a'.repeat(64), '00000000-0000-0000-0000-000000000000']]),
       }),
     ).rejects.toThrow(/paired controller/i);
   });

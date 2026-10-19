@@ -21,6 +21,12 @@ export interface ResourceSample {
   readonly process_count: number;
 }
 
+export interface VolumeUsageSample {
+  readonly quota_bytes: number;
+  readonly available_bytes: number;
+  readonly used_bytes: number;
+}
+
 export interface NativeTeardownReceipt {
   readonly jobId: string;
   readonly stoppedAtUtc: string;
@@ -33,6 +39,7 @@ export interface NativeSupervisorBinding {
   launchSuspended(spec: VerifiedRunSpec): JobHandle;
   stopJob(handle: JobHandle, graceMs: number): NativeTeardownReceipt;
   sampleJob(handle: JobHandle): ResourceSample;
+  sampleVolumeUsage(path: string): VolumeUsageSample;
   protectSecret(plaintext: Buffer): Buffer;
   unprotectSecret(ciphertext: Buffer): Buffer;
 }
@@ -94,6 +101,26 @@ export class WindowsJobSupervisor {
       return sample;
     } catch (cause) {
       throw new ProcessError('Job Object resource sampling failed', { cause });
+    }
+  }
+
+  sampleVolumeUsage(path: string): VolumeUsageSample {
+    try {
+      const sample = this.binding.sampleVolumeUsage(path);
+      if (
+        !Number.isSafeInteger(sample.quota_bytes) ||
+        sample.quota_bytes < 1 ||
+        !Number.isSafeInteger(sample.available_bytes) ||
+        sample.available_bytes < 0 ||
+        sample.available_bytes > sample.quota_bytes ||
+        !Number.isSafeInteger(sample.used_bytes) ||
+        sample.used_bytes !== sample.quota_bytes - sample.available_bytes
+      ) {
+        throw new Error('native supervisor returned an invalid worker-volume usage sample');
+      }
+      return sample;
+    } catch (cause) {
+      throw new ProcessError('Worker-volume quota sampling failed', { cause });
     }
   }
 

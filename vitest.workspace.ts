@@ -4,7 +4,7 @@ export default defineWorkspace([
   {
     test: {
       name: 'sumatrafuzz',
-      include: ['packages/**/test/**/*.test.ts', 'apps/**/test/**/*.test.ts'],
+      include: ['packages/*/test/**/*.test.ts', 'apps/*/test/**/*.test.ts'],
     },
   },
 ]);

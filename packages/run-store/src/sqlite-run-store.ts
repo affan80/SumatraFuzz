@@ -60,6 +60,46 @@ export interface StoreOpenOptions {
   readonly maxDatabasePages?: number;
 }
 
+export interface FinalArtifact {
+  readonly artifactId: string;
+  readonly sha256: string;
+  readonly relativePath: string;
+  readonly sizeBytes: number;
+}
+
+export interface ActiveRunSnapshot {
+  readonly runId: RunId;
+  readonly controllerId: ControllerId;
+  readonly state: RunState;
+  readonly lastSequence: bigint;
+}
+
+function validateFinalArtifact(artifact: FinalArtifact): void {
+  if (
+    !/^[A-Za-z0-9_-]{1,128}$/.test(artifact.artifactId) ||
+    !/^[0-9a-f]{64}$/.test(artifact.sha256) ||
+    typeof artifact.relativePath !== 'string' ||
+    artifact.relativePath.length > 1024 ||
+    artifact.relativePath.startsWith('/') ||
+    artifact.relativePath.includes('\\') ||
+    artifact.relativePath.includes(':') ||
+    artifact.relativePath.split('/').some(
+      (part) =>
+        !part ||
+        part === '.' ||
+        part === '..' ||
+        [...part].some((character) => {
+          const code = character.charCodeAt(0);
+          return code < 0x20 || code === 0x7f;
+        }),
+    ) ||
+    !Number.isSafeInteger(artifact.sizeBytes) ||
+    artifact.sizeBytes < 0
+  ) {
+    throw new StoreError('invalid_request');
+  }
+}
+
 function wrapDatabaseError(error: unknown): StoreError {
   if (error instanceof StoreError) return error;
   return new StoreError('database', 'SQLite operation failed', { cause: error });
@@ -92,6 +132,7 @@ function assertTeardownReceipt(receipt: TeardownReceipt): void {
     !receipt ||
     typeof receipt.jobId !== 'string' ||
     receipt.jobId.length === 0 ||
+    typeof receipt.stoppedAtUtc !== 'string' ||
     !receipt.stoppedAtUtc.endsWith('Z') ||
     !Number.isFinite(Date.parse(receipt.stoppedAtUtc)) ||
     receipt.remainingProcesses !== 0 ||
@@ -100,6 +141,16 @@ function assertTeardownReceipt(receipt: TeardownReceipt): void {
   ) {
     throw new StoreError('invalid_request');
   }
+}
+
+function sameTeardownReceipt(left: TeardownReceipt, right: TeardownReceipt): boolean {
+  return (
+    left.jobId === right.jobId &&
+    left.stoppedAtUtc === right.stoppedAtUtc &&
+    left.remainingProcesses === right.remainingProcesses &&
+    left.exitCode === right.exitCode &&
+    left.stopReason === right.stopReason
+  );
 }
 
 export class SqliteRunStore {
@@ -229,6 +280,322 @@ export class SqliteRunStore {
           )
           .get(controllerId, runId),
       );
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  findRequest(
+    controllerId: ControllerId,
+    requestId: string,
+  ): { runId: RunId; payloadDigest: string } | null {
+    assertUuid(controllerId);
+    assertUuid(requestId);
+    try {
+      const row = this.db
+        .prepare(
+          'SELECT run_id, payload_digest FROM command_idempotency WHERE controller_id = ? AND request_id = ?',
+        )
+        .get(controllerId, requestId) as { run_id: string; payload_digest: string } | undefined;
+      if (!row) return null;
+      assertUuid(row.run_id);
+      assertDigest(row.payload_digest);
+      return { runId: asRunId(row.run_id), payloadDigest: row.payload_digest };
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  runSnapshot(runId: RunId): { state: RunState; lastSequence: bigint } {
+    assertUuid(runId);
+    try {
+      const row = this.db
+        .prepare('SELECT state, last_seq FROM run_state WHERE run_id = ?')
+        .get(runId) as { state: string; last_seq: bigint } | undefined;
+      if (!row || !validState(row.state) || row.last_seq < 0n)
+        throw new StoreError('invalid_request');
+      return { state: row.state, lastSequence: row.last_seq };
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  activeRunSnapshot(): ActiveRunSnapshot | null {
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT s.run_id, s.state, s.last_seq, c.controller_id
+           FROM worker_slot w
+           JOIN run_state s ON s.run_id = w.run_id
+           JOIN command_idempotency c ON c.run_id = s.run_id
+           WHERE w.slot = 1
+           ORDER BY c.rowid
+           LIMIT 1`,
+        )
+        .get() as
+        | { run_id: string; state: string; last_seq: bigint; controller_id: string }
+        | undefined;
+      if (!row) return null;
+      if (!validState(row.state) || row.last_seq < 0n) throw new StoreError('corrupt');
+      assertUuid(row.run_id);
+      assertUuid(row.controller_id);
+      return {
+        runId: asRunId(row.run_id),
+        controllerId: row.controller_id as ControllerId,
+        state: row.state,
+        lastSequence: row.last_seq,
+      };
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  appendMetricSample(
+    runId: RunId,
+    sample: {
+      readonly time_utc: string;
+      readonly cpu_percent: number;
+      readonly memory_bytes: number;
+      readonly disk_bytes: number;
+      readonly process_count: number;
+    },
+  ): bigint {
+    assertUuid(runId);
+    if (
+      !Number.isFinite(sample.cpu_percent) ||
+      sample.cpu_percent < 0 ||
+      !Number.isSafeInteger(sample.memory_bytes) ||
+      sample.memory_bytes < 0 ||
+      !Number.isSafeInteger(sample.disk_bytes) ||
+      sample.disk_bytes < 0 ||
+      !Number.isSafeInteger(sample.process_count) ||
+      sample.process_count < 0 ||
+      !Number.isFinite(Date.parse(sample.time_utc))
+    ) {
+      throw new StoreError('invalid_request');
+    }
+    try {
+      return this.db
+        .transaction(() => {
+          const row = this.db
+            .prepare('SELECT state, last_seq FROM run_state WHERE run_id = ?')
+            .get(runId) as { state: string; last_seq: bigint } | undefined;
+          if (row?.state !== 'running' || row.last_seq < 0n) {
+            throw new StoreError('invalid_transition');
+          }
+          const sequence = row.last_seq + 1n;
+          if (sequence > MAX_SQLITE_INTEGER) throw new StoreError('corrupt');
+          const update = this.db
+            .prepare(
+              'UPDATE run_state SET last_seq = ? WHERE run_id = ? AND state = ? AND last_seq = ?',
+            )
+            .run(sequence, runId, 'running', row.last_seq);
+          if (update.changes !== 1) throw new StoreError('invalid_transition');
+          this.db
+            .prepare(
+              'INSERT INTO events(run_id, seq, time_utc, event_type, payload) VALUES (?, ?, ?, ?, ?)',
+            )
+            .run(
+              runId,
+              sequence,
+              sample.time_utc,
+              JSON.stringify('metric_sample'),
+              JSON.stringify(sample),
+            );
+          return sequence;
+        })
+        .immediate();
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  recordTeardownReceipt(runId: RunId, receipt: TeardownReceipt): bigint {
+    assertUuid(runId);
+    assertTeardownReceipt(receipt);
+    try {
+      return this.db
+        .transaction(() => {
+          const row = this.db
+            .prepare('SELECT state, last_seq FROM run_state WHERE run_id = ?')
+            .get(runId) as { state: string; last_seq: bigint } | undefined;
+          if (row?.state !== 'stopping' || row.last_seq < 0n) {
+            throw new StoreError('invalid_transition');
+          }
+          const earlier = this.db
+            .prepare('SELECT 1 FROM events WHERE run_id = ? AND event_type = ? LIMIT 1')
+            .get(runId, JSON.stringify('process_teardown'));
+          if (earlier) throw new StoreError('invalid_transition');
+          const sequence = row.last_seq + 1n;
+          if (sequence > MAX_SQLITE_INTEGER) throw new StoreError('corrupt');
+          const update = this.db
+            .prepare(
+              'UPDATE run_state SET last_seq = ? WHERE run_id = ? AND state = ? AND last_seq = ?',
+            )
+            .run(sequence, runId, 'stopping', row.last_seq);
+          if (update.changes !== 1) throw new StoreError('invalid_transition');
+          this.db
+            .prepare(
+              'INSERT INTO events(run_id, seq, time_utc, event_type, payload) VALUES (?, ?, ?, ?, ?)',
+            )
+            .run(
+              runId,
+              sequence,
+              receipt.stoppedAtUtc,
+              JSON.stringify('process_teardown'),
+              JSON.stringify(receipt),
+            );
+          return sequence;
+        })
+        .immediate();
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  teardownReceipt(runId: RunId): TeardownReceipt | null {
+    assertUuid(runId);
+    try {
+      const row = this.db
+        .prepare(
+          'SELECT payload FROM events WHERE run_id = ? AND event_type = ? ORDER BY seq DESC LIMIT 1',
+        )
+        .get(runId, JSON.stringify('process_teardown')) as { payload: string } | undefined;
+      if (!row) return null;
+      const receipt = JSON.parse(row.payload) as TeardownReceipt;
+      assertTeardownReceipt(receipt);
+      if (receipt.remainingProcesses !== 0) throw new StoreError('corrupt');
+      return receipt;
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  finalizeAfterTeardown(
+    runId: RunId,
+    next: Extract<RunState, 'completed' | 'failed' | 'interrupted'>,
+    artifacts: readonly FinalArtifact[],
+    receipt: TeardownReceipt,
+  ): void {
+    assertUuid(runId);
+    assertTeardownReceipt(receipt);
+    if (!validTransition('stopping', next) || artifacts.length > 10_000) {
+      throw new StoreError('invalid_request');
+    }
+    if (next === 'completed' && artifacts.length === 0) throw new StoreError('invalid_request');
+    try {
+      this.db
+        .transaction(() => {
+          const row = this.db
+            .prepare('SELECT state, last_seq FROM run_state WHERE run_id = ?')
+            .get(runId) as { state: string; last_seq: bigint } | undefined;
+          if (row?.state !== 'stopping' || row.last_seq < 0n) {
+            throw new StoreError('invalid_transition');
+          }
+          if (this.db.prepare('SELECT 1 FROM evidence_index WHERE run_id = ? LIMIT 1').get(runId)) {
+            throw new StoreError('invalid_transition');
+          }
+          const teardownRow = this.db
+            .prepare(
+              'SELECT payload FROM events WHERE run_id = ? AND event_type = ? ORDER BY seq DESC LIMIT 1',
+            )
+            .get(runId, JSON.stringify('process_teardown')) as { payload: string } | undefined;
+          if (!teardownRow) throw new StoreError('invalid_transition');
+          const recordedReceipt = JSON.parse(teardownRow.payload) as TeardownReceipt;
+          assertTeardownReceipt(recordedReceipt);
+          if (!sameTeardownReceipt(recordedReceipt, receipt)) throw new StoreError('corrupt');
+          const seen = new Set<string>();
+          const insertArtifact = this.db.prepare(
+            'INSERT INTO evidence_index(run_id, artifact_id, sha256, relative_path, size_bytes, is_final) VALUES (?, ?, ?, ?, ?, 1)',
+          );
+          let totalBytes = 0n;
+          for (const artifact of artifacts) {
+            validateFinalArtifact(artifact);
+            if (seen.has(artifact.artifactId)) throw new StoreError('invalid_request');
+            seen.add(artifact.artifactId);
+            totalBytes += BigInt(artifact.sizeBytes);
+            insertArtifact.run(
+              runId,
+              artifact.artifactId,
+              artifact.sha256,
+              artifact.relativePath,
+              artifact.sizeBytes,
+            );
+          }
+
+          let sequence = row.last_seq;
+          const insertEvent = this.db.prepare(
+            'INSERT INTO events(run_id, seq, time_utc, event_type, payload) VALUES (?, ?, ?, ?, ?)',
+          );
+          const append = (eventType: EventType, payload: unknown, time: string): void => {
+            sequence += 1n;
+            if (sequence > MAX_SQLITE_INTEGER) throw new StoreError('corrupt');
+            insertEvent.run(
+              runId,
+              sequence,
+              time,
+              JSON.stringify(eventType),
+              JSON.stringify(payload),
+            );
+          };
+          const finalizedAt = new Date().toISOString();
+          if (artifacts.length > 0) {
+            append(
+              'evidence_finalized',
+              {
+                artifact_count: artifacts.length,
+                total_bytes: totalBytes.toString(),
+              },
+              finalizedAt,
+            );
+          }
+          append('state_changed', { from: 'stopping', to: next }, finalizedAt);
+          const update = this.db
+            .prepare(
+              'UPDATE run_state SET state = ?, last_seq = ? WHERE run_id = ? AND state = ? AND last_seq = ?',
+            )
+            .run(next, sequence, runId, 'stopping', row.last_seq);
+          if (update.changes !== 1) throw new StoreError('invalid_transition');
+          const release = this.db
+            .prepare('DELETE FROM worker_slot WHERE slot = 1 AND run_id = ?')
+            .run(runId);
+          if (release.changes !== 1) throw new StoreError('invalid_transition');
+        })
+        .immediate();
+    } catch (error) {
+      throw wrapDatabaseError(error);
+    }
+  }
+
+  finalArtifacts(runId: RunId): FinalArtifact[] {
+    assertUuid(runId);
+    try {
+      const rows = this.db
+        .prepare(
+          'SELECT artifact_id, sha256, relative_path, size_bytes FROM evidence_index WHERE run_id = ? AND is_final = 1 ORDER BY artifact_id',
+        )
+        .all(runId) as Array<{
+        artifact_id: string;
+        sha256: string;
+        relative_path: string;
+        size_bytes: bigint;
+      }>;
+      return rows.map((row) => {
+        if (row.size_bytes < 0n || row.size_bytes > BigInt(Number.MAX_SAFE_INTEGER))
+          throw new StoreError('corrupt');
+        const artifact = {
+          artifactId: row.artifact_id,
+          sha256: row.sha256,
+          relativePath: row.relative_path,
+          sizeBytes: Number(row.size_bytes),
+        };
+        try {
+          validateFinalArtifact(artifact);
+        } catch {
+          throw new StoreError('corrupt');
+        }
+        return artifact;
+      });
     } catch (error) {
       throw wrapDatabaseError(error);
     }
