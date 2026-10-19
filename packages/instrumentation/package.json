@@ -4,8 +4,17 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./fixtures": "./src/fixtures.ts",
-    "./verify-debug": "./src/verify-debug.ts",
-    "./seed": "./src/seed.ts"
+    "./fixtures": {
+      "types": "./src/fixtures.ts",
+      "import": "./dist/src/fixtures.js"
+    },
+    "./verify-debug": {
+      "types": "./src/verify-debug.ts",
+      "import": "./dist/src/verify-debug.js"
+    },
+    "./seed": {
+      "types": "./src/seed.ts",
+      "import": "./dist/src/seed.js"
+    }
   }
 }

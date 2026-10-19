@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  createWorkerPairingBundle,
   loadTrustedWorkerBundleSigningKey,
   verifyWorkerPairingBundle,
 } from '../src/main/worker-bundle.js';
@@ -50,6 +51,24 @@ describe('signed worker pairing bundles', () => {
     );
     expect(result.profile).toEqual({ ...profile, workerFingerprint: 'a'.repeat(64) });
     expect(result.expiresAt).toBeInstanceOf(Date);
+  });
+
+  it('creates a signed, bounded bundle that the importer verifies', () => {
+    const bundle = createWorkerPairingBundle(profile, privateKey);
+    const verified = verifyWorkerPairingBundle(
+      bundle,
+      publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+    );
+    expect(verified.profile).toEqual({ ...profile, workerFingerprint: 'a'.repeat(64) });
+    expect(() => createWorkerPairingBundle(profile, publicKey)).toThrow(/private key/);
+    expect(() =>
+      createWorkerPairingBundle(
+        profile,
+        privateKey,
+        new Date(0),
+        new Date(8 * 24 * 60 * 60 * 1000),
+      ),
+    ).toThrow(/validity window/);
   });
 
   it('rejects unsigned, modified, and incorrectly signed bundle contents', () => {

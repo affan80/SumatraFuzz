@@ -1,4 +1,4 @@
-import { createPublicKey, type KeyObject, verify } from 'node:crypto';
+import { createPublicKey, type KeyObject, sign, verify } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
 import { validateWorkerProfile, type WorkerProfile } from './worker-profile-store.js';
 
@@ -14,6 +14,45 @@ export interface VerifiedWorkerBundle {
   readonly profile: WorkerProfile;
   readonly issuedAt: Date;
   readonly expiresAt: Date;
+}
+
+export function createWorkerPairingBundle(
+  profileInput: unknown,
+  signingPrivateKey: KeyObject,
+  issuedAt = new Date(),
+  expiresAt = new Date(issuedAt.getTime() + 24 * 60 * 60 * 1000),
+): Buffer {
+  if (signingPrivateKey.type !== 'private' || signingPrivateKey.asymmetricKeyType !== 'ed25519') {
+    throw new TypeError('worker bundle signing key must be an Ed25519 private key');
+  }
+  if (
+    !Number.isFinite(issuedAt.getTime()) ||
+    !Number.isFinite(expiresAt.getTime()) ||
+    expiresAt.getTime() <= issuedAt.getTime() ||
+    expiresAt.getTime() - issuedAt.getTime() > MAX_BUNDLE_LIFETIME_MS
+  ) {
+    throw new RangeError('worker pairing bundle validity window is invalid');
+  }
+  const profile = validateWorkerProfile(profileInput);
+  const payloadBytes = Buffer.from(
+    JSON.stringify({
+      format: PAYLOAD_FORMAT,
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      profile,
+    }),
+    'utf8',
+  );
+  const bundle = Buffer.from(
+    JSON.stringify({
+      format: BUNDLE_FORMAT,
+      payload: payloadBytes.toString('base64'),
+      signature: sign(null, payloadBytes, signingPrivateKey).toString('base64'),
+    }),
+    'utf8',
+  );
+  if (bundle.length > MAX_BUNDLE_BYTES) throw new RangeError('worker pairing bundle is too large');
+  return bundle;
 }
 
 function parseJson(value: Buffer, errorMessage: string): unknown {
