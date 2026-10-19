@@ -39,7 +39,7 @@ export interface WorkerProfileStoreOptions {
   readonly platform?: NodeJS.Platform;
 }
 
-function validateProfile(value: unknown): WorkerProfile {
+export function validateWorkerProfile(value: unknown): WorkerProfile {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('worker profile is invalid');
   }
@@ -204,11 +204,11 @@ export function createWorkerProfileStore({
       } catch {
         throw new Error('decrypted worker profile is invalid');
       }
-      return validateProfile(value);
+      return validateWorkerProfile(value);
     },
     async save(input) {
       await requireDpapi();
-      const profile = validateProfile(input);
+      const profile = validateWorkerProfile(input);
       await writeEncrypted(JSON.stringify(profile));
     },
     async clear() {
