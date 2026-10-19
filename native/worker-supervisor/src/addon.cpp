@@ -265,7 +265,9 @@ Napi::Value StopJob(const Napi::CallbackInfo& info) {
     GetSystemTime(&utc);
     wchar_t timestamp[32]{};
     swprintf_s(timestamp, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond, utc.wMilliseconds);
-    receipt.Set("stoppedAtUtc", Napi::String::New(env, std::wstring(timestamp)));
+    std::u16string timestamp_utf16;
+    for (const wchar_t character : std::wstring(timestamp)) timestamp_utf16.push_back(static_cast<char16_t>(character));
+    receipt.Set("stoppedAtUtc", Napi::String::New(env, timestamp_utf16));
     receipt.Set("remainingProcesses", accounting.ActiveProcesses);
     DWORD exit_code = 0;
     const bool root_exited = WaitForSingleObject(job.process, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(job.process, &exit_code);
