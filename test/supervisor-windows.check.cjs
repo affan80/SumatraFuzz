@@ -39,22 +39,35 @@ test('Windows supervisor bounds and tears down a child process tree', {
     root: path.dirname(probePath),
     sha256: createHash('sha256').update(bytes).digest('hex'),
   };
-  const job = supervisor.launchSuspended({
-    executable: probePath,
-    argv: [],
-    workingDir: path.dirname(probePath),
-    limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
-    fileProofs: [proof],
-  });
-  let sample;
-  for (let i = 0; i < 100; i++) {
-    sample = supervisor.sampleJob(job);
-    if (sample.process_count >= 2) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+  const previousSecret = process.env.SUMATRAFUZZ_TEST_SECRET;
+  process.env.SUMATRAFUZZ_TEST_SECRET = 'must-not-reach-target';
+  let job;
+  try {
+    job = supervisor.launchSuspended({
+      executable: probePath,
+      argv: ['-D', path.dirname(probePath)],
+      workingDir: path.dirname(probePath),
+      limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
+      fileProofs: [proof],
+    });
+    let sample;
+    for (let i = 0; i < 100; i++) {
+      sample = supervisor.sampleJob(job);
+      if (sample.process_count >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(
+      sample.process_count >= 2,
+      'probe child must stay in the job and must not inherit secrets',
+    );
+    const receipt = supervisor.stopJob(job, 0);
+    job = undefined;
+    assert.equal(receipt.remainingProcesses, 0);
+  } finally {
+    if (job) supervisor.stopJob(job, 0);
+    if (previousSecret === undefined) delete process.env.SUMATRAFUZZ_TEST_SECRET;
+    else process.env.SUMATRAFUZZ_TEST_SECRET = previousSecret;
   }
-  assert.ok(sample.process_count >= 2, 'probe child must remain inside the assigned job');
-  const receipt = supervisor.stopJob(job, 0);
-  assert.equal(receipt.remainingProcesses, 0);
   const protectedBytes = supervisor.protectSecret(Buffer.from('service-key'));
   assert.equal(supervisor.unprotectSecret(protectedBytes).toString(), 'service-key');
   assert.throws(() => supervisor.unprotectSecret(Buffer.from('tampered')));

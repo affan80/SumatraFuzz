@@ -14,6 +14,7 @@ test('root manifest pins Node and defines TypeScript workspace commands', () => 
     assert.ok(manifest.scripts[script], `missing root script ${script}`);
   }
   assert.ok(existsSync('package-lock.json'));
+  assert.match(readFileSync('.gitattributes', 'utf8'), /text=auto eol=lf/);
   assert.equal(readFileSync('.node-version', 'utf8').trim(), '24.22.0');
 });
 

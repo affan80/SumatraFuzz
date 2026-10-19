@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cwctype>
+#include <iterator>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -77,6 +79,39 @@ std::wstring Lower(std::wstring value) {
   return value;
 }
 
+bool IsOrdinaryLocalPath(const std::wstring& value) {
+  return value.size() >= 3 && std::iswalpha(value[0]) && value[1] == L':' &&
+         (value[2] == L'\\' || value[2] == L'/') && value.rfind(L"\\\\", 0) != 0;
+}
+
+std::wstring EnvironmentValue(const wchar_t* name) {
+  const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+  if (size == 0 || size > 32767) throw std::runtime_error("required Windows environment variable is unavailable");
+  std::wstring value(size, L'\0');
+  const DWORD written = GetEnvironmentVariableW(name, value.data(), size);
+  if (written == 0 || written >= size) throw std::runtime_error("could not read required Windows environment variable");
+  value.resize(written);
+  return value;
+}
+
+std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, const std::wstring& tool_dir) {
+  const std::wstring system_root = EnvironmentValue(L"SystemRoot");
+  std::map<std::wstring, std::wstring> values;
+  values.emplace(L"PATH", tool_dir + L";" + system_root + L"\\System32");
+  values.emplace(L"SystemRoot", system_root);
+  values.emplace(L"TEMP", working_dir);
+  values.emplace(L"TMP", working_dir);
+  values.emplace(L"WINDIR", system_root);
+  std::vector<wchar_t> block;
+  for (const auto& [name, value] : values) {
+    const std::wstring entry = name + L"=" + value;
+    block.insert(block.end(), entry.begin(), entry.end());
+    block.push_back(L'\0');
+  }
+  block.push_back(L'\0');
+  return block;
+}
+
 struct OpenProof {
   HANDLE handle = INVALID_HANDLE_VALUE;
   ~OpenProof() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
@@ -125,7 +160,7 @@ bool HashMatches(HANDLE file, const std::wstring& expected) {
   return okay;
 }
 
-std::vector<OpenProof> VerifyProofs(Napi::Array proofs, const std::wstring& executable) {
+std::vector<OpenProof> VerifyProofs(Napi::Array proofs, const std::wstring& executable, const std::wstring& tool_dir) {
   if (proofs.Length() == 0 || proofs.Length() > 64) throw std::runtime_error("invalid file proof count");
   OpenProof executable_file;
   executable_file.handle = CreateFileW(executable.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -135,6 +170,13 @@ std::vector<OpenProof> VerifyProofs(Napi::Array proofs, const std::wstring& exec
     throw std::runtime_error("requested executable is redirected or not a regular file");
   }
   const std::wstring canonical_executable = Lower(FinalPath(executable_file.handle));
+  OpenProof tool_directory;
+  tool_directory.handle = CreateFileW(tool_dir.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (tool_directory.handle == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open verified tool directory");
+  BY_HANDLE_FILE_INFORMATION tool_info{};
+  if (!GetFileInformationByHandle(tool_directory.handle, &tool_info) || (tool_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || !(tool_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) throw std::runtime_error("tool directory is redirected or not a directory");
+  const std::wstring canonical_tool_dir = Lower(FinalPath(tool_directory.handle));
+  bool tool_directory_proven = false;
   bool executable_proven = false;
   std::vector<OpenProof> open;
   open.reserve(proofs.Length());
@@ -145,6 +187,7 @@ std::vector<OpenProof> VerifyProofs(Napi::Array proofs, const std::wstring& exec
     const std::wstring file_path = Wide(proof.Get("path"), "proof path");
     const std::wstring root_path = Wide(proof.Get("root"), "proof root");
     const std::wstring expected = Wide(proof.Get("sha256"), "proof hash");
+    if (!IsOrdinaryLocalPath(file_path) || !IsOrdinaryLocalPath(root_path)) throw std::runtime_error("proof path is not an ordinary local Windows path");
     OpenProof root;
     root.handle = CreateFileW(root_path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (root.handle == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open trusted proof root");
@@ -163,9 +206,12 @@ std::vector<OpenProof> VerifyProofs(Napi::Array proofs, const std::wstring& exec
     if (canonical_file.size() <= root_prefix.size() || canonical_file.compare(0, root_prefix.size(), root_prefix) != 0) throw std::runtime_error("trusted file escaped its root");
     if (!HashMatches(file.handle, expected)) throw std::runtime_error("trusted file hash changed before launch");
     if (canonical_file == canonical_executable) executable_proven = true;
+    const size_t separator = canonical_file.find_last_of(L'\\');
+    if (separator != std::wstring::npos && canonical_file.substr(0, separator) == canonical_tool_dir) tool_directory_proven = true;
     open.push_back(std::move(file));  // Deny write/delete sharing until CreateProcess has opened the image.
   }
   if (!executable_proven) throw std::runtime_error("requested executable has no matching verified file proof");
+  if (!tool_directory_proven) throw std::runtime_error("DynamoRIO directory has no matching verified file proof");
   return open;
 }
 
@@ -176,6 +222,7 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     Napi::Object spec = info[0].As<Napi::Object>();
     const std::wstring executable = Wide(spec.Get("executable"), "executable");
     const std::wstring working_dir = Wide(spec.Get("workingDir"), "workingDir");
+    if (!IsOrdinaryLocalPath(executable) || !IsOrdinaryLocalPath(working_dir)) throw std::runtime_error("launch paths must be ordinary local Windows paths");
     Napi::Array argv = spec.Get("argv").As<Napi::Array>();
     Napi::Array proofs = spec.Get("fileProofs").As<Napi::Array>();
     Napi::Object limits = spec.Get("limits").As<Napi::Object>();
@@ -183,13 +230,19 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     const double cpu = limits.Get("max_cpu_percent").As<Napi::Number>().DoubleValue();
     if (!std::isfinite(memory) || !std::isfinite(cpu) || std::floor(memory) != memory || std::floor(cpu) != cpu ||
         memory < 16 * 1024 * 1024 || memory > 0x7fffffffffffffff || cpu < 1 || cpu > 100) throw std::runtime_error("resource limit outside native bounds");
-    std::vector<OpenProof> opened_proofs = VerifyProofs(proofs, executable);
-
     std::vector<std::wstring> arguments{executable};
     if (argv.Length() > 256) throw std::runtime_error("argument count exceeds native bound");
     for (uint32_t i = 0; i < argv.Length(); ++i) arguments.push_back(Wide(argv.Get(i), "argv entry"));
     std::wstring command = sumatrafuzz::supervisor::BuildWindowsCommandLine(arguments);
     if (command.size() > 32766) throw std::runtime_error("command line exceeds Windows limit");
+    std::wstring tool_dir;
+    for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+      if (arguments[i] == L"-D") { tool_dir = arguments[i + 1]; break; }
+    }
+    if (tool_dir.empty()) throw std::runtime_error("verified DynamoRIO tool directory is missing from argv");
+    if (!IsOrdinaryLocalPath(tool_dir)) throw std::runtime_error("DynamoRIO tool directory is not an ordinary local Windows path");
+    [[maybe_unused]] std::vector<OpenProof> opened_proofs = VerifyProofs(proofs, executable, tool_dir);
+    std::vector<wchar_t> environment = BuildWorkerEnvironment(working_dir, tool_dir);
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
@@ -204,7 +257,7 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     cpu_limit.CpuRate = static_cast<DWORD>(cpu * 100.0);
     if (!SetInformationJobObject(job_handle, JobObjectCpuRateControlInformation, &cpu_limit, sizeof(cpu_limit))) { CloseHandle(job_handle); throw std::runtime_error("Job CPU quota setup failed"); }
     const DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, flags, nullptr, working_dir.c_str(), &startup, &process)) {
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, flags, environment.data(), working_dir.c_str(), &startup, &process)) {
       CloseHandle(job_handle); throw std::runtime_error("CreateProcessW failed");
     }
     if (!AssignProcessToJobObject(job_handle, process.hProcess)) {
