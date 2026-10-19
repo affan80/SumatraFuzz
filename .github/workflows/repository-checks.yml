@@ -30,6 +30,11 @@ jobs:
         run: npm ci
       - name: Build SQLite binding from locked source
         run: npm run native:sqlite:build
+      - name: Build Windows Job Object supervisor from locked source
+        if: runner.os == 'Windows'
+        run: npm run native:supervisor:build
+      - name: Test native supervisor argument contract
+        run: npm run native:supervisor:contract
       - name: Formatting
         run: npm run format:check
       - name: Lint

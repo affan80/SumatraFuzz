@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(sumatrafuzz_worker_supervisor LANGUAGES CXX)
+
+add_executable(command_line_tests src/command_line.cpp tests/command_line_tests.cpp)
+target_include_directories(command_line_tests PRIVATE include)
+target_compile_features(command_line_tests PRIVATE cxx_std_17)
+add_executable(process_probe tests/process_probe.cpp)
+target_compile_features(process_probe PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(command_line_tests PRIVATE /W4 /WX /permissive-)
+endif()
+enable_testing()
+add_test(NAME command_line_tests COMMAND command_line_tests)
