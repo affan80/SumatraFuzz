@@ -1,0 +1,41 @@
+appId: com.affan80.sumatrafuzz
+productName: SumatraFuzz
+directories:
+  app: apps/desktop/.package-stage
+  output: release/windows
+files:
+  - package.json
+  - dist/**/*
+  - node_modules/**/*
+  - '!**/*.map'
+  - '!**/*.ts'
+  - '!**/*.d.ts'
+  - '!**/*.mts'
+  - '!**/*.cts'
+  - '!**/{test,tests,__tests__,fixtures,corpus,corpora,runs}/**/*'
+asar: true
+electronVersion: 44.9.0
+npmRebuild: false
+nodeGypRebuild: false
+artifactName: ${productName}-${version}-${arch}-setup.${ext}
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  signAndEditExecutable: false
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  grantFileProtocolExtraPrivileges: false

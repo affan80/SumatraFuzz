@@ -14,6 +14,7 @@
     "lint": "biome lint .",
     "typecheck": "tsc -b --pretty false && node scripts/build-runtime-assets.mjs",
     "desktop:build": "tsc -b apps/desktop --force && node scripts/build-desktop.mjs",
+    "desktop:package:win": "npm run desktop:build && node scripts/stage-desktop-package.mjs && electron-builder --config electron-builder.yml --win nsis --x64 --publish never",
     "worker:bundle:sign": "node scripts/sign-worker-pairing-bundle.mjs",
     "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
     "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
@@ -23,13 +24,8 @@
     "test:watch": "vitest",
     "verify": "npm run format:check && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
   },
-  "dependencies": {
-    "@sinclair/typebox": "0.34.52",
-    "ajv": "8.20.0",
-    "ajv-formats": "3.0.1",
-    "better-sqlite3": "13.0.3"
-  },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@biomejs/biome": "2.5.15",
     "@cyclonedx/cyclonedx-npm": "6.0.1",
     "@electron/fuses": "2.1.3",

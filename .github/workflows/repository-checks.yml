@@ -11,6 +11,54 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  desktop-installer:
+    name: Electron Windows x64 NSIS installer
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build unsigned x64 NSIS installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run desktop:package:win
+      - name: Test package policy against the built ASAR
+        run: node scripts/check-desktop-package.mjs release/windows/win-unpacked/resources/app.asar
+      - name: Silently install, launch and uninstall
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -Path release/windows -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          $installDir = Join-Path $env:RUNNER_TEMP 'SumatraFuzz Installer Smoke'
+          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS install failed with exit code $($install.ExitCode)" }
+          $application = Join-Path $installDir 'SumatraFuzz.exe'
+          if (-not (Test-Path -LiteralPath $application -PathType Leaf)) { throw 'Installed desktop executable is missing' }
+          $process = Start-Process -FilePath $application -PassThru
+          Start-Sleep -Seconds 8
+          $process.Refresh()
+          if ($process.HasExited) { throw "Desktop exited during smoke launch with code $($process.ExitCode)" }
+          & taskkill.exe /T /F /PID $process.Id | Out-Null
+          $uninstaller = Join-Path $installDir 'Uninstall SumatraFuzz.exe'
+          if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw 'NSIS uninstaller is missing' }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "NSIS uninstall failed with exit code $($uninstall.ExitCode)" }
+          if (Test-Path -LiteralPath $application) { throw 'Desktop executable remains after uninstall' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sumatrafuzz-windows-x64-nsis
+          path: release/windows/*.exe
+          if-no-files-found: error
+          retention-days: 14
   typescript:
     name: TypeScript (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
