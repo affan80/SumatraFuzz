@@ -129,7 +129,6 @@ $metadata=[ordered]@{
   stats_later=(Get-FileHash -LiteralPath $second -Algorithm SHA256).Hash
 }
 $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDir 'campaign-metadata.json') -Encoding utf8
-$script=Resolve-Path (Join-Path $PSScriptRoot '../../tools/evidence/stats_cli.py')
-& python $script --before $first --after $second --final $statsPath
+& node --experimental-strip-types (Join-Path $PSScriptRoot 'stats-cli.ts') --before $first --after $second --final $statsPath
 if ($LASTEXITCODE -ne 0) { throw 'Real WinAFL execution counts did not progress' }
 Write-Output "Real bounded WinAFL campaign validated: $OutputDir"

@@ -123,6 +123,7 @@ pub struct RunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     StateChanged,
+    ProcessTeardown,
     MetricSample,
     EvidenceFinalized,
     Error,

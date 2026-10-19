@@ -18,7 +18,7 @@ $null = New-Item -ItemType Directory -Path $runs -Force
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runs 'native-execution-context.json') -Encoding utf8
 Write-Output "Verified standard-user native execution: $($identity.Name)"
 $seed = Join-Path $RepoRoot 'runs/a4/seed.pdf'
-python tools/instrumentation/make_debug_seed.py --out $seed
+node --experimental-strip-types scripts/windows/generate-debug-seed.ts --out $seed
 if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
 & scripts/windows/run-dynamorio-debug.ps1 `
     -ToolchainLock (Join-Path $RepoRoot 'external/native-tools/locks/target-lock.json') `
@@ -26,7 +26,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Seed generation failed' }
     -InputPdf $seed -OutputDir (Join-Path $RepoRoot 'runs/a4/debug-evidence')
 
 $seeds = Join-Path $RepoRoot 'runs/a5/seeds'
-python scripts/windows/generate_fixtures.py --out $seeds
+node --experimental-strip-types scripts/windows/generate-gate-fixtures.ts --output-dir $seeds
 if ($LASTEXITCODE -ne 0) { throw 'Deterministic PDF seed generation failed' }
 $harness = Join-Path $RepoRoot 'build/a3/Release/sumatrafuzz-harness.exe'
 foreach ($file in @(Get-ChildItem -LiteralPath $seeds -Filter '*.pdf' -File)) {
@@ -46,7 +46,7 @@ $stale = Join-Path $RepoRoot 'runs/a5/first.stats'
 if ((Get-Content -LiteralPath $stale -Raw).Trim() -ne 'stale snapshot regression fixture') {
     throw 'Current campaign modified another campaign snapshot'
 }
-python tools/evidence/collect.py `
+node --experimental-strip-types scripts/windows/collect-evidence.ts `
     --toolchain-lock (Join-Path $RepoRoot 'external/native-tools/locks/target-lock.json') `
     --a4-manifest (Join-Path $RepoRoot 'runs/a4/debug-evidence/a4-confirmed.json') `
     --harness $harness --run-dir (Join-Path $RepoRoot 'runs/a5/campaign') `
