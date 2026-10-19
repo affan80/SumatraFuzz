@@ -3,6 +3,7 @@ import {
   attachWindowGuards,
   createWindowOptions,
   isAllowedRendererRequest,
+  isTrustedAppDocumentUrl,
   isTrustedAppUrl,
   secureResponseHeaders,
   showWhenReady,
@@ -33,6 +34,18 @@ describe('Electron window security', () => {
       'file:///tmp/index.html',
     ]) {
       expect(isTrustedAppUrl(url)).toBe(false);
+    }
+  });
+
+  it('trusts only the exact packaged HTML document for navigation and IPC', () => {
+    expect(isTrustedAppDocumentUrl('app://renderer/index.html')).toBe(true);
+    for (const url of [
+      'app://renderer/app.js',
+      'app://renderer/index.html?view=worker',
+      'app://renderer/index.html#worker',
+      'app://renderer/missing',
+    ]) {
+      expect(isTrustedAppDocumentUrl(url)).toBe(false);
     }
   });
 
@@ -86,6 +99,11 @@ describe('Electron window security', () => {
       'app://renderer/index.html',
     );
     expect(prevented).toBe(false);
+    navigationHandlers.get('will-navigate')?.(
+      { preventDefault: () => (prevented = true) },
+      'app://renderer/app.js',
+    );
+    expect(prevented).toBe(true);
   });
 
   it('applies a restrictive content security policy to app responses', () => {

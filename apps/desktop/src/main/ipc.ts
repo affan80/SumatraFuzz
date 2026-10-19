@@ -1,5 +1,5 @@
 import { isNonNilUuid, type RunRequest, validateRunRequest } from '@sumatrafuzz/worker-protocol';
-import { isTrustedAppUrl } from './window-security.js';
+import { isTrustedAppDocumentUrl } from './window-security.js';
 
 export interface DesktopIpcEvent {
   readonly sender: { readonly mainFrame: { readonly url: string } };
@@ -31,7 +31,7 @@ const CHANNELS = [
 
 function assertTrustedMainFrame(event: DesktopIpcEvent): void {
   const frame = event.senderFrame;
-  if (!frame || frame !== event.sender.mainFrame || !isTrustedAppUrl(frame.url)) {
+  if (!frame || frame !== event.sender.mainFrame || !isTrustedAppDocumentUrl(frame.url)) {
     throw new Error('IPC request rejected from an untrusted renderer');
   }
 }

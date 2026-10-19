@@ -66,6 +66,8 @@ describe('Electron IPC security', () => {
         request,
       ),
     ).rejects.toThrow(/untrusted renderer/i);
+    ipc.mainFrame.url = 'app://renderer/app.js';
+    await expect(handler?.(ipc.event(), request)).rejects.toThrow(/untrusted renderer/i);
     expect(ipc.calls).toEqual([]);
   });
 

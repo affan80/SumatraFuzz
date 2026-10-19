@@ -70,10 +70,14 @@ export function isTrustedAppUrl(value: string): boolean {
   }
 }
 
+export function isTrustedAppDocumentUrl(value: string): boolean {
+  return value === DESKTOP_APP_URL;
+}
+
 export function attachWindowGuards(webContents: GuardedWebContents): void {
   webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   const rejectUntrustedNavigation = (event: { preventDefault(): void }, url: string): void => {
-    if (!isTrustedAppUrl(url)) event.preventDefault();
+    if (!isTrustedAppDocumentUrl(url)) event.preventDefault();
   };
   webContents.on('will-navigate', rejectUntrustedNavigation);
   webContents.on('will-redirect', rejectUntrustedNavigation);

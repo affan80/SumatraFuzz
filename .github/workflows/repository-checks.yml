@@ -35,10 +35,8 @@ jobs:
         run: npm run native:supervisor:build
       - name: Test native supervisor argument contract
         run: npm run native:supervisor:contract
-      - name: Formatting
+      - name: Formatting and lint
         run: npm run format:check
-      - name: Lint
-        run: npm run lint
       - name: Typecheck
         run: npm run typecheck
       - name: Build Electron desktop shell
@@ -73,7 +71,7 @@ jobs:
             ~/.cargo/git/db
             ~/.cargo/git/checkouts
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
       - name: Verify locked dependencies
@@ -155,7 +153,7 @@ jobs:
   native-real-engine:
     name: Real SumatraPDF parser
     runs-on: windows-2022
-    needs: [target-config, windows-tests, native-contract, debug-evidence-unit]
+    needs: [target-config]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -200,7 +198,7 @@ jobs:
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
-    needs: [windows-tests, debug-evidence-unit, native-real-engine]
+    needs: [windows-tests, native-contract, debug-evidence-unit, native-real-engine]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
