@@ -40,6 +40,16 @@ test('Node CI runs in both operating systems and keeps the lockfile cache scoped
   assert.match(workflow, /npm audit --audit-level=high/);
 });
 
+test('real DynamoRIO job builds workspace imports before running the native gate', () => {
+  const workflow = readFileSync('.github/workflows/repository-checks.yml', 'utf8');
+  const job = workflow.split('  real-dynamorio:\n')[1]?.split('\n  [a-z][a-z-]*:\n')[0];
+  assert.ok(job, 'real-dynamorio job must exist');
+  const install = job.indexOf('run: npm ci --ignore-scripts');
+  const build = job.indexOf('run: npm run typecheck');
+  const gate = job.indexOf('scripts/windows/ci-native-gate.ps1');
+  assert.ok(install >= 0 && build > install && gate > build);
+});
+
 test('TypeScript compiler fixture reports the expected type diagnostic', () => {
   const compiler = join('node_modules', 'typescript', 'bin', 'tsc');
   const fixture = join('test', 'fixtures', 'expected-diagnostic.ts');

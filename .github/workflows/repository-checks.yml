@@ -258,6 +258,8 @@ jobs:
           cache: npm
       - name: Install locked TypeScript CLI dependencies
         run: npm ci --ignore-scripts
+      - name: Build TypeScript workspace runtime for seed tooling
+        run: npm run typecheck
       - name: Check out pinned SumatraPDF 3.6.1rel
         shell: pwsh
         run: |
