@@ -36,10 +36,11 @@ function signedBundle(): Buffer {
   );
 }
 
-function workerClient(id = workerId): WorkerClient {
+function workerClient(id = workerId, authenticatedControllerId = controllerId): WorkerClient {
   return {
     capabilities: vi.fn(async () => ({
       worker_id: id,
+      controller_id: authenticatedControllerId,
       protocol_version: 1 as const,
       target_lock_sha256: 'b'.repeat(64),
       max_limits: {
@@ -49,6 +50,8 @@ function workerClient(id = workerId): WorkerClient {
         max_cpu_percent: 20,
       },
     })),
+    importInputBundle: vi.fn(async () => ({}) as never),
+    activeRun: vi.fn(async () => null),
     startRun: vi.fn(async () => ({}) as never),
     getRun: vi.fn(async () => ({}) as never),
     stopRun: vi.fn(async () => ({}) as never),
@@ -57,10 +60,16 @@ function workerClient(id = workerId): WorkerClient {
   };
 }
 
-function setup(options: { readonly selected?: Buffer | null; readonly clientId?: string } = {}) {
+function setup(
+  options: {
+    readonly selected?: Buffer | null;
+    readonly clientId?: string;
+    readonly authenticatedControllerId?: string;
+  } = {},
+) {
   const save = vi.fn(async () => undefined);
   const clear = vi.fn(async () => undefined);
-  const client = workerClient(options.clientId);
+  const client = workerClient(options.clientId, options.authenticatedControllerId);
   const createClient = vi.fn(() => client);
   const controller = createDesktopWorkerController({
     profileStore: {
@@ -90,6 +99,17 @@ describe('desktop worker controller pairing', () => {
     const { controller, save, client } = setup({
       selected: signedBundle(),
       clientId: '22222222-2222-4222-8222-222222222222',
+    });
+
+    await expect(controller.pairWorker()).rejects.toThrow(/worker identity/);
+    expect(save).not.toHaveBeenCalled();
+    expect(client.close).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a pairing bundle when authenticated controller identity differs', async () => {
+    const { controller, save, client } = setup({
+      selected: signedBundle(),
+      authenticatedControllerId: '33333333-3333-4333-8333-333333333333',
     });
 
     await expect(controller.pairWorker()).rejects.toThrow(/worker identity/);

@@ -1,6 +1,7 @@
 export {
   createWorkerClient,
   createWorkerIdentityVerifier,
+  type ImportedInputBundle,
   normalizeCertificateFingerprint,
   validateWorkerUrl,
   verifyPinnedWorkerCertificate,

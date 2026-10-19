@@ -13,6 +13,9 @@ import {
 const PROTOCOL_VERSION = '1';
 const MAX_EVENT_BYTES = 4 * 1024 * 1024;
 const MAX_EVENT_COUNT = 500;
+const MAX_ARCHIVE_BYTES = 32 * 1024 * 1024;
+const MAX_EXPANDED_BYTES = 64 * 1024 * 1024;
+const MAX_INPUT_FILES = 1024;
 const MAX_SEQUENCE = '9223372036854775807';
 const SHA256_FINGERPRINT = /^[0-9a-f]{64}$/;
 
@@ -45,6 +48,7 @@ export interface WorkerHttpTransport {
 
 export interface WorkerCapabilities {
   readonly worker_id: string;
+  readonly controller_id: string;
   readonly protocol_version: 1;
   readonly target_lock_sha256: string;
   readonly max_limits: {
@@ -55,8 +59,17 @@ export interface WorkerCapabilities {
   };
 }
 
+export interface ImportedInputBundle {
+  readonly input_bundle_id: string;
+  readonly archive_sha256: string;
+  readonly file_count: number;
+  readonly expanded_bytes: number;
+}
+
 export interface WorkerClient {
   capabilities(): Promise<WorkerCapabilities>;
+  importInputBundle(archive: Buffer): Promise<ImportedInputBundle>;
+  activeRun(): Promise<RunStatus | null>;
   startRun(request: RunRequest): Promise<RunStatus>;
   getRun(runId: string): Promise<RunStatus>;
   stopRun(runId: string): Promise<RunStatus>;
@@ -137,9 +150,17 @@ function validateCapabilities(value: unknown): WorkerCapabilities {
   }
   const candidate = value as Record<string, unknown>;
   if (
-    !exactKeys(candidate, ['worker_id', 'protocol_version', 'target_lock_sha256', 'max_limits']) ||
+    !exactKeys(candidate, [
+      'worker_id',
+      'controller_id',
+      'protocol_version',
+      'target_lock_sha256',
+      'max_limits',
+    ]) ||
     typeof candidate.worker_id !== 'string' ||
     !isNonNilUuid(candidate.worker_id) ||
+    typeof candidate.controller_id !== 'string' ||
+    !isNonNilUuid(candidate.controller_id) ||
     candidate.protocol_version !== 1 ||
     typeof candidate.target_lock_sha256 !== 'string' ||
     !/^[0-9a-f]{64}$/i.test(candidate.target_lock_sha256) ||
@@ -172,6 +193,7 @@ function validateCapabilities(value: unknown): WorkerCapabilities {
   }
   return {
     worker_id: candidate.worker_id,
+    controller_id: candidate.controller_id,
     protocol_version: 1,
     target_lock_sha256: candidate.target_lock_sha256,
     max_limits: {
@@ -180,6 +202,34 @@ function validateCapabilities(value: unknown): WorkerCapabilities {
       max_disk_bytes: limits.max_disk_bytes as number,
       max_cpu_percent: limits.max_cpu_percent as number,
     },
+  };
+}
+
+function validateImportedInputBundle(value: unknown): ImportedInputBundle {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('worker input bundle response is invalid');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    !exactKeys(candidate, ['input_bundle_id', 'archive_sha256', 'file_count', 'expanded_bytes']) ||
+    typeof candidate.input_bundle_id !== 'string' ||
+    !isNonNilUuid(candidate.input_bundle_id) ||
+    typeof candidate.archive_sha256 !== 'string' ||
+    !/^[0-9a-f]{64}$/i.test(candidate.archive_sha256) ||
+    !Number.isSafeInteger(candidate.file_count) ||
+    (candidate.file_count as number) < 1 ||
+    (candidate.file_count as number) > MAX_INPUT_FILES ||
+    !Number.isSafeInteger(candidate.expanded_bytes) ||
+    (candidate.expanded_bytes as number) < 1 ||
+    (candidate.expanded_bytes as number) > MAX_EXPANDED_BYTES
+  ) {
+    throw new TypeError('worker input bundle response is invalid');
+  }
+  return {
+    input_bundle_id: candidate.input_bundle_id,
+    archive_sha256: candidate.archive_sha256,
+    file_count: candidate.file_count as number,
+    expanded_bytes: candidate.expanded_bytes as number,
   };
 }
 
@@ -329,7 +379,14 @@ export function createWorkerClient(
       'x-sf-protocol-version': PROTOCOL_VERSION,
     };
     let encoded: Buffer | undefined;
-    if (body !== undefined) {
+    if (Buffer.isBuffer(body)) {
+      if (body.byteLength < 1) throw new RangeError('worker input archive must not be empty');
+      if (body.byteLength > MAX_ARCHIVE_BYTES)
+        throw new RangeError('worker input archive exceeds size limit');
+      encoded = body;
+      headers['content-type'] = 'application/zip';
+      headers['content-length'] = String(encoded.byteLength);
+    } else if (body !== undefined) {
       encoded = Buffer.from(JSON.stringify(body));
       if (encoded.byteLength > 1024 * 1024)
         throw new RangeError('worker request exceeds size limit');
@@ -367,8 +424,7 @@ export function createWorkerClient(
     return result;
   }
 
-  async function json(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
-    const result = await request(method, path, body);
+  function parseJsonResponse(result: WorkerHttpResponse): unknown {
     const contentType = Object.entries(result.headers).find(
       ([name]) => name.toLowerCase() === 'content-type',
     )?.[1];
@@ -380,6 +436,10 @@ export function createWorkerClient(
     } catch {
       throw new TypeError('worker JSON response is invalid');
     }
+  }
+
+  async function json(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+    return parseJsonResponse(await request(method, path, body));
   }
 
   function getCapabilities(): Promise<WorkerCapabilities> {
@@ -397,6 +457,28 @@ export function createWorkerClient(
   return {
     async capabilities() {
       return getCapabilities();
+    },
+    async importInputBundle(archive) {
+      if (!Buffer.isBuffer(archive)) throw new TypeError('worker input archive must be a Buffer');
+      const result = await request('POST', '/v1/input-bundles', archive);
+      return validateImportedInputBundle(parseJsonResponse(result));
+    },
+    async activeRun() {
+      const capabilities = await getCapabilities();
+      const value = await json('GET', '/v1/runs/active');
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new TypeError('worker active run response is invalid');
+      }
+      const candidate = value as Record<string, unknown>;
+      if (!exactKeys(candidate, ['active_run'])) {
+        throw new TypeError('worker active run response is invalid');
+      }
+      if (candidate.active_run === null) return null;
+      const run = validateRunStatus(candidate.active_run);
+      if (run.worker_id !== capabilities.worker_id) {
+        throw new TypeError('active run response identity is invalid');
+      }
+      return run;
     },
     async startRun(input) {
       const runRequest = validateRunRequest(input);

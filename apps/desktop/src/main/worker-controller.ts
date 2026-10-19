@@ -58,7 +58,10 @@ export function createDesktopWorkerController({
   const requireClient = async (): Promise<{ client: WorkerClient; profile: WorkerProfile }> => {
     if (!activeClient || !activeProfile) throw new Error('no worker is paired');
     const capabilities = await activeClient.capabilities();
-    if (capabilities.worker_id !== activeProfile.workerId) {
+    if (
+      capabilities.worker_id !== activeProfile.workerId ||
+      capabilities.controller_id !== activeProfile.controllerId
+    ) {
       closeClient(activeClient);
       activeClient = null;
       activeProfile = null;
@@ -91,7 +94,10 @@ export function createDesktopWorkerController({
         let capabilities: WorkerCapabilities;
         try {
           capabilities = await candidate.capabilities();
-          if (capabilities.worker_id !== verified.profile.workerId) {
+          if (
+            capabilities.worker_id !== verified.profile.workerId ||
+            capabilities.controller_id !== verified.profile.controllerId
+          ) {
             throw new Error('authenticated worker identity does not match the signed bundle');
           }
           if (closed) throw new Error('worker controller is closed');
