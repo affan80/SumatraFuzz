@@ -8,6 +8,7 @@ test('Windows native gate launches through the real worker coordinator and super
   const workflow = read('.github/workflows/repository-checks.yml');
   const job = workflow.split('  real-dynamorio:\n')[1]?.split(/\n {2}[a-z][a-z-]*:\n/)[0];
   assert.ok(job, 'DynamoRIO native acceptance job is required');
+  assert.match(job, /fetch-depth: 0/);
   assert.match(job, /npm run native:supervisor:build/);
   assert.match(job, /npm run native:sqlite:build/);
   assert.match(job, /Verify A4–A6 as a standard Windows user/);
