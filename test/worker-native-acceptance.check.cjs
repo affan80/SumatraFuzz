@@ -14,6 +14,10 @@ test('Windows native gate launches through the real worker coordinator and super
   assert.match(job, /timeout-minutes: 35/);
   assert.match(
     job,
+    /WORKER_ACCEPTANCE_HEAD_SHA:\s*\$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/,
+  );
+  assert.match(
+    job,
     /name: worker-native-acceptance-\$\{\{ github\.run_id \}\}[\s\S]*?if-no-files-found: error/,
   );
 
@@ -32,4 +36,10 @@ test('Windows native gate launches through the real worker coordinator and super
   assert.match(acceptance, /1_000/);
   assert.match(acceptance, /remainingProcesses/);
   assert.match(acceptance, /evidence_finalized/);
+  assert.match(acceptance, /source_commit: sourceCommit/);
+  assert.match(acceptance, /checked_out_commit: checkedOutCommit/);
+  assert.match(acceptance, /teardown_receipt:\s*\{/);
+  assert.match(acceptance, /stopped_at_utc: receipt\.stoppedAtUtc/);
+  assert.match(acceptance, /event_sequence: events\.map/);
+  assert.match(acceptance, /event_type: event\.event_type/);
 });

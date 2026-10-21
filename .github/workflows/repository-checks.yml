@@ -210,6 +210,8 @@ jobs:
       - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
         timeout-minutes: 35
+        env:
+          WORKER_ACCEPTANCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

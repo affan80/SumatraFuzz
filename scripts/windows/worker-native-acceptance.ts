@@ -64,10 +64,13 @@ async function readExecutions(file: string): Promise<number | null> {
 async function main(): Promise<void> {
   invariant(process.platform === 'win32' && process.arch === 'x64', 'native worker acceptance requires Windows x64');
   invariant(process.env.GITHUB_ACTIONS === 'true', 'native worker acceptance requires an ephemeral CI worker');
-  const sourceCommit = process.env.GITHUB_SHA ?? '';
-  invariant(/^[0-9a-f]{40}$/i.test(sourceCommit), 'native worker acceptance requires the exact CI commit SHA');
+  const workflowCommit = process.env.GITHUB_SHA ?? '';
+  invariant(/^[0-9a-f]{40}$/i.test(workflowCommit), 'native worker acceptance requires the exact CI commit SHA');
   const checkedOutCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-  invariant(sourceCommit.toLowerCase() === checkedOutCommit.toLowerCase(), 'native worker acceptance checkout does not match the exact CI commit SHA');
+  invariant(workflowCommit.toLowerCase() === checkedOutCommit.toLowerCase(), 'native worker acceptance checkout does not match the exact CI commit SHA');
+  const sourceCommit = process.env.WORKER_ACCEPTANCE_HEAD_SHA ?? workflowCommit;
+  invariant(/^[0-9a-f]{40}$/i.test(sourceCommit), 'native worker acceptance requires the exact source commit SHA');
+  execFileSync('git', ['merge-base', '--is-ancestor', sourceCommit, checkedOutCommit], { cwd: root, stdio: 'ignore' });
 
   await mkdir(nativeRoot, { recursive: true });
   await mkdir(inputRoot, { recursive: true });
@@ -180,13 +183,20 @@ async function main(): Promise<void> {
 
     const summary = {
       schema_version: 1,
-      source_commit: checkedOutCommit,
+      source_commit: sourceCommit.toLowerCase(),
+      checked_out_commit: checkedOutCommit.toLowerCase(),
       state: 'completed',
       stop_reason: 'requested',
       executions_done: finalStats,
       duration_seconds: Math.round((Date.now() - startedAt) / 1_000),
       process_count_at_teardown: receipt.remainingProcesses,
-      event_types: eventTypes,
+      teardown_receipt: {
+        job_id: receipt.jobId,
+        stopped_at_utc: receipt.stoppedAtUtc,
+        stop_reason: receipt.stopReason,
+        remaining_processes: receipt.remainingProcesses,
+      },
+      event_sequence: events.map((event) => ({ seq: event.seq.toString(), event_type: event.event_type })),
       artifact_count: artifacts.length,
       artifact_total_bytes: artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0),
       fuzzer_stats_sha256: statsArtifact.sha256,
