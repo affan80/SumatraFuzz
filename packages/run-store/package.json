@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@sumatrafuzz/worker-protocol": "0.1.0"
+    "@sumatrafuzz/worker-protocol": "0.1.0",
+    "better-sqlite3": "13.0.3"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
   }
 }

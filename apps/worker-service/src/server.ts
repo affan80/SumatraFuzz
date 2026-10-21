@@ -7,6 +7,7 @@ import {
   isNonNilUuid,
   type RunRequest,
   validateRunRequest,
+  validateRunStatus,
 } from '@sumatrafuzz/worker-protocol';
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
 import { importInputBundle, MAX_ARCHIVE_BYTES } from './input-bundles.js';
@@ -27,6 +28,7 @@ export interface ArtifactChunk {
 
 export interface WorkerApiHandlers {
   capabilities(controllerId: string): Promise<unknown>;
+  activeRun(controllerId: string): Promise<unknown>;
   startRun(controllerId: string, request: RunRequest): Promise<unknown>;
   getRun(controllerId: string, runId: string): Promise<unknown>;
   stopRun(controllerId: string, runId: string): Promise<unknown>;
@@ -287,6 +289,13 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
 
         if (request.method === 'GET' && url.pathname === '/v1/capabilities') {
           json(response, 200, await config.handlers.capabilities(controllerId));
+          return;
+        }
+        if (request.method === 'GET' && url.pathname === '/v1/runs/active') {
+          const activeRun = await config.handlers.activeRun(controllerId);
+          json(response, 200, {
+            active_run: activeRun === null ? null : validateRunStatus(activeRun),
+          });
           return;
         }
         if (request.method === 'POST' && url.pathname === '/v1/input-bundles') {

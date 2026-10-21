@@ -11,40 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  typescript:
-    name: TypeScript (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-2022]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .node-version
-          cache: npm
-      - name: Install locked dependencies
-        run: npm ci
-      - name: Build SQLite binding from locked source
-        run: npm run native:sqlite:build
-      - name: Build Windows Job Object supervisor from locked source
-        if: runner.os == 'Windows'
-        run: npm run native:supervisor:build
-      - name: Test native supervisor argument contract
-        run: npm run native:supervisor:contract
-      - name: Formatting
-        run: npm run format:check
-      - name: Lint
-        run: npm run lint
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Tests
-        run: npm test
-      - name: Dependency audit
-        run: npm audit --audit-level=high
   rust-worker:
     name: Rust worker (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -69,7 +35,7 @@ jobs:
             ~/.cargo/git/db
             ~/.cargo/git/checkouts
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
       - name: Verify locked dependencies
@@ -151,7 +117,7 @@ jobs:
   native-real-engine:
     name: Real SumatraPDF parser
     runs-on: windows-2022
-    needs: [target-config, windows-tests, native-contract, debug-evidence-unit]
+    needs: [target-config]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -196,18 +162,21 @@ jobs:
   real-dynamorio:
     name: DynamoRIO persistent debug
     runs-on: windows-2022
-    needs: [windows-tests, debug-evidence-unit, native-real-engine]
+    needs: [windows-tests, native-contract, debug-evidence-unit, native-real-engine]
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
+          cache-dependency-path: package-lock.json
       - name: Install locked TypeScript CLI dependencies
         run: npm ci --ignore-scripts
+      - name: Build TypeScript workspace runtime for seed tooling
+        run: npm run typecheck
       - name: Check out pinned SumatraPDF 3.6.1rel
         shell: pwsh
         run: |

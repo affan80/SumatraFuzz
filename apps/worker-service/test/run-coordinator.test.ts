@@ -103,6 +103,25 @@ afterEach(async () => {
 });
 
 describe('worker run coordinator', () => {
+  it('returns authenticated capabilities and only the caller-owned active run', async () => {
+    const { coordinator, store } = await setup();
+
+    await expect(coordinator.capabilities(controllerId)).resolves.toMatchObject({
+      controller_id: controllerId,
+      worker_id: '66666666-6666-4666-8666-666666666666',
+    });
+    await expect(coordinator.activeRun(controllerId)).resolves.toBeNull();
+
+    await coordinator.startRun(controllerId, request());
+    await expect(coordinator.activeRun(controllerId)).resolves.toMatchObject({
+      run_id: runId,
+      worker_id: '66666666-6666-4666-8666-666666666666',
+      state: 'running',
+    });
+    await expect(coordinator.activeRun(otherController)).resolves.toBeNull();
+    store.close();
+  });
+
   it('claims one durable slot, replays the same command, and rejects a competing run', async () => {
     const { coordinator, store, supervisor, verifyLaunch } = await setup();
     const start = request();
@@ -160,6 +179,42 @@ describe('worker run coordinator', () => {
     expect(await coordinator.stopRun(controllerId, runId)).toMatchObject({ state: 'completed' });
     expect(supervisor.stopJob).toHaveBeenCalledTimes(2);
     expect(store.runState(runId as never)).toBe('completed');
+    store.close();
+  });
+
+  it('rejects a memory limit below native bounds before claiming the worker slot', async () => {
+    const { coordinator, store, verifyLaunch } = await setup();
+    const invalid = {
+      ...request(),
+      limits: { ...request().limits, max_memory_bytes: 1024 },
+    } as ReturnType<typeof request>;
+
+    await expect(coordinator.startRun(controllerId, invalid)).rejects.toThrow(/invalid_config/i);
+    await expect(
+      coordinator.startRun(controllerId, {
+        ...request(),
+        limits: { ...request().limits, max_disk_bytes: request().limits.max_disk_bytes - 1 },
+      }),
+    ).rejects.toThrow(/invalid_config/i);
+    expect(verifyLaunch).not.toHaveBeenCalled();
+    expect(store.activeRunSnapshot()).toBeNull();
+    store.close();
+  });
+
+  it('attempts native teardown when the first stopping-state journal write fails', async () => {
+    const { coordinator, store, supervisor } = await setup();
+    await coordinator.startRun(controllerId, request());
+    const transition = vi.spyOn(store, 'transitionState').mockImplementationOnce(() => {
+      throw new Error('temporary journal failure');
+    });
+
+    await expect(coordinator.stopRun(controllerId, runId)).resolves.toMatchObject({
+      state: 'completed',
+    });
+    expect(supervisor.stopJob).toHaveBeenCalledOnce();
+    expect(store.activeRunSnapshot()).toBeNull();
+    expect(transition).toHaveBeenCalledTimes(2);
+    transition.mockRestore();
     store.close();
   });
 

@@ -1,6 +1,6 @@
 # SumatraFuzz Electron and TypeScript Migration
 
-**Status:** Proposed design for review. No implementation is authorized by this document until it and the implementation plan are approved.
+**Status:** Approved by the user for implementation on 2026-10-19; migration remains in progress.
 **Date:** 2026-10-19
 **Repository:** `affan80/SumatraFuzz`
 **Target branch:** `dev`

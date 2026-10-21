@@ -98,10 +98,18 @@ export class WorkerQuotaMonitor {
       }
       return reason;
     } catch (error) {
-      if (!run.stopping && this.runs.has(runId)) {
+      if (this.runs.has(runId)) {
+        const needsFailureStop = !run.stopping;
         run.stopping = true;
         if (run.timer) clearTimeout(run.timer);
-        await this.config.stopRun(run.controllerId, runId, 'process_failure');
+        if (needsFailureStop) {
+          try {
+            await this.config.stopRun(run.controllerId, runId, 'process_failure');
+          } catch {
+            // Keep the lease monitored and retry after the normal interval.
+          }
+        }
+        if (this.runs.has(runId)) run.stopping = false;
       }
       throw error;
     } finally {

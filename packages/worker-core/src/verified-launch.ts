@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   asRunId,
   type CampaignLimits,
+  MIN_CAMPAIGN_MEMORY_BYTES,
   type RunRequest,
   validateRunRequest,
   WorkerError,
@@ -153,6 +154,7 @@ async function readBoundedJson(filePath: string): Promise<unknown> {
 }
 
 function validateLimits(request: CampaignLimits, ceilings: CampaignLimits): void {
+  if (request.max_memory_bytes < MIN_CAMPAIGN_MEMORY_BYTES) fail(WorkerError.InvalidConfig);
   if (request.max_disk_bytes !== ceilings.max_disk_bytes) fail(WorkerError.InvalidConfig);
   if (
     request.max_duration_s > ceilings.max_duration_s ||

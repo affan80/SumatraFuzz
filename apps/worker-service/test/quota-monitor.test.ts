@@ -112,4 +112,43 @@ describe('worker quota monitor', () => {
     monitor.stop(runId);
     store.close();
   });
+
+  it('retries threshold stop after a transient journal or teardown failure', async () => {
+    const store = await setup();
+    const stopRun = vi.fn().mockRejectedValueOnce(new Error('temporary journal failure'));
+    stopRun.mockResolvedValue(undefined);
+    const monitor = new WorkerQuotaMonitor({
+      store,
+      sampleJob: async () => ({ cpu_percent: 1, memory_bytes: 1024, process_count: 1 }),
+      measureWorkerVolumeUsedBytes: async () => 1,
+      stopRun,
+      intervalMs: 60_000,
+      now: () => Date.parse('2026-10-19T12:00:00.000Z'),
+    });
+    monitor.start(
+      runId,
+      controllerId,
+      { id: 'job-1', processId: 1234 },
+      {
+        runId,
+        executable: 'unused',
+        argv: [],
+        workingDir: 'unused',
+        evidenceDir: 'unused',
+        fileProofs: [],
+        limits: {
+          max_duration_s: 60,
+          max_memory_bytes: 1024,
+          max_disk_bytes: 100,
+          max_cpu_percent: 80,
+        },
+      },
+    );
+
+    await expect(monitor.sampleOnce(runId)).rejects.toThrow(/journal failure/i);
+    await expect(monitor.sampleOnce(runId)).resolves.toBe('memory_limit');
+    expect(stopRun).toHaveBeenCalledTimes(2);
+    monitor.stop(runId);
+    store.close();
+  });
 });

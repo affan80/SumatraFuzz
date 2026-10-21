@@ -9,17 +9,6 @@
     "packages/*",
     "apps/*"
   ],
-  "scripts": {
-    "format:check": "biome check .",
-    "lint": "biome lint .",
-    "typecheck": "tsc -b --pretty false",
-    "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
-    "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
-    "native:supervisor:contract": "cmake -S native/worker-supervisor -B build/worker-supervisor && cmake --build build/worker-supervisor --config Debug && ctest --test-dir build/worker-supervisor -C Debug --output-on-failure",
-    "test": "vitest run && node --test test/*.check.cjs",
-    "test:watch": "vitest",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm audit --audit-level=high"
-  },
   "dependencies": {
     "@sinclair/typebox": "0.34.52",
     "ajv": "8.20.0",
@@ -28,11 +17,28 @@
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
+  "scripts": {
+    "format:check": "biome check .",
+    "lint": "biome lint .",
+    "typecheck": "tsc -b --pretty false && node scripts/build-runtime-assets.mjs",
+    "desktop:build": "tsc -b apps/desktop --force && node scripts/build-desktop.mjs",
+    "desktop:package:win": "npm run desktop:build && node scripts/stage-desktop-package.mjs && electron-builder --config electron-builder.yml --win nsis --x64 --publish never",
+    "worker:bundle:sign": "node scripts/sign-worker-pairing-bundle.mjs",
+    "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
+    "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
+    "native:supervisor:contract": "cmake -S native/worker-supervisor -B build/worker-supervisor && cmake --build build/worker-supervisor --config Debug && ctest --test-dir build/worker-supervisor -C Debug --output-on-failure",
+    "audit:production": "npm audit --omit=dev --audit-level=moderate",
+    "test": "vitest run && node --test test/*.check.cjs",
+    "test:watch": "vitest",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
+  },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@biomejs/biome": "2.5.15",
     "@cyclonedx/cyclonedx-npm": "6.0.1",
     "@electron/fuses": "2.1.3",
     "@electron/rebuild": "4.2.1",
+    "esbuild": "0.28.2",
     "@types/better-sqlite3": "9.6.0",
     "@types/node": "26.6.5",
     "@types/react": "19.3.0",
@@ -48,5 +54,8 @@
     "vite": "8.3.4",
     "vitest": "5.0.5",
     "yazl": "3.3.1"
+  },
+  "overrides": {
+    "global-agent": "4.1.3"
   }
 }
