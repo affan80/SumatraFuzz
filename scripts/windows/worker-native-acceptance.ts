@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { SqliteRunStore } from '@sumatrafuzz/run-store';
@@ -63,7 +64,10 @@ async function readExecutions(file: string): Promise<number | null> {
 async function main(): Promise<void> {
   invariant(process.platform === 'win32' && process.arch === 'x64', 'native worker acceptance requires Windows x64');
   invariant(process.env.GITHUB_ACTIONS === 'true', 'native worker acceptance requires an ephemeral CI worker');
-  invariant(/^[0-9a-f]{40}$/i.test(process.env.GITHUB_SHA ?? ''), 'native worker acceptance requires the exact CI commit SHA');
+  const sourceCommit = process.env.GITHUB_SHA ?? '';
+  invariant(/^[0-9a-f]{40}$/i.test(sourceCommit), 'native worker acceptance requires the exact CI commit SHA');
+  const checkedOutCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  invariant(sourceCommit.toLowerCase() === checkedOutCommit.toLowerCase(), 'native worker acceptance checkout does not match the exact CI commit SHA');
 
   await mkdir(nativeRoot, { recursive: true });
   await mkdir(inputRoot, { recursive: true });
@@ -176,7 +180,7 @@ async function main(): Promise<void> {
 
     const summary = {
       schema_version: 1,
-      source_commit: process.env.GITHUB_SHA,
+      source_commit: checkedOutCommit,
       state: 'completed',
       stop_reason: 'requested',
       executions_done: finalStats,
