@@ -69,3 +69,11 @@ test('desktop package policy rejects unbundled preload source and allows its Com
   assert.equal(findings.length, 1);
   assert.match(findings[0], /preload source/i);
 });
+
+test('desktop package policy converts normalized ASAR paths to Windows separators', async () => {
+  const { toArchivePath } = await import('../scripts/check-desktop-package.mjs');
+  assert.equal(
+    toArchivePath?.('node_modules/@sinclair/typebox/package.json', '\\'),
+    'node_modules\\@sinclair\\typebox\\package.json',
+  );
+});

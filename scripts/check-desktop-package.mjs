@@ -21,6 +21,10 @@ function normalizeEntry(entry) {
   return entry.replaceAll('\\', '/').replace(/^\/+/, '');
 }
 
+export function toArchivePath(entry, separator = path.sep) {
+  return normalizeEntry(entry).split('/').join(separator);
+}
+
 export function findForbiddenPackageEntries(entries) {
   const findings = [];
   for (const original of entries) {
@@ -108,13 +112,14 @@ export async function inspectDesktopAsar(asarPath) {
   const findings = findForbiddenPackageEntries(entries);
   for (const original of entries) {
     const entry = normalizeEntry(original);
-    const metadata = statFile(asarPath, entry, false);
+    const archiveEntry = toArchivePath(entry);
+    const metadata = statFile(asarPath, archiveEntry, false);
     if ('files' in metadata) continue;
     if ('link' in metadata) {
       findings.push(`${original}: packaged symbolic link is not allowed`);
       continue;
     }
-    if (containsPrivateSigningKey(extractFile(asarPath, entry, false))) {
+    if (containsPrivateSigningKey(extractFile(asarPath, archiveEntry, false))) {
       findings.push(`${original}: private signing key content is forbidden`);
     }
   }
@@ -122,7 +127,7 @@ export async function inspectDesktopAsar(asarPath) {
   if (!entries.some((entry) => normalizeEntry(entry) === trustKeyPath)) {
     findings.push(`${trustKeyPath}: required organization trust key is missing`);
   } else {
-    if (!validatePackagedTrustKey(extractFile(asarPath, trustKeyPath))) {
+    if (!validatePackagedTrustKey(extractFile(asarPath, toArchivePath(trustKeyPath)))) {
       findings.push(`${trustKeyPath}: packaged trust key is not public-only`);
     }
   }
@@ -133,7 +138,7 @@ export async function inspectDesktopAsar(asarPath) {
   if (!entries.some((entry) => normalizeEntry(entry) === preloadPath)) {
     findings.push(`${preloadPath}: bundled CommonJS preload is missing`);
   } else {
-    const preload = extractFile(asarPath, preloadPath).toString('utf8');
+    const preload = extractFile(asarPath, toArchivePath(preloadPath)).toString('utf8');
     if (!/require\(["']electron["']\)/.test(preload) || /^\s*(?:import|export)\s/m.test(preload)) {
       findings.push(`${preloadPath}: sandboxed preload must be bundled as CommonJS`);
     }
