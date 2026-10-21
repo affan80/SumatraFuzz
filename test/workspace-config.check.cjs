@@ -31,7 +31,13 @@ test('Node CI runs in both operating systems and keeps the lockfile cache scoped
   const workflow = readFileSync('.github/workflows/repository-checks.yml', 'utf8');
   assert.match(workflow, /name: TypeScript \(\$\{\{ matrix\.os \}\}\)/);
   assert.match(workflow, /os: \[ubuntu-latest, windows-2022\]/);
-  assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
+  const setupNodeRefs = [...workflow.matchAll(/^\s*- uses: actions\/setup-node@(\S+)/gm)].map(
+    (match) => match[1],
+  );
+  assert.ok(setupNodeRefs.length > 0, 'Node CI must use setup-node');
+  for (const ref of setupNodeRefs) {
+    assert.equal(ref, '949feb2413d6458794dcd2491c4babbbce0c15c1', 'setup-node v7.1.0 pin');
+  }
   assert.match(workflow, /cache: npm/);
   assert.match(workflow, /npm run typecheck/);
   assert.match(workflow, /npm run native:sqlite:build/);
