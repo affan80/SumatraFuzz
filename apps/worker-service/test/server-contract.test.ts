@@ -7,6 +7,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   assertProtocolVersion,
+  createExclusiveRequestGate,
   createWorkerServer,
   parseArtifactRange,
   parseEventPageLimit,
@@ -157,6 +158,16 @@ function authenticatedGet(
 }
 
 describe('worker API contract', () => {
+  it('permits only one in-flight input import and releases the gate after completion', () => {
+    const gate = createExclusiveRequestGate();
+    const release = gate.tryAcquire();
+
+    expect(release).toBeTypeOf('function');
+    expect(gate.tryAcquire()).toBeUndefined();
+    release?.();
+    expect(gate.tryAcquire()).toBeTypeOf('function');
+  });
+
   it('returns the signed controller identity and only its active run over mutual TLS', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'sf-server-contract-'));
     const tls = await createTlsFixture(root);
@@ -179,6 +190,7 @@ describe('worker API contract', () => {
       ca: tls.ca,
       pairedControllers: new Map([[tls.fingerprint, controllerId]]),
       inputRoot: root,
+      ensureInputCapacity: async () => {},
       store: { ownsRun: () => false },
       handlers: {
         capabilities: async (authenticatedControllerId: string) => ({
@@ -311,6 +323,7 @@ describe('worker API contract', () => {
       ca: Buffer.alloc(0),
       pairedControllers: new Map<string, string>(),
       inputRoot: '/unused',
+      ensureInputCapacity: async () => {},
       store: { ownsRun: () => false },
       handlers: {} as never,
     };

@@ -49,6 +49,32 @@ describe('input bundle staging', () => {
     expect(await readdir(path.join(root, controllerId))).toEqual([result.input_bundle_id]);
   });
 
+  it('rejects a bundle that would exceed the aggregate worker disk limit', async () => {
+    const root = await makeRoot();
+    const pdf = Buffer.from('%PDF-1.4\nfirst retained seed\n%%EOF\n');
+    const archive = await makeZip([{ name: 'seed.pdf', bytes: pdf }]);
+    const importWithCapacity = importInputBundle as (
+      inputRoot: string,
+      controller: string,
+      bundle: Buffer,
+      options: { ensureCapacity(bytesToWrite: number): Promise<void> },
+    ) => Promise<Awaited<ReturnType<typeof importInputBundle>>>;
+    const workerDiskLimit = pdf.length;
+    let usedBytes = 0;
+    const ensureCapacity = async (bytesToWrite: number): Promise<void> => {
+      if (usedBytes + bytesToWrite > workerDiskLimit) {
+        throw Object.assign(new Error('worker disk limit would be exceeded'), { status: 507 });
+      }
+    };
+
+    const first = await importWithCapacity(root, controllerId, archive, { ensureCapacity });
+    usedBytes += first.expanded_bytes;
+    await expect(
+      importWithCapacity(root, controllerId, archive, { ensureCapacity }),
+    ).rejects.toThrow(/worker disk limit/i);
+    expect(await readdir(path.join(root, controllerId))).toEqual([first.input_bundle_id]);
+  });
+
   it('rejects traversal names and removes the incomplete staging directory', async () => {
     const root = await makeRoot();
     const archive = await makeZip([{ name: 'good.pdf', bytes: Buffer.from('%PDF-1.4\n') }]);
