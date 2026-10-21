@@ -191,6 +191,7 @@ describe('worker API contract', () => {
       pairedControllers: new Map([[tls.fingerprint, controllerId]]),
       inputRoot: root,
       ensureInputCapacity: async () => {},
+      maxInputBundleBytes: 64 * 1024 * 1024,
       store: { ownsRun: () => false },
       handlers: {
         capabilities: async (authenticatedControllerId: string) => ({
@@ -324,6 +325,7 @@ describe('worker API contract', () => {
       pairedControllers: new Map<string, string>(),
       inputRoot: '/unused',
       ensureInputCapacity: async () => {},
+      maxInputBundleBytes: 64 * 1024 * 1024,
       store: { ownsRun: () => false },
       handlers: {} as never,
     };

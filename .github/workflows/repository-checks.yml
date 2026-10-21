@@ -177,6 +177,12 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build TypeScript workspace runtime for seed tooling
         run: npm run typecheck
+      - name: Build native SQLite and Windows supervisor modules
+        run: |
+          npm run native:sqlite:build
+          if ($LASTEXITCODE -ne 0) { throw 'Native SQLite build failed' }
+          npm run native:supervisor:build
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows supervisor build failed' }
       - name: Check out pinned SumatraPDF 3.6.1rel
         shell: pwsh
         run: |
@@ -203,7 +209,7 @@ jobs:
           pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
       - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
-        timeout-minutes: 22
+        timeout-minutes: 35
         run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -220,6 +226,14 @@ jobs:
             runs/a6/evidence.json
             runs/native-execution-context.json
           if-no-files-found: error
+          retention-days: 30
+      - name: Upload integrated worker acceptance summary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: worker-native-acceptance-${{ github.run_id }}
+          path: runs/worker-native/acceptance-summary.json
+          if-no-files-found: warn
           retention-days: 30
       - name: Save non-sensitive WinAFL counters and run metadata
         if: always()

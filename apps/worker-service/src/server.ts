@@ -10,7 +10,7 @@ import {
   validateRunStatus,
 } from '@sumatrafuzz/worker-protocol';
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
-import { importInputBundle, MAX_ARCHIVE_BYTES } from './input-bundles.js';
+import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
 
 export interface WorkerEventRecord {
@@ -66,6 +66,7 @@ export interface WorkerServerConfig {
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
   readonly inputRoot: string;
   readonly ensureInputCapacity: (bytesToWrite: number) => Promise<void>;
+  readonly maxInputBundleBytes: number;
   readonly maxRequestBytes?: number;
 }
 
@@ -236,6 +237,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   }
   if (!isNonNilUuid(config.workerId)) throw new TypeError('worker ID must be a non-nil UUID');
   const requestLimit = config.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
+  if (!Number.isSafeInteger(config.maxInputBundleBytes) || config.maxInputBundleBytes < 1) {
+    throw new RangeError('invalid worker input bundle disk limit');
+  }
   if (
     !Number.isSafeInteger(requestLimit) ||
     requestLimit < 1024 ||
@@ -309,10 +313,11 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             json(
               response,
               201,
-              await importInputBundle(
+              await importInputBundleFrom(
                 config.inputRoot,
                 controllerId,
-                await body(request, requestLimit),
+                () => body(request, requestLimit),
+                config.maxInputBundleBytes,
                 { ensureCapacity: config.ensureInputCapacity },
               ),
             );
