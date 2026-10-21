@@ -22,7 +22,7 @@
     "audit:production": "npm audit --omit=dev --audit-level=moderate",
     "test": "vitest run && node --test test/*.check.cjs",
     "test:watch": "vitest",
-    "verify": "npm run format:check && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
