@@ -12,6 +12,10 @@ test('Windows native gate launches through the real worker coordinator and super
   assert.match(job, /npm run native:sqlite:build/);
   assert.match(job, /Verify A4–A6 as a standard Windows user/);
   assert.match(job, /timeout-minutes: 35/);
+  assert.match(
+    job,
+    /name: worker-native-acceptance-\$\{\{ github\.run_id \}\}[\s\S]*?if-no-files-found: error/,
+  );
 
   const gate = read('scripts/windows/verify-native-gate.ps1');
   assert.match(gate, /worker-native-acceptance\.ts/);
