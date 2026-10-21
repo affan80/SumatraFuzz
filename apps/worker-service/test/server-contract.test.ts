@@ -1,3 +1,9 @@
+import { execFileSync } from 'node:child_process';
+import { X509Certificate } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { request as httpsRequest } from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   assertProtocolVersion,
@@ -9,7 +15,211 @@ import {
   validateStartRequest,
 } from '../src/server.js';
 
+async function createTlsFixture(root: string) {
+  const caKeyPath = path.join(root, 'ca.key');
+  const caCertPath = path.join(root, 'ca.crt');
+  const workerKeyPath = path.join(root, 'worker.key');
+  const workerCsrPath = path.join(root, 'worker.csr');
+  const workerCertPath = path.join(root, 'worker.crt');
+  const clientKeyPath = path.join(root, 'client.key');
+  const clientCsrPath = path.join(root, 'client.csr');
+  const clientCertPath = path.join(root, 'client.crt');
+  const workerExtensionsPath = path.join(root, 'worker.ext');
+  const clientExtensionsPath = path.join(root, 'client.ext');
+
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-keyout',
+      caKeyPath,
+      '-out',
+      caCertPath,
+      '-days',
+      '2',
+      '-subj',
+      '/CN=SumatraFuzz test CA',
+      '-addext',
+      'basicConstraints=critical,CA:TRUE',
+      '-addext',
+      'keyUsage=critical,keyCertSign,cRLSign',
+    ],
+    { stdio: 'ignore' },
+  );
+  for (const [name, keyPath, csrPath] of [
+    ['worker', workerKeyPath, workerCsrPath],
+    ['client', clientKeyPath, clientCsrPath],
+  ] as const) {
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-new',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyPath,
+        '-out',
+        csrPath,
+        '-subj',
+        `/CN=SumatraFuzz test ${name}`,
+      ],
+      { stdio: 'ignore' },
+    );
+  }
+  await writeFile(
+    workerExtensionsPath,
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n',
+  );
+  await writeFile(
+    clientExtensionsPath,
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n',
+  );
+  for (const [csrPath, certPath, extensionPath] of [
+    [workerCsrPath, workerCertPath, workerExtensionsPath],
+    [clientCsrPath, clientCertPath, clientExtensionsPath],
+  ] as const) {
+    execFileSync(
+      'openssl',
+      [
+        'x509',
+        '-req',
+        '-in',
+        csrPath,
+        '-CA',
+        caCertPath,
+        '-CAkey',
+        caKeyPath,
+        '-CAcreateserial',
+        '-out',
+        certPath,
+        '-days',
+        '2',
+        '-extfile',
+        extensionPath,
+      ],
+      { stdio: 'ignore' },
+    );
+  }
+
+  const [ca, workerCert, workerKey, clientCert, clientKey] = await Promise.all([
+    readFile(caCertPath),
+    readFile(workerCertPath),
+    readFile(workerKeyPath),
+    readFile(clientCertPath),
+    readFile(clientKeyPath),
+  ]);
+  const fingerprint = new X509Certificate(clientCert).fingerprint256
+    .replaceAll(':', '')
+    .toLowerCase();
+  return { ca, workerCert, workerKey, clientCert, clientKey, fingerprint };
+}
+
+function authenticatedGet(
+  baseUrl: string,
+  requestPath: string,
+  tls: Awaited<ReturnType<typeof createTlsFixture>>,
+): Promise<{ status: number; body: unknown }> {
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      new URL(requestPath, baseUrl),
+      {
+        ca: tls.ca,
+        cert: tls.clientCert,
+        key: tls.clientKey,
+        headers: { 'x-sf-protocol-version': '1' },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer | string) =>
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+        );
+        response.on('end', () => {
+          try {
+            resolve({
+              status: response.statusCode ?? 0,
+              body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown,
+            });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    request.on('error', reject);
+    request.end();
+  });
+}
+
 describe('worker API contract', () => {
+  it('returns the signed controller identity and only its active run over mutual TLS', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'sf-server-contract-'));
+    const tls = await createTlsFixture(root);
+    const controllerId = '22222222-2222-4222-8222-222222222222';
+    const activeStatus = {
+      run_id: '33333333-3333-4333-8333-333333333333',
+      worker_id: '11111111-1111-4111-8111-111111111111',
+      state: 'running',
+      last_event_seq: '2',
+      stop_reason: null,
+    };
+    let currentRun: unknown = activeStatus;
+    const server = await createWorkerServer({
+      host: '127.0.0.1',
+      mode: 'local',
+      port: 0,
+      workerId: activeStatus.worker_id,
+      key: tls.workerKey,
+      cert: tls.workerCert,
+      ca: tls.ca,
+      pairedControllers: new Map([[tls.fingerprint, controllerId]]),
+      inputRoot: root,
+      store: { ownsRun: () => false },
+      handlers: {
+        capabilities: async (authenticatedControllerId: string) => ({
+          worker_id: activeStatus.worker_id,
+          controller_id: authenticatedControllerId,
+          protocol_version: 1,
+          target_lock_sha256: 'a'.repeat(64),
+          max_limits: {
+            max_duration_s: 60,
+            max_memory_bytes: 1024,
+            max_disk_bytes: 2048,
+            max_cpu_percent: 50,
+          },
+        }),
+        activeRun: async (authenticatedControllerId: string) =>
+          authenticatedControllerId === controllerId ? currentRun : null,
+      } as never,
+    });
+
+    try {
+      const capabilities = await authenticatedGet(server.address, '/v1/capabilities', tls);
+      expect(capabilities.status).toBe(200);
+      expect(capabilities.body).toMatchObject({
+        worker_id: activeStatus.worker_id,
+        controller_id: controllerId,
+      });
+
+      const recovered = await authenticatedGet(server.address, '/v1/runs/active', tls);
+      expect(recovered.status).toBe(200);
+      expect(recovered.body).toEqual({ active_run: activeStatus });
+
+      currentRun = null;
+      const empty = await authenticatedGet(server.address, '/v1/runs/active', tls);
+      expect(empty.status).toBe(200);
+      expect(empty.body).toEqual({ active_run: null });
+    } finally {
+      await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects absent, malformed, and unsupported protocol versions', () => {
     for (const version of [undefined, ['1'], '2', '01']) {
       expect(() => assertProtocolVersion(version)).toThrow(/protocol version/i);

@@ -1,5 +1,7 @@
 import { type Static, Type } from '@sinclair/typebox';
 
+export const MIN_CAMPAIGN_MEMORY_BYTES = 16 * 1024 * 1024;
+
 const Uuid = Type.String({
   pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
 });

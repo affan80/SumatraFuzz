@@ -1,0 +1,15 @@
+{
+  "name": "@sumatrafuzz/worker-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sumatrafuzz/worker-protocol": "0.1.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/src/index.js"
+    }
+  }
+}
