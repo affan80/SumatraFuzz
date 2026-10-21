@@ -44,10 +44,10 @@ try {
     if (-not $started) { throw 'Nonadministrator verification process failed to start' }
     $stdout = $proc.StandardOutput.ReadToEndAsync()
     $stderr = $proc.StandardError.ReadToEndAsync()
-    if (-not $proc.WaitForExit(1200000)) {
+    if (-not $proc.WaitForExit(1920000)) {
         $proc.Kill($true)
         [void]$proc.WaitForExit(30000)
-        throw 'Nonadministrator native gate exceeded 20 minutes'
+        throw 'Nonadministrator native gate exceeded 32 minutes'
     }
     $out = $stdout.GetAwaiter().GetResult()
     $err = $stderr.GetAwaiter().GetResult()

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ZipFile } from 'yazl';
-import { importInputBundle } from '../src/input-bundles.js';
+import { importInputBundle, importInputBundleFrom } from '../src/input-bundles.js';
 
 const controllerId = '11111111-1111-4111-8111-111111111111';
 const roots: string[] = [];
@@ -39,7 +39,7 @@ describe('input bundle staging', () => {
     const root = await makeRoot();
     const pdf = Buffer.from('%PDF-1.4\nvalid seed\n%%EOF\n');
     const archive = await makeZip([{ name: 'seed.pdf', bytes: pdf }]);
-    const result = await importInputBundle(root, controllerId, archive);
+    const result = await importInputBundle(root, controllerId, archive, 64 * 1024 * 1024);
     expect(result.file_count).toBe(1);
     expect(result.expanded_bytes).toBe(pdf.length);
     expect(result.archive_sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -53,12 +53,6 @@ describe('input bundle staging', () => {
     const root = await makeRoot();
     const pdf = Buffer.from('%PDF-1.4\nfirst retained seed\n%%EOF\n');
     const archive = await makeZip([{ name: 'seed.pdf', bytes: pdf }]);
-    const importWithCapacity = importInputBundle as (
-      inputRoot: string,
-      controller: string,
-      bundle: Buffer,
-      options: { ensureCapacity(bytesToWrite: number): Promise<void> },
-    ) => Promise<Awaited<ReturnType<typeof importInputBundle>>>;
     const workerDiskLimit = pdf.length;
     let usedBytes = 0;
     const ensureCapacity = async (bytesToWrite: number): Promise<void> => {
@@ -67,10 +61,12 @@ describe('input bundle staging', () => {
       }
     };
 
-    const first = await importWithCapacity(root, controllerId, archive, { ensureCapacity });
+    const first = await importInputBundle(root, controllerId, archive, workerDiskLimit, {
+      ensureCapacity,
+    });
     usedBytes += first.expanded_bytes;
     await expect(
-      importWithCapacity(root, controllerId, archive, { ensureCapacity }),
+      importInputBundle(root, controllerId, archive, 64 * 1024 * 1024, { ensureCapacity }),
     ).rejects.toThrow(/worker disk limit/i);
     expect(await readdir(path.join(root, controllerId))).toEqual([first.input_bundle_id]);
   });
@@ -87,7 +83,9 @@ describe('input bundle staging', () => {
       }
     }
     expect(replacements).toBe(2);
-    await expect(importInputBundle(root, controllerId, corruptedName)).rejects.toThrow();
+    await expect(
+      importInputBundle(root, controllerId, corruptedName, 64 * 1024 * 1024),
+    ).rejects.toThrow();
     expect(await readdir(path.join(root, controllerId))).toEqual([]);
   });
 
@@ -97,13 +95,19 @@ describe('input bundle staging', () => {
       { name: 'Seed.pdf', bytes: Buffer.from('%PDF-1.4\n') },
       { name: 'seed.pdf', bytes: Buffer.from('%PDF-1.4\n') },
     ]);
-    await expect(importInputBundle(root, controllerId, duplicates)).rejects.toThrow(/duplicate/i);
+    await expect(
+      importInputBundle(root, controllerId, duplicates, 64 * 1024 * 1024),
+    ).rejects.toThrow(/duplicate/i);
     const link = await makeZip([
       { name: 'link.pdf', bytes: Buffer.from('target'), mode: 0o120777 },
     ]);
-    await expect(importInputBundle(root, controllerId, link)).rejects.toThrow(/non-file/i);
+    await expect(importInputBundle(root, controllerId, link, 64 * 1024 * 1024)).rejects.toThrow(
+      /non-file/i,
+    );
     const bomb = await makeZip([{ name: 'bomb.pdf', bytes: Buffer.alloc(1024 * 1024, 65) }]);
-    await expect(importInputBundle(root, controllerId, bomb)).rejects.toThrow(/expansion/i);
+    await expect(importInputBundle(root, controllerId, bomb, 64 * 1024 * 1024)).rejects.toThrow(
+      /expansion/i,
+    );
     expect(await readdir(path.join(root, controllerId))).toEqual([]);
   });
 
@@ -115,7 +119,69 @@ describe('input bundle staging', () => {
     const offset = damaged.indexOf(bytes);
     expect(offset).toBeGreaterThanOrEqual(0);
     damaged[offset + 8] = (damaged[offset + 8] ?? 0) ^ 0xff;
-    await expect(importInputBundle(root, controllerId, damaged)).rejects.toThrow(/CRC/i);
+    await expect(importInputBundle(root, controllerId, damaged, 64 * 1024 * 1024)).rejects.toThrow(
+      /CRC/i,
+    );
     expect(await readdir(path.join(root, controllerId))).toEqual([]);
+  });
+
+  it('serializes imports against one aggregate worker disk budget across controllers', async () => {
+    const root = await makeRoot();
+    const firstController = controllerId;
+    const secondController = '22222222-2222-4222-8222-222222222222';
+    const pdf = Buffer.from('%PDF-1.4\naggregate budget\n%%EOF\n');
+    const archive = await makeZip([{ name: 'seed.pdf', bytes: pdf }]);
+    const budget = pdf.length + 1;
+
+    const results = await Promise.allSettled([
+      importInputBundle(root, firstController, archive, budget),
+      importInputBundle(root, secondController, archive, budget),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({ status: 'rejected' });
+    if (rejected?.status === 'rejected') expect(rejected.reason).toMatchObject({ status: 413 });
+
+    let storedBytes = 0;
+    for (const controller of [firstController, secondController]) {
+      try {
+        const bundles = await readdir(path.join(root, controller));
+        for (const bundle of bundles) {
+          const content = await readFile(path.join(root, controller, bundle, 'seed.pdf'));
+          storedBytes += content.length;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    expect(storedBytes).toBe(pdf.length);
+    expect(storedBytes).toBeLessThanOrEqual(budget);
+  });
+
+  it('serializes archive body reads before buffering concurrent uploads', async () => {
+    const root = await makeRoot();
+    const pdf = Buffer.from('%PDF-1.4\nserialized request\n%%EOF\n');
+    const archive = await makeZip([{ name: 'seed.pdf', bytes: pdf }]);
+    let activeReads = 0;
+    let peakReads = 0;
+    const readArchive = async () => {
+      activeReads += 1;
+      peakReads = Math.max(peakReads, activeReads);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeReads -= 1;
+      return archive;
+    };
+
+    await Promise.all([
+      importInputBundleFrom(root, controllerId, readArchive, 64 * 1024 * 1024),
+      importInputBundleFrom(
+        root,
+        '22222222-2222-4222-8222-222222222222',
+        readArchive,
+        64 * 1024 * 1024,
+      ),
+    ]);
+
+    expect(peakReads).toBe(1);
   });
 });

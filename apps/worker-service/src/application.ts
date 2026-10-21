@@ -94,6 +94,7 @@ export async function createWorkerApplication(
           throw Object.assign(new Error('worker disk limit would be exceeded'), { status: 507 });
         }
       },
+      maxInputBundleBytes: config.policy.maxLimits.max_disk_bytes,
       ...(config.maxRequestBytes === undefined ? {} : { maxRequestBytes: config.maxRequestBytes }),
     });
     return {
