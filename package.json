@@ -9,6 +9,14 @@
     "packages/*",
     "apps/*"
   ],
+  "dependencies": {
+    "@sinclair/typebox": "0.34.52",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "better-sqlite3": "13.0.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
   "scripts": {
     "format:check": "biome check .",
     "lint": "biome lint .",
@@ -32,15 +40,18 @@
     "@electron/rebuild": "4.2.1",
     "esbuild": "0.28.2",
     "@types/better-sqlite3": "9.6.0",
-    "@types/node": "24.19.2",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "@types/yauzl": "3.4.0",
-    "@types/yazl": "3.3.0",
+    "@types/yazl": "3.3.1",
+    "@vitejs/plugin-react": "6.1.2",
     "electron": "44.9.0",
     "electron-builder": "26.17.0",
     "node-addon-api": "8.9.2",
     "node-gyp": "13.1.0",
-    "typescript": "6.0.3",
-    "vite": "7.3.7",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
     "vitest": "5.0.5",
     "yazl": "3.3.1"
   },
