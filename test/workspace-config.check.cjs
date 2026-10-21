@@ -37,6 +37,13 @@ test('Node CI runs in both operating systems and keeps the lockfile cache scoped
   assert.match(workflow, /name: TypeScript \(\$\{\{ matrix\.os \}\}\)/);
   assert.match(workflow, /os: \[ubuntu-latest, windows-2022\]/);
   assert.match(workflow, /node-version-file: \.node-version/);
+  const setupNodeRefs = [...workflow.matchAll(/^\s*- uses: actions\/setup-node@(\S+)/gm)].map(
+    (match) => match[1],
+  );
+  assert.ok(setupNodeRefs.length > 0, 'Node CI must use setup-node');
+  for (const ref of setupNodeRefs) {
+    assert.equal(ref, '949feb2413d6458794dcd2491c4babbbce0c15c1', 'setup-node v7.1.0 pin');
+  }
   assert.match(workflow, /cache: npm/);
   assert.match(workflow, /cache-dependency-path: package-lock\.json/);
   assert.match(workflow, /npm ci --ignore-scripts/);
