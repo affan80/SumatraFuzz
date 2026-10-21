@@ -1,5 +1,12 @@
+import { execFileSync } from 'node:child_process';
+import { X509Certificate } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createServer } from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
 import type { PeerCertificate } from 'node:tls';
-import { describe, expect, it } from 'vitest';
+import { createTlsFixture } from '@sumatrafuzz/worker-security/test-fixtures';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createWorkerClient,
   createWorkerIdentityVerifier,
@@ -40,6 +47,16 @@ function clientWith(respond: (request: WorkerHttpRequest) => Promise<WorkerHttpR
   );
 }
 
+let identityRoot: string;
+let identityTls: Awaited<ReturnType<typeof createTlsFixture>>;
+beforeAll(async () => {
+  identityRoot = await mkdtemp(path.join(os.tmpdir(), 'sf-client-identity-'));
+  identityTls = await createTlsFixture(identityRoot);
+});
+afterAll(async () => {
+  await rm(identityRoot, { recursive: true, force: true });
+});
+
 describe('authenticated worker client', () => {
   it('requires HTTPS and rejects URL credentials, query strings and fragments', () => {
     expect(() => validateWorkerUrl('http://127.0.0.1:4242')).toThrow(/HTTPS/i);
@@ -57,11 +74,9 @@ describe('authenticated worker client', () => {
   });
 
   it('checks both the TLS hostname and paired certificate fingerprint', () => {
-    const verify = createWorkerIdentityVerifier(fingerprint);
-    const certificateIdentity = {
-      subjectaltname: 'IP Address:127.0.0.1',
-      fingerprint256: fingerprint.toUpperCase().match(/.{2}/g)?.join(':') ?? '',
-    } as PeerCertificate;
+    const workerCert = new X509Certificate(identityTls.workerCert);
+    const verify = createWorkerIdentityVerifier(workerCert.fingerprint256);
+    const certificateIdentity = workerCert.toLegacyObject() as PeerCertificate;
     expect(verify('127.0.0.1', certificateIdentity)).toBeUndefined();
     expect(verify('worker.example', certificateIdentity)).toBeInstanceOf(Error);
     expect(
@@ -307,5 +322,97 @@ describe('authenticated worker client', () => {
   it('destroys its TLS agent when closed', () => {
     const client = clientWith(async () => response(200, {}));
     expect(() => client.close()).not.toThrow();
+  });
+});
+
+describe('worker client TLS endpoint policy', () => {
+  it.each([
+    ['valid worker', false, 'serverAuth', undefined, true],
+    ['wrong purpose', false, 'clientAuth', undefined, false],
+    ['CA as worker', true, 'serverAuth', undefined, false],
+    ['wrong anchor', false, 'serverAuth', undefined, false],
+    ['wrong pin', false, 'serverAuth', undefined, false],
+    ['wrong hostname', false, 'serverAuth', undefined, false],
+    ['missing EKU', false, '', undefined, false],
+    ['TLS 1.2 only', false, 'serverAuth', 'TLSv1.2', false],
+  ] as const)('enforces %s', async (_name, isCa, purpose, maxVersion, accepted) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'sf-client-tls-'));
+    const certPath = path.join(root, 'cert.pem');
+    const keyPath = path.join(root, 'key.pem');
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyPath,
+        '-out',
+        certPath,
+        '-days',
+        '2',
+        '-subj',
+        '/CN=worker',
+        '-addext',
+        `basicConstraints=critical,CA:${isCa ? 'TRUE' : 'FALSE'}`,
+        '-addext',
+        'keyUsage=critical,digitalSignature,keyEncipherment',
+        ...(purpose ? ['-addext', `extendedKeyUsage=${purpose}`] : []),
+        '-addext',
+        _name === 'wrong hostname'
+          ? 'subjectAltName=DNS:wrong.invalid'
+          : 'subjectAltName=IP:127.0.0.1',
+      ],
+      { stdio: 'ignore' },
+    );
+    const cert = await readFile(certPath);
+    const privateKey = await readFile(keyPath);
+    let dispatches = 0;
+    const server = createServer(
+      { cert, key: privateKey, ...(maxVersion ? { maxVersion } : {}) },
+      (_request, reply) => {
+        dispatches++;
+        reply.setHeader('content-type', 'application/json');
+        reply.end(
+          JSON.stringify({
+            worker_id: workerId,
+            controller_id: controllerId,
+            protocol_version: 1,
+            target_lock_sha256: 'b'.repeat(64),
+            max_limits: {
+              max_duration_s: 60,
+              max_memory_bytes: 1024,
+              max_disk_bytes: 2048,
+              max_cpu_percent: 50,
+            },
+          }),
+        );
+      },
+    );
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    const client = createWorkerClient({
+      baseUrl: `https://127.0.0.1:${address.port}`,
+      controllerCertificate: cert,
+      controllerKey: privateKey,
+      trustedCa: _name === 'wrong anchor' ? identityTls.ca : cert,
+      workerFingerprint:
+        _name === 'wrong pin' ? fingerprint : new X509Certificate(cert).fingerprint256,
+    });
+    try {
+      if (accepted)
+        await expect(client.capabilities()).resolves.toMatchObject({ worker_id: workerId });
+      else await expect(client.capabilities()).rejects.toThrow();
+      expect(dispatches).toBe(accepted ? 1 : 0);
+    } finally {
+      client.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

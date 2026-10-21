@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { request as httpsRequest } from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
+import { createTlsFixture, issueCertificate } from '@sumatrafuzz/worker-security/test-fixtures';
 import { describe, expect, it } from 'vitest';
 import {
   assertProtocolVersion,
@@ -16,121 +16,19 @@ import {
   validateStartRequest,
 } from '../src/server.js';
 
-async function createTlsFixture(root: string) {
-  const caKeyPath = path.join(root, 'ca.key');
-  const caCertPath = path.join(root, 'ca.crt');
-  const workerKeyPath = path.join(root, 'worker.key');
-  const workerCsrPath = path.join(root, 'worker.csr');
-  const workerCertPath = path.join(root, 'worker.crt');
-  const clientKeyPath = path.join(root, 'client.key');
-  const clientCsrPath = path.join(root, 'client.csr');
-  const clientCertPath = path.join(root, 'client.crt');
-  const workerExtensionsPath = path.join(root, 'worker.ext');
-  const clientExtensionsPath = path.join(root, 'client.ext');
-
-  execFileSync(
-    'openssl',
-    [
-      'req',
-      '-x509',
-      '-newkey',
-      'rsa:2048',
-      '-nodes',
-      '-keyout',
-      caKeyPath,
-      '-out',
-      caCertPath,
-      '-days',
-      '2',
-      '-subj',
-      '/CN=SumatraFuzz test CA',
-      '-addext',
-      'basicConstraints=critical,CA:TRUE',
-      '-addext',
-      'keyUsage=critical,keyCertSign,cRLSign',
-    ],
-    { stdio: 'ignore' },
-  );
-  for (const [name, keyPath, csrPath] of [
-    ['worker', workerKeyPath, workerCsrPath],
-    ['client', clientKeyPath, clientCsrPath],
-  ] as const) {
-    execFileSync(
-      'openssl',
-      [
-        'req',
-        '-new',
-        '-newkey',
-        'rsa:2048',
-        '-nodes',
-        '-keyout',
-        keyPath,
-        '-out',
-        csrPath,
-        '-subj',
-        `/CN=SumatraFuzz test ${name}`,
-      ],
-      { stdio: 'ignore' },
-    );
-  }
-  await writeFile(
-    workerExtensionsPath,
-    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n',
-  );
-  await writeFile(
-    clientExtensionsPath,
-    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n',
-  );
-  for (const [csrPath, certPath, extensionPath] of [
-    [workerCsrPath, workerCertPath, workerExtensionsPath],
-    [clientCsrPath, clientCertPath, clientExtensionsPath],
-  ] as const) {
-    execFileSync(
-      'openssl',
-      [
-        'x509',
-        '-req',
-        '-in',
-        csrPath,
-        '-CA',
-        caCertPath,
-        '-CAkey',
-        caKeyPath,
-        '-CAcreateserial',
-        '-out',
-        certPath,
-        '-days',
-        '2',
-        '-extfile',
-        extensionPath,
-      ],
-      { stdio: 'ignore' },
-    );
-  }
-
-  const [ca, workerCert, workerKey, clientCert, clientKey] = await Promise.all([
-    readFile(caCertPath),
-    readFile(workerCertPath),
-    readFile(workerKeyPath),
-    readFile(clientCertPath),
-    readFile(clientKeyPath),
-  ]);
-  const fingerprint = new X509Certificate(clientCert).fingerprint256
-    .replaceAll(':', '')
-    .toLowerCase();
-  return { ca, workerCert, workerKey, clientCert, clientKey, fingerprint };
-}
-
 function authenticatedGet(
   baseUrl: string,
   requestPath: string,
   tls: Awaited<ReturnType<typeof createTlsFixture>>,
+  maxVersion?: 'TLSv1.2',
 ): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve, reject) => {
     const request = httpsRequest(
       new URL(requestPath, baseUrl),
       {
         ca: tls.ca,
+        agent: false,
+        ...(maxVersion ? { maxVersion } : {}),
         cert: tls.clientCert,
         key: tls.clientKey,
         headers: { 'x-sf-protocol-version': '1' },
@@ -227,6 +125,81 @@ describe('worker API contract', () => {
       const empty = await authenticatedGet(server.address, '/v1/runs/active', tls);
       expect(empty.status).toBe(200);
       expect(empty.body).toEqual({ active_run: null });
+    } finally {
+      await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid client leaves and TLS 1.2 before handler dispatch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'sf-server-policy-'));
+    const tls = await createTlsFixture(root);
+    const cases: Array<{ cert: Buffer; key: Buffer }> = [];
+    for (const [name, ext] of [
+      [
+        'ca-leaf',
+        'basicConstraints=CA:TRUE\nkeyUsage=critical,digitalSignature,keyCertSign\nextendedKeyUsage=clientAuth\n',
+      ],
+      ['missing-eku', 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'],
+      [
+        'wrong-eku',
+        'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n',
+      ],
+      ['missing-key-usage', 'basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n'],
+    ] as const)
+      cases.push(await issueCertificate(root, name, ext));
+    cases.push(
+      await issueCertificate(
+        root,
+        'expired',
+        'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n',
+        undefined,
+        '-1',
+      ),
+    );
+    const otherRoot = path.join(root, 'other');
+    await mkdir(otherRoot);
+    const other = await createTlsFixture(otherRoot);
+    cases.push({ cert: other.clientCert, key: other.clientKey });
+    let dispatches = 0;
+    const server = await createWorkerServer({
+      host: '127.0.0.1',
+      mode: 'local',
+      port: 0,
+      workerId: '11111111-1111-4111-8111-111111111111',
+      cert: tls.workerCert,
+      key: tls.workerKey,
+      ca: tls.ca,
+      pairedControllers: new Map(
+        [tls.clientCert, ...cases.map((item) => item.cert)].map((cert) => [
+          new X509Certificate(cert).fingerprint256,
+          '22222222-2222-4222-8222-222222222222',
+        ]),
+      ),
+      inputRoot: root,
+      ensureInputCapacity: async () => {},
+      maxInputBundleBytes: 1024,
+      store: { ownsRun: () => false },
+      handlers: {
+        capabilities: async () => {
+          dispatches++;
+          return {};
+        },
+      } as never,
+    });
+    try {
+      for (const invalid of cases) {
+        const outcome = await authenticatedGet(server.address, '/v1/capabilities', {
+          ...tls,
+          clientCert: Buffer.from(invalid.cert),
+          clientKey: Buffer.from(invalid.key),
+        }).catch(() => ({ status: 0 }));
+        expect(outcome.status).not.toBe(200);
+      }
+      await expect(
+        authenticatedGet(server.address, '/v1/capabilities', tls, 'TLSv1.2'),
+      ).rejects.toThrow();
+      expect(dispatches).toBe(0);
     } finally {
       await server.close();
       await rm(root, { recursive: true, force: true });

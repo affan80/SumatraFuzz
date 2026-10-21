@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "packages/worker-security" },
     { "path": "packages/worker-protocol" },
     { "path": "packages/worker-client" },
     { "path": "packages/worker-core" },

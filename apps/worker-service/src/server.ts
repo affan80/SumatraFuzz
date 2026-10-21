@@ -9,6 +9,7 @@ import {
   validateRunRequest,
   validateRunStatus,
 } from '@sumatrafuzz/worker-protocol';
+import { TLS_MIN_VERSION, validateEndpointCertificate } from '@sumatrafuzz/worker-security';
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
 import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
@@ -257,6 +258,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   }
   if (typeof config.ensureInputCapacity !== 'function')
     throw new TypeError('input bundle disk capacity check is required');
+  validateEndpointCertificate(config.cert, 'server');
   const inputImportGate = createExclusiveRequestGate();
 
   const server: HttpsServer = createHttpsServer(
@@ -266,12 +268,14 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       ca: config.ca,
       requestCert: true,
       rejectUnauthorized: true,
-      minVersion: 'TLSv1.2',
+      minVersion: TLS_MIN_VERSION,
     },
     (request, response) => {
       void (async () => {
         const socket = request.socket as TLSSocket;
         const peer = socket.getPeerCertificate(true);
+        if (!socket.authorized || !peer.raw) throw new Error('unauthorized client certificate');
+        validateEndpointCertificate(peer.raw, 'client');
         const fingerprint = authorizePairedCertificate(
           peerIdentity(peer, socket.authorized),
           new Set(pairedControllers.keys()),

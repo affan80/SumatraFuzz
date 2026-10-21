@@ -9,6 +9,7 @@ import {
   validateRunRequest,
   validateRunStatus,
 } from '@sumatrafuzz/worker-protocol';
+import { TLS_MIN_VERSION, validateEndpointCertificate } from '@sumatrafuzz/worker-security';
 
 const PROTOCOL_VERSION = '1';
 const MAX_EVENT_BYTES = 4 * 1024 * 1024;
@@ -129,6 +130,8 @@ export function createWorkerIdentityVerifier(
     const hostnameError = checkServerIdentity(host, cert);
     if (hostnameError) return hostnameError;
     try {
+      if (!cert.raw) throw new Error('worker certificate is missing');
+      validateEndpointCertificate(cert.raw, 'server');
       verifyPinnedWorkerCertificate(expected, cert.fingerprint256 ?? '');
     } catch {
       return new Error('worker certificate identity does not match the paired fingerprint');
@@ -298,7 +301,7 @@ function createHttpsTransport(config: WorkerClientConfig, baseUrl: URL): WorkerH
     keepAlive: true,
     maxSockets: 4,
     rejectUnauthorized: true,
-    minVersion: 'TLSv1.2',
+    minVersion: TLS_MIN_VERSION,
     checkServerIdentity: verifyIdentity,
   });
   const timeoutMsValue = timeoutMs;
