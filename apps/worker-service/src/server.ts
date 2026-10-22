@@ -23,6 +23,7 @@ import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth
 import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
 import { type AuthenticatedPrincipal, authorizeRoute } from './route-policy.js';
+import type { WorkerTrustRepository } from './trust-store.js';
 
 export interface WorkerEventRecord {
   readonly seq: string;
@@ -71,8 +72,8 @@ export interface WorkerServerConfig {
   readonly key: Buffer;
   readonly cert: Buffer;
   readonly ca: Buffer;
-  readonly pairedControllers: ReadonlyMap<string, string>;
-  readonly revokedFingerprints?: ReadonlySet<string>;
+  /** Single service-owned repository; all supported operator mutations use this instance. */
+  readonly trust: WorkerTrustRepository;
   readonly handlers: WorkerApiHandlers;
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
   readonly inputRoot: string;
@@ -100,17 +101,6 @@ const MAX_SQLITE_SEQUENCE = '9223372036854775807';
 const MAX_REQUEST_HEADER_FIELDS = 64;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
 
-// Transitional operator-supplied pairing records grant this explicit fixed set.
-// The persistent trust resolver supplies per-request permissions in the next slice.
-const PAIRED_PERMISSIONS: AuthenticatedPrincipal['permissions'] = [
-  'capabilities:read',
-  'input-bundles:write',
-  'runs:start',
-  'runs:read',
-  'runs:stop',
-  'events:read',
-  'artifacts:read',
-];
 const SAFE_ERROR_CODES = new Map([
   [400, 'invalid_request'],
   [401, 'unauthorized'],
@@ -341,15 +331,12 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     requestLimit > MAX_ARCHIVE_BYTES
   )
     throw new RangeError('invalid request size limit');
-  const pairedControllers = new Map<string, string>();
-  for (const [fingerprint, controllerId] of config.pairedControllers) {
-    const normalized = fingerprint.replaceAll(':', '').toLowerCase();
-    if (!FINGERPRINT.test(normalized) || !isNonNilUuid(controllerId))
-      throw new TypeError('invalid paired controller certificate record');
-    if (pairedControllers.has(normalized))
-      throw new TypeError('duplicate paired certificate fingerprint');
-    pairedControllers.set(normalized, controllerId);
-  }
+  if (
+    !config.trust ||
+    typeof config.trust.resolveFingerprint !== 'function' ||
+    typeof config.trust.subscribe !== 'function'
+  )
+    throw new TypeError('live worker trust repository is required');
   if (typeof config.ensureInputCapacity !== 'function')
     throw new TypeError('input bundle disk capacity check is required');
   validateEndpointCertificate(config.cert, 'server');
@@ -366,7 +353,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   )
     throw new RangeError('invalid worker shutdown timeout');
   const activeWork = new Set<Promise<void>>();
-  type Connection = { socket: Socket; lease: SocketLease; requests: number };
+  type Connection = { socket: Socket; lease: SocketLease; requests: number; fingerprint?: string };
   const connections = new Map<string, Connection>();
   const socketKey = (socket: Socket): string =>
     JSON.stringify([
@@ -449,25 +436,24 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
         const socket = request.socket as TLSSocket;
         const peer = socket.getPeerCertificate(true);
         if (!socket.authorized || !peer.raw) rejectRequest(401);
-        let fingerprint: string;
+        let principal: AuthenticatedPrincipal;
         try {
           validateEndpointCertificate(peer.raw, 'client');
-          fingerprint = authorizePairedCertificate(
+          const record = authorizePairedCertificate(
             peerIdentity(peer, socket.authorized),
-            new Set(pairedControllers.keys()),
-            config.revokedFingerprints ?? new Set(),
+            config.trust,
           );
+          principal = {
+            controllerId: record.controllerId,
+            fingerprint: record.fingerprint,
+            permissions: record.permissions,
+          };
+          connection.fingerprint = record.fingerprint;
         } catch {
           rejectRequest(401);
         }
-        const controllerId = pairedControllers.get(fingerprint);
-        if (!controllerId || !isNonNilUuid(controllerId)) rejectRequest(401);
+        const controllerId = principal.controllerId;
         assertProtocolVersion(request.headers['x-sf-protocol-version']);
-        const principal: AuthenticatedPrincipal = {
-          controllerId,
-          fingerprint,
-          permissions: PAIRED_PERMISSIONS,
-        };
         const target = request.url ?? '';
         const pathname = target.split('?')[0] ?? '';
         // Authorize the original target first: URL would normalize dot segments and hide aliases.
@@ -686,7 +672,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       socket.destroy();
       return;
     }
-    const connection = { socket, lease, requests: 0 };
+    const connection: Connection = { socket, lease, requests: 0 };
     connections.set(key, connection);
     socket.once('close', () => {
       lease.release();
@@ -701,6 +687,12 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       return;
     }
     connection.lease.secure();
+    const peerFingerprint = socket
+      .getPeerCertificate(true)
+      .fingerprint256?.replaceAll(':', '')
+      .toLowerCase();
+    if (peerFingerprint && FINGERPRINT.test(peerFingerprint))
+      connection.fingerprint = peerFingerprint;
     socket.on('data', () => connection.lease.touch());
     socket.once('close', () => {
       connection.lease.release();
@@ -721,15 +713,39 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   server.keepAliveTimeout = Math.min(5_000, admissionPolicy.idleTimeoutMs);
   server.maxHeadersCount = MAX_REQUEST_HEADER_FIELDS;
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(config.port, config.host, () => {
-      server.off('error', reject);
-      resolve();
-    });
+  const unsubscribeTrust = config.trust.subscribe((change) => {
+    for (const fingerprint of change.fingerprints) {
+      let authorized = false;
+      try {
+        authorized = config.trust.resolveFingerprint(fingerprint, new Date()) !== null;
+      } catch {
+        /* Trust lookup failure denies continued socket use. */
+      }
+      if (authorized) continue;
+      for (const connection of connections.values())
+        if (connection.fingerprint === fingerprint) {
+          connection.lease.release();
+          connection.socket.destroy();
+        }
+    }
   });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(config.port, config.host, () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    unsubscribeTrust();
+    admission.close();
+    throw error;
+  }
   const address = server.address();
   if (!address || typeof address === 'string') {
+    unsubscribeTrust();
+    admission.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     throw new Error('worker server did not bind a TCP address');
   }
@@ -740,6 +756,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     },
     close: () => {
       if (!closing) {
+        unsubscribeTrust();
         admission.close();
         closing = (async () => {
           await new Promise<void>((resolve, reject) =>

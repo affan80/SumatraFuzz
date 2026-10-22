@@ -29,6 +29,7 @@ export interface TrustRevisionChange {
 }
 export interface WorkerTrustRepository {
   readonly revision: number;
+  close(): void;
   subscribe(listener: (change: TrustRevisionChange) => void): () => void;
   resolveFingerprint(fingerprint: string, now: Date): TrustRecord | null;
   listActive(): readonly TrustRecord[];

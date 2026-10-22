@@ -1,15 +1,17 @@
 import { X509Certificate } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { Agent, request as httpsRequest } from 'node:https';
 import { connect as netConnect } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import type { TLSSocket } from 'node:tls';
 import { connect } from 'node:tls';
 import { createTlsFixture, issueCertificate } from '@sumatrafuzz/worker-security/test-fixtures';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, type Mock, vi } from 'vitest';
 import { ZipFile } from 'yazl';
 import { type AdmissionPolicy, PROVISIONAL_ADMISSION_POLICY } from '../src/admission.js';
+import { createWorkerApplication } from '../src/application.js';
 import {
   assertProtocolVersion,
   createExclusiveRequestGate,
@@ -20,6 +22,7 @@ import {
   serializeBoundedJson,
   validateStartRequest,
 } from '../src/server.js';
+import { SqliteWorkerTrustStore, type TrustPermission } from '../src/trust-store.js';
 
 function authenticatedGet(
   baseUrl: string,
@@ -132,6 +135,62 @@ function safeError(result: { status: number; body: Buffer }, status: number, cod
   return decoded;
 }
 
+const allPermissions: readonly TrustPermission[] = [
+  'capabilities:read',
+  'input-bundles:write',
+  'runs:start',
+  'runs:read',
+  'runs:stop',
+  'events:read',
+  'artifacts:read',
+];
+function trustInput(cert: Buffer, controllerId: string, permissions = allPermissions) {
+  const leaf = new X509Certificate(cert);
+  return {
+    fingerprint: leaf.fingerprint256.replaceAll(':', '').toLowerCase(),
+    controllerId,
+    permissions,
+    notBefore: new Date(leaf.validFrom).toISOString(),
+    notAfter: new Date(leaf.validTo).toISOString(),
+  };
+}
+function persistentTrust(root: string, entries: readonly (readonly [Buffer, string])[]) {
+  const trust = SqliteWorkerTrustStore.open(path.join(root, 'trust.db'));
+  for (const [cert, controller] of entries) trust.provision(trustInput(cert, controller));
+  return trust;
+}
+function keepAliveClient(address: string, tls: Awaited<ReturnType<typeof createTlsFixture>>) {
+  const agent = new Agent({
+    keepAlive: true,
+    maxSockets: 1,
+    ca: tls.ca,
+    cert: tls.clientCert,
+    key: tls.clientKey,
+  });
+  return {
+    close: () => agent.destroy(),
+    get: (
+      pathname = '/v1/capabilities',
+    ): Promise<{ status: number; socket: TLSSocket; reused: boolean }> =>
+      new Promise((resolve, reject) => {
+        const request = httpsRequest(
+          new URL(pathname, address),
+          { agent, headers: { 'x-sf-protocol-version': '1' } },
+          (response) => {
+            const socket = request.socket as TLSSocket;
+            response.resume();
+            response.on('error', reject);
+            response.on('end', () =>
+              resolve({ status: response.statusCode ?? 0, socket, reused: request.reusedSocket }),
+            );
+          },
+        );
+        request.on('error', reject);
+        request.end();
+      }),
+  };
+}
+
 async function withApiFixture(
   test: (fixture: {
     root: string;
@@ -139,9 +198,12 @@ async function withApiFixture(
     tlsA: Awaited<ReturnType<typeof createTlsFixture>>;
     tlsB: Awaited<ReturnType<typeof createTlsFixture>>;
     handlers: {
-      [K in keyof import('../src/server.js').WorkerApiHandlers]: ReturnType<typeof vi.fn>;
+      [K in keyof import('../src/server.js').WorkerApiHandlers]: Mock<
+        import('../src/server.js').WorkerApiHandlers[K]
+      >;
     };
     ownsRun: ReturnType<typeof vi.fn>;
+    trust: SqliteWorkerTrustStore;
   }) => Promise<void>,
   admissionPolicy?: AdmissionPolicy,
 ) {
@@ -177,6 +239,10 @@ async function withApiFixture(
       bytes: Buffer.from('pdf'),
     })),
   };
+  const trust = persistentTrust(root, [
+    [tlsA.clientCert, controllerA],
+    [tlsB.clientCert, controllerB],
+  ]);
   const server = await createWorkerServer({
     host: '127.0.0.1',
     mode: 'local',
@@ -185,10 +251,7 @@ async function withApiFixture(
     key: tlsA.workerKey,
     cert: tlsA.workerCert,
     ca: tlsA.ca,
-    pairedControllers: new Map([
-      [tlsA.fingerprint, controllerA],
-      [new X509Certificate(second.cert).fingerprint256, controllerB],
-    ]),
+    trust,
     inputRoot: root,
     ensureInputCapacity: async () => {},
     maxInputBundleBytes: 64 * 1024 * 1024,
@@ -197,9 +260,10 @@ async function withApiFixture(
     handlers,
   });
   try {
-    await test({ root, server, tlsA, tlsB, handlers, ownsRun });
+    await test({ root, server, tlsA, tlsB, handlers, ownsRun, trust });
   } finally {
     await server.close();
+    trust.close();
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -213,6 +277,227 @@ function deferred<T>() {
 }
 
 describe('worker API contract', () => {
+  it('closes an already reused keep-alive TLS socket immediately after committed revocation', async () => {
+    await withApiFixture(async ({ server, tlsA, tlsB, trust, handlers }) => {
+      const client = keepAliveClient(server.address, tlsA);
+      try {
+        const first = await client.get();
+        const second = await client.get();
+        expect(second.reused).toBe(true);
+        expect(second.socket).toBe(first.socket);
+        trust.revoke(tlsA.fingerprint);
+        await vi.waitFor(() => expect(first.socket.destroyed).toBe(true));
+        const denied = await client.get().catch(() => ({ status: 0 }));
+        expect(denied.status).not.toBe(200);
+        expect(handlers.capabilities).toHaveBeenCalledTimes(2);
+        expect((await apiRequest(server.address, tlsB, 'GET', '/v1/capabilities')).status).toBe(
+          200,
+        );
+        expect(handlers.stopRun).not.toHaveBeenCalled();
+      } finally {
+        client.close();
+      }
+    });
+  });
+
+  it('rereads durable trust on each request of the same TLS session even without a notification', async () => {
+    await withApiFixture(async ({ root, server, tlsA, handlers }) => {
+      const client = keepAliveClient(server.address, tlsA);
+      const otherHandle = SqliteWorkerTrustStore.open(path.join(root, 'trust.db'));
+      try {
+        const first = await client.get();
+        expect(first.status).toBe(200);
+        otherHandle.revoke(tlsA.fingerprint);
+        const denied = await client.get();
+        expect(denied.reused).toBe(true);
+        expect(denied.socket).toBe(first.socket);
+        expect(denied.status).toBe(401);
+        expect(handlers.capabilities).toHaveBeenCalledOnce();
+      } finally {
+        client.close();
+        otherHandle.close();
+      }
+    });
+  });
+
+  it('keeps both rotation generations during overlap and disconnects only a revoked generation', async () => {
+    await withApiFixture(async ({ root, server, tlsA, trust, handlers }) => {
+      const replacement = await issueCertificate(
+        root,
+        'rotation-client',
+        'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n',
+      );
+      const old = keepAliveClient(server.address, tlsA);
+      const fresh = keepAliveClient(server.address, {
+        ...tlsA,
+        clientCert: replacement.cert,
+        clientKey: replacement.key,
+      });
+      try {
+        const first = await old.get();
+        const clock = new Date();
+        const next = trust.rotate(
+          trustInput(replacement.cert, controllerA, ['capabilities:read']),
+          new Date(clock.getTime() + 60_000),
+          clock,
+        );
+        expect((await old.get()).socket).toBe(first.socket);
+        const nextRequest = await fresh.get();
+        expect(nextRequest.status).toBe(200);
+        expect((await fresh.get(`/v1/runs/${ownedRun}`)).status).toBe(404);
+        trust.revoke(tlsA.fingerprint);
+        await vi.waitFor(() => expect(first.socket.destroyed).toBe(true));
+        const stillAllowed = await fresh.get();
+        expect(stillAllowed.socket).toBe(nextRequest.socket);
+        expect(stillAllowed.status).toBe(200);
+        expect(trust.resolveFingerprint(next.fingerprint, new Date())?.controllerId).toBe(
+          controllerA,
+        );
+        trust.unpair(controllerA);
+        await vi.waitFor(() => expect(nextRequest.socket.destroyed).toBe(true));
+        expect(handlers.getRun).not.toHaveBeenCalled();
+        expect(handlers.stopRun).not.toHaveBeenCalled();
+      } finally {
+        old.close();
+        fresh.close();
+      }
+    });
+  });
+
+  it('denies the old generation on its existing TLS session once overlap expires', async () => {
+    await withApiFixture(async ({ root, server, tlsA, trust }) => {
+      const replacement = await issueCertificate(
+        root,
+        'expiry-client',
+        'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n',
+      );
+      const client = keepAliveClient(server.address, tlsA);
+      try {
+        const first = await client.get();
+        const clock = new Date();
+        trust.rotate(
+          trustInput(replacement.cert, controllerA),
+          new Date(clock.getTime() + 200),
+          clock,
+        );
+        expect((await client.get()).status).toBe(200);
+        await vi.waitFor(() =>
+          expect(trust.resolveFingerprint(tlsA.fingerprint, new Date())).toBeNull(),
+        );
+        const denied = await client.get();
+        expect(denied.socket).toBe(first.socket);
+        expect(denied.reused).toBe(true);
+        expect(denied.status).toBe(401);
+      } finally {
+        client.close();
+      }
+    });
+  });
+
+  it('continues to deny persisted revocation after repository and server restart', async () => {
+    await withApiFixture(async ({ root, server, tlsA, trust, handlers, ownsRun }) => {
+      expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(200);
+      trust.revoke(tlsA.fingerprint);
+      await server.close();
+      trust.close();
+      const reopened = SqliteWorkerTrustStore.open(path.join(root, 'trust.db'));
+      const restarted = await createWorkerServer({
+        host: '127.0.0.1',
+        mode: 'local',
+        port: 0,
+        workerId,
+        key: tlsA.workerKey,
+        cert: tlsA.workerCert,
+        ca: tlsA.ca,
+        trust: reopened,
+        inputRoot: root,
+        ensureInputCapacity: async () => {},
+        maxInputBundleBytes: 1024,
+        store: { ownsRun: ownsRun as never },
+        handlers,
+      });
+      try {
+        expect((await apiRequest(restarted.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+          401,
+        );
+        expect(handlers.capabilities).toHaveBeenCalledOnce();
+      } finally {
+        await restarted.close();
+        reopened.close();
+      }
+    });
+  });
+
+  it('unsubscribes its committed-trust observer on server close', async () => {
+    await withApiFixture(async ({ server, trust }) => {
+      await server.close();
+      const unsubscribers = [];
+      for (let n = 0; n < 16; n++) unsubscribers.push(trust.subscribe(() => {}));
+      expect(() => trust.subscribe(() => {})).toThrow();
+      for (const unsubscribe of unsubscribers) unsubscribe();
+    });
+  });
+
+  it('keeps trust and campaign stores open through drain, then closes both after application shutdown', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'sf-app-trust-drain-'));
+    const tls = await createTlsFixture(root);
+    const trust = persistentTrust(root, [[tls.clientCert, controllerA]]);
+    const policy = {
+      maxLimits: startRequest.limits,
+      pinnedTargetLockSha256: 'a'.repeat(64),
+      pinnedA4ManifestSha256: 'b'.repeat(64),
+      targetLockPath: path.join(root, 'target.lock'),
+      a4ManifestPath: path.join(root, 'a4.json'),
+      harnessPath: path.join(root, 'harness.exe'),
+      allowedBinaryRoot: root,
+      allowedToolRoot: root,
+      allowedInputRoot: root,
+      outputRoot: path.join(root, 'outputs'),
+    };
+    const app = await createWorkerApplication({
+      host: '127.0.0.1',
+      mode: 'local',
+      port: 0,
+      workerId,
+      key: tls.workerKey,
+      cert: tls.workerCert,
+      ca: tls.ca,
+      trust,
+      inputRoot: root,
+      databasePath: path.join(root, 'runs.db'),
+      policy,
+      supervisor: {} as never,
+      readWorkerVolumeUsage: async () => ({
+        quota_bytes: startRequest.limits.max_disk_bytes,
+        used_bytes: 0,
+        available_bytes: startRequest.limits.max_disk_bytes,
+      }),
+    });
+    const pending = deferred<unknown>();
+    const dispatch = vi
+      .spyOn(app.coordinator, 'capabilities')
+      .mockImplementationOnce(() => pending.promise);
+    const request = apiRequest(app.server.address, tls, 'GET', '/v1/capabilities').catch(() => ({
+      status: 0,
+    }));
+    try {
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+      const closing = app.close();
+      await request;
+      expect(trust.revision).toBe(1);
+      expect(app.store.activeRunSnapshot()).toBeNull();
+      pending.resolve({ ready: true });
+      await closing;
+      expect(() => trust.revision).toThrow();
+      expect(() => app.store.activeRunSnapshot()).toThrow();
+    } finally {
+      pending.resolve({ ready: true });
+      await app.close();
+      trust.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('denies per-controller and global work before dispatch and returns capacity after completion', async () => {
     await withApiFixture(
       async ({ server, tlsA, tlsB, handlers }) => {
@@ -914,6 +1199,7 @@ describe('worker API contract', () => {
       stop_reason: null,
     };
     let currentRun: unknown = activeStatus;
+    const trust = persistentTrust(root, [[tls.clientCert, controllerId]]);
     const server = await createWorkerServer({
       host: '127.0.0.1',
       mode: 'local',
@@ -922,7 +1208,7 @@ describe('worker API contract', () => {
       key: tls.workerKey,
       cert: tls.workerCert,
       ca: tls.ca,
-      pairedControllers: new Map([[tls.fingerprint, controllerId]]),
+      trust,
       inputRoot: root,
       ensureInputCapacity: async () => {},
       maxInputBundleBytes: 64 * 1024 * 1024,
@@ -963,6 +1249,7 @@ describe('worker API contract', () => {
       expect(empty.body).toEqual({ active_run: null });
     } finally {
       await server.close();
+      trust.close();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -998,6 +1285,13 @@ describe('worker API contract', () => {
     const other = await createTlsFixture(otherRoot);
     cases.push({ cert: other.clientCert, key: other.clientKey });
     let dispatches = 0;
+    const trust = persistentTrust(
+      root,
+      [tls.clientCert, ...cases.map((item) => item.cert)].map((cert, index) => [
+        cert,
+        `22222222-2222-4222-8222-${String(index + 1).padStart(12, '0')}`,
+      ]),
+    );
     const server = await createWorkerServer({
       host: '127.0.0.1',
       mode: 'local',
@@ -1006,12 +1300,7 @@ describe('worker API contract', () => {
       cert: tls.workerCert,
       key: tls.workerKey,
       ca: tls.ca,
-      pairedControllers: new Map(
-        [tls.clientCert, ...cases.map((item) => item.cert)].map((cert) => [
-          new X509Certificate(cert).fingerprint256,
-          '22222222-2222-4222-8222-222222222222',
-        ]),
-      ),
+      trust,
       inputRoot: root,
       ensureInputCapacity: async () => {},
       maxInputBundleBytes: 1024,
@@ -1038,6 +1327,7 @@ describe('worker API contract', () => {
       expect(dispatches).toBe(0);
     } finally {
       await server.close();
+      trust.close();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1122,7 +1412,7 @@ describe('worker API contract', () => {
     );
   });
 
-  it('fails before listening when the binding, pairing records, or worker identity are unsafe', async () => {
+  it('fails before listening when the binding, trust authority, or worker identity are unsafe', async () => {
     const base = {
       host: '127.0.0.1',
       mode: 'local' as const,
@@ -1131,7 +1421,7 @@ describe('worker API contract', () => {
       key: Buffer.alloc(0),
       cert: Buffer.alloc(0),
       ca: Buffer.alloc(0),
-      pairedControllers: new Map<string, string>(),
+      trust: {} as never,
       inputRoot: '/unused',
       ensureInputCapacity: async () => {},
       maxInputBundleBytes: 64 * 1024 * 1024,
@@ -1142,17 +1432,9 @@ describe('worker API contract', () => {
       /private|VPN/i,
     );
     await expect(createWorkerServer({ ...base, workerId: 'bad' })).rejects.toThrow(/UUID/i);
+    await expect(createWorkerServer(base)).rejects.toThrow(/trust/i);
     await expect(
-      createWorkerServer({
-        ...base,
-        pairedControllers: new Map([['not-a-fingerprint', '11111111-1111-4111-8111-111111111111']]),
-      }),
-    ).rejects.toThrow(/paired controller/i);
-    await expect(
-      createWorkerServer({
-        ...base,
-        pairedControllers: new Map([['a'.repeat(64), '00000000-0000-0000-0000-000000000000']]),
-      }),
-    ).rejects.toThrow(/paired controller/i);
+      createWorkerServer({ ...base, trust: { resolveFingerprint: () => null } as never }),
+    ).rejects.toThrow(/trust/i);
   });
 });

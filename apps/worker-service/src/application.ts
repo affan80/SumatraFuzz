@@ -10,7 +10,10 @@ import { type WorkerCoordinatorConfig, WorkerRunCoordinator } from './run-coordi
 import { createWorkerServer, type WorkerServer, type WorkerServerConfig } from './server.js';
 
 export interface WorkerApplicationConfig
-  extends Omit<WorkerServerConfig, 'handlers' | 'store'>,
+  extends Omit<
+      WorkerServerConfig,
+      'handlers' | 'store' | 'ensureInputCapacity' | 'maxInputBundleBytes'
+    >,
     Omit<
       WorkerCoordinatorConfig,
       'workerId' | 'store' | 'evidence' | 'policy' | 'supervisor' | 'measureWorkerVolumeUsedBytes'
@@ -81,10 +84,7 @@ export async function createWorkerApplication(
       key: config.key,
       cert: config.cert,
       ca: config.ca,
-      pairedControllers: config.pairedControllers,
-      ...(config.revokedFingerprints === undefined
-        ? {}
-        : { revokedFingerprints: config.revokedFingerprints }),
+      trust: config.trust,
       handlers: coordinator,
       store,
       inputRoot: config.inputRoot,
@@ -111,10 +111,12 @@ export async function createWorkerApplication(
         // Closing it while an admitted handler can still resume would corrupt recovery state.
         await server.close();
         store.close();
+        config.trust.close();
       },
     };
   } catch (error) {
     store.close();
+    config.trust.close();
     throw error;
   }
 }
