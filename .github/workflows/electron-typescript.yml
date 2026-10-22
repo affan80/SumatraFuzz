@@ -39,6 +39,8 @@ jobs:
         run: npm run native:supervisor:build
       - name: Test native supervisor argument contract
         run: npm run native:supervisor:contract
+      - name: Test worker API security boundaries
+        run: npm run test:worker-api-security
       - name: Test Windows supervisor as a standard user
         if: runner.os == 'Windows'
         shell: pwsh

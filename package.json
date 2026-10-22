@@ -27,6 +27,7 @@
     "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
     "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
     "native:supervisor:contract": "cmake -S native/worker-supervisor -B build/worker-supervisor && cmake --build build/worker-supervisor --config Debug && ctest --test-dir build/worker-supervisor -C Debug --output-on-failure",
+    "test:worker-api-security": "vitest run packages/worker-security/test/certificate-policy.test.ts apps/worker-service/test/route-policy.test.ts apps/worker-service/test/admission.test.ts apps/worker-service/test/server-contract.test.ts apps/worker-service/test/run-coordinator.test.ts packages/worker-client/test/client.test.ts",
     "audit:production": "npm audit --omit=dev --audit-level=moderate",
     "test": "vitest run && node --test test/*.check.cjs",
     "test:watch": "vitest",
