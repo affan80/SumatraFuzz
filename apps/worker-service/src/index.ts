@@ -24,3 +24,13 @@ export {
   type WorkerServer,
   type WorkerServerConfig,
 } from './server.js';
+export {
+  SqliteWorkerTrustStore,
+  type TrustPermission,
+  type TrustProvisionInput,
+  type TrustRecord,
+  TrustStoreError,
+  type TrustStoreErrorCode,
+  type TrustStoreOpenOptions,
+  type WorkerTrustRepository,
+} from './trust-store.js';
