@@ -96,6 +96,10 @@ export async function createWorkerApplication(
       },
       maxInputBundleBytes: config.policy.maxLimits.max_disk_bytes,
       ...(config.maxRequestBytes === undefined ? {} : { maxRequestBytes: config.maxRequestBytes }),
+      ...(config.admissionPolicy === undefined ? {} : { admissionPolicy: config.admissionPolicy }),
+      ...(config.shutdownTimeoutMs === undefined
+        ? {}
+        : { shutdownTimeoutMs: config.shutdownTimeoutMs }),
     });
     return {
       server,
@@ -103,11 +107,10 @@ export async function createWorkerApplication(
       coordinator,
       startupRecovery,
       close: async () => {
-        try {
-          await server.close();
-        } finally {
-          store.close();
-        }
+        // A timed-out drain leaves SQLite open; the service host will force-stop this process.
+        // Closing it while an admitted handler can still resume would corrupt recovery state.
+        await server.close();
+        store.close();
       },
     };
   } catch (error) {

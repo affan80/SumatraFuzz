@@ -80,6 +80,7 @@ export interface WorkerServerConfig {
   readonly maxInputBundleBytes: number;
   readonly maxRequestBytes?: number;
   readonly admissionPolicy?: AdmissionPolicy;
+  readonly shutdownTimeoutMs?: number;
 }
 
 export interface WorkerServer {
@@ -97,6 +98,7 @@ const WORKER_PROTOCOL_VERSION = '1';
 const FINGERPRINT = /^[0-9a-f]{64}$/i;
 const MAX_SQLITE_SEQUENCE = '9223372036854775807';
 const MAX_REQUEST_HEADER_FIELDS = 64;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
 
 // Transitional operator-supplied pairing records grant this explicit fixed set.
 // The persistent trust resolver supplies per-request permissions in the next slice.
@@ -356,6 +358,14 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     ...(config.admissionPolicy ?? PROVISIONAL_ADMISSION_POLICY),
   });
   const admission = createAdmissionController(admissionPolicy);
+  const shutdownTimeoutMs = config.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(shutdownTimeoutMs) ||
+    shutdownTimeoutMs < 1 ||
+    shutdownTimeoutMs > 120_000
+  )
+    throw new RangeError('invalid worker shutdown timeout');
+  const activeWork = new Set<Promise<void>>();
   type Connection = { socket: Socket; lease: SocketLease; requests: number };
   const connections = new Map<string, Connection>();
   const socketKey = (socket: Socket): string =>
@@ -420,7 +430,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
         lease.assertActive();
         return result;
       };
-      void (async () => {
+      const work = (async () => {
         if (!connection?.lease.active) {
           request.destroy();
           return;
@@ -665,6 +675,8 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           workDone = true;
           release();
         });
+      activeWork.add(work);
+      void work.then(() => activeWork.delete(work));
     },
   );
   server.on('connection', (socket: Socket) => {
@@ -729,9 +741,30 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     close: () => {
       if (!closing) {
         admission.close();
-        closing = new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve())),
-        );
+        closing = (async () => {
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+          const deadline = performance.now() + shutdownTimeoutMs;
+          while (activeWork.size > 0) {
+            const remainingMs = deadline - performance.now();
+            if (remainingMs <= 0) throw new Error('worker request drain timed out');
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                Promise.allSettled([...activeWork]),
+                new Promise<never>((_resolve, reject) => {
+                  timeout = setTimeout(
+                    () => reject(new Error('worker request drain timed out')),
+                    remainingMs,
+                  );
+                }),
+              ]);
+            } finally {
+              if (timeout) clearTimeout(timeout);
+            }
+          }
+        })();
       }
       return closing;
     },

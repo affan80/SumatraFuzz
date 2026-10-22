@@ -408,6 +408,32 @@ describe('worker API contract', () => {
     },
   );
 
+  it('waits for dispatched handler work before resolving server shutdown', async () => {
+    await withApiFixture(
+      async ({ server, tlsA, handlers }) => {
+        const pending = deferred<{ ready: boolean }>();
+        handlers.capabilities.mockImplementationOnce(() => pending.promise);
+        const request = apiRequest(server.address, tlsA, 'GET', '/v1/capabilities').catch(() => ({
+          status: 0,
+        }));
+        await vi.waitFor(() => expect(handlers.capabilities).toHaveBeenCalledOnce());
+
+        let closeResolved = false;
+        const closing = server.close().then(() => {
+          closeResolved = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(closeResolved).toBe(false);
+
+        pending.resolve({ ready: true });
+        await closing;
+        await request;
+        expect(closeResolved).toBe(true);
+      },
+      { ...PROVISIONAL_ADMISSION_POLICY, requestTimeoutMs: 100 },
+    );
+  });
+
   it('bounds initial sockets and incomplete TLS headers with local connections', async () => {
     await withApiFixture(
       async ({ server, tlsA, handlers }) => {
