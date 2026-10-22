@@ -22,8 +22,14 @@ export interface TrustRecord extends TrustProvisionInput {
   readonly generation: number;
   readonly revision: number;
 }
+export interface TrustRevisionChange {
+  readonly revision: number;
+  /** Previously installed fingerprints whose authorization may have changed (at most two). */
+  readonly fingerprints: readonly string[];
+}
 export interface WorkerTrustRepository {
   readonly revision: number;
+  subscribe(listener: (change: TrustRevisionChange) => void): () => void;
   resolveFingerprint(fingerprint: string, now: Date): TrustRecord | null;
   listActive(): readonly TrustRecord[];
   provision(input: TrustProvisionInput): TrustRecord;
@@ -161,6 +167,7 @@ function record(row: CertificateRow, revision: number): TrustRecord {
 
 /** Operator-only persistence. Callers must verify signed provisioning evidence first. */
 export class SqliteWorkerTrustStore implements WorkerTrustRepository {
+  private readonly listeners = new Set<(change: TrustRevisionChange) => void>();
   private constructor(
     private readonly db: Handle,
     private readonly maxOverlapMs: number,
@@ -211,9 +218,21 @@ export class SqliteWorkerTrustStore implements WorkerTrustRepository {
   close(): void {
     try {
       if (this.db.open) this.db.close();
+      this.listeners.clear();
     } catch (error) {
       throw wrap(error);
     }
+  }
+  /** All service mutations must use this instance; external-process writes do not publish events. */
+  subscribe(listener: (change: TrustRevisionChange) => void): () => void {
+    if (typeof listener !== 'function') invalid();
+    if (!this.db.open) throw new TrustStoreError('database');
+    if (this.listeners.size >= 16) throw new TrustStoreError('capacity');
+    const subscriber = (change: TrustRevisionChange) => listener(change);
+    this.listeners.add(subscriber);
+    return () => {
+      this.listeners.delete(subscriber);
+    };
   }
   get revision(): number {
     try {
@@ -398,14 +417,50 @@ export class SqliteWorkerTrustStore implements WorkerTrustRepository {
   }
   private mutate<T>(operation: () => T): T {
     try {
-      return this.db
+      const result = this.db
         .transaction(() => {
           this.validateIntegrity();
+          const previousRevision = this.revision;
+          const installed = new Set(
+            (
+              this.db
+                .prepare("SELECT fingerprint FROM trust_certificates WHERE status = 'active'")
+                .all() as { fingerprint: string }[]
+            ).map((row) => row.fingerprint),
+          );
           const value = operation();
           this.validateIntegrity();
-          return value;
+          const revision = this.revision;
+          if (revision === previousRevision) return { value, change: undefined };
+          const changed = (
+            this.db
+              .prepare(
+                'SELECT fingerprint FROM trust_certificates WHERE revision = ? ORDER BY fingerprint',
+              )
+              .all(revision) as { fingerprint: string }[]
+          ).map((row) => row.fingerprint);
+          // A rotation can retire two old generations and add a third fingerprint.
+          // Only the previously installed fingerprints can own established sockets.
+          const previous = changed.filter((fingerprint) => installed.has(fingerprint));
+          const fingerprints = previous.length > 0 ? previous : changed;
+          if (fingerprints.length > 2) throw new TrustStoreError('corrupt');
+          const change: TrustRevisionChange = Object.freeze({
+            revision,
+            fingerprints: Object.freeze(fingerprints),
+          });
+          return { value, change };
         })
         .immediate();
+      // Notification follows SQLite commit; listener failures never change the committed outcome.
+      if (result.change)
+        for (const listener of [...this.listeners]) {
+          try {
+            listener(result.change);
+          } catch {
+            /* Listener health is not trust authority. */
+          }
+        }
+      return result.value;
     } catch (error) {
       throw wrap(error);
     }

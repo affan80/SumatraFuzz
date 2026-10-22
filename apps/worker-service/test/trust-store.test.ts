@@ -297,3 +297,83 @@ describe('trust database integrity', () => {
     expect(() => open(name)).toThrow(expect.objectContaining({ code: 'corrupt' }));
   });
 });
+
+describe('bounded committed trust notifications', () => {
+  it('publishes immutable revision changes only after the mutation is visible to another handle', async () => {
+    const name = await file();
+    const store = open(name);
+    const changes: unknown[] = [];
+    const unsubscribe = store.subscribe((change) => {
+      const second = open(name);
+      expect(second.revision).toBe(change.revision);
+      expect(Object.isFrozen(change)).toBe(true);
+      expect(Object.isFrozen(change.fingerprints)).toBe(true);
+      changes.push(change);
+    });
+    store.provision(input());
+    expect(changes).toEqual([{ revision: 1, fingerprints: [fingerprint()] }]);
+    store.revoke(fingerprint());
+    store.revoke(fingerprint());
+    expect(changes).toHaveLength(2);
+    unsubscribe();
+    store.unpair(controller());
+    expect(changes).toHaveLength(2);
+  });
+
+  it('isolates listener failures and caps subscriptions at 16', async () => {
+    const store = open(await file());
+    const remove = store.subscribe(() => {
+      throw new Error('listener failure');
+    });
+    for (let n = 1; n < 16; n++) store.subscribe(() => {});
+    expect(() => store.subscribe(() => {})).toThrow();
+    expect(store.provision(input()).revision).toBe(1);
+    remove();
+    expect(() => store.subscribe(() => {})).not.toThrow();
+  });
+
+  it('never publishes a rejected or rolled-back rotation', async () => {
+    const name = await file();
+    const store = open(name);
+    store.provision(input());
+    const changes: unknown[] = [];
+    store.subscribe((change) => changes.push(change));
+    const db = new Database(name);
+    db.exec(
+      "CREATE TRIGGER notification_failure BEFORE INSERT ON trust_certificates BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+    );
+    expect(() =>
+      store.rotate(
+        input(2, { controllerId: controller() }),
+        new Date('2026-10-22T13:00:00.000Z'),
+        now,
+      ),
+    ).toThrow();
+    db.close();
+    expect(changes).toEqual([]);
+    expect(store.revision).toBe(1);
+  });
+
+  it('bounds rotation and unpair notifications to the two previously installed fingerprints', async () => {
+    const store = open(await file());
+    store.provision(input());
+    store.rotate(
+      input(2, { controllerId: controller() }),
+      new Date('2026-10-22T13:00:00.000Z'),
+      now,
+    );
+    const changes: unknown[] = [];
+    store.subscribe((change) => changes.push(change));
+    store.rotate(
+      input(3, { controllerId: controller() }),
+      new Date('2026-10-22T14:00:00.000Z'),
+      new Date('2026-10-22T13:00:00.000Z'),
+    );
+    expect(changes).toEqual([{ revision: 3, fingerprints: [fingerprint(), fingerprint(2)] }]);
+    store.unpair(controller());
+    expect(changes).toEqual([
+      { revision: 3, fingerprints: [fingerprint(), fingerprint(2)] },
+      { revision: 4, fingerprints: [fingerprint(2), fingerprint(3)] },
+    ]);
+  });
+});
