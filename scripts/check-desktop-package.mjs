@@ -8,6 +8,7 @@ const ALLOWED_ROOTS = [
   'dist/',
   'node_modules/@sumatrafuzz/worker-client/',
   'node_modules/@sumatrafuzz/worker-protocol/',
+  'node_modules/@sumatrafuzz/worker-security/',
   'node_modules/@sinclair/typebox/',
   'node_modules/ajv/',
   'node_modules/ajv-formats/',

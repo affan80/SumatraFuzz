@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
-const { existsSync, readFileSync } = require('node:fs');
+const { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { execFileSync } = require('node:child_process');
+const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
@@ -55,4 +57,43 @@ test('desktop runtime imports compiled workspace JavaScript instead of TypeScrip
     pathToFileURL(path.join(desktopRoot, 'dist', 'src', 'main', 'worker-profile-store.js'))
   );
   await import(pathToFileURL(path.join(desktopRoot, 'dist', 'src', 'main', 'worker-bundle.js')));
+});
+
+test('staged desktop worker client imports without repository workspace resolution', () => {
+  execFileSync(process.execPath, [path.join(repositoryRoot, 'scripts/stage-desktop-package.mjs')], {
+    cwd: repositoryRoot,
+    stdio: 'pipe',
+  });
+  const isolatedRoot = mkdtempSync(path.join(os.tmpdir(), 'sf-packaged-runtime-'));
+  try {
+    cpSync(
+      path.join(desktopRoot, '.package-stage', 'node_modules'),
+      path.join(isolatedRoot, 'node_modules'),
+      {
+        recursive: true,
+        dereference: true,
+      },
+    );
+    writeFileSync(
+      path.join(isolatedRoot, 'check.mjs'),
+      `
+      import assert from 'node:assert/strict';
+      import { createWorkerClient, validateWorkerUrl } from '@sumatrafuzz/worker-client';
+      assert.equal(typeof createWorkerClient, 'function');
+      assert.equal(validateWorkerUrl('https://127.0.0.1:4242').origin, 'https://127.0.0.1:4242');
+    `,
+    );
+    const { NODE_PATH, NODE_OPTIONS, ...isolatedEnv } = process.env;
+    execFileSync(process.execPath, [path.join(isolatedRoot, 'check.mjs')], {
+      cwd: isolatedRoot,
+      env: isolatedEnv,
+      stdio: 'pipe',
+    });
+    const securityRoot = path.join(isolatedRoot, 'node_modules', '@sumatrafuzz', 'worker-security');
+    assert.equal(existsSync(path.join(securityRoot, 'dist', 'test')), false);
+    assert.equal(existsSync(path.join(securityRoot, 'dist', 'src', 'index.js.map')), false);
+    assert.equal(existsSync(path.join(securityRoot, 'dist', 'src', 'index.d.ts')), false);
+  } finally {
+    rmSync(isolatedRoot, { recursive: true, force: true });
+  }
 });
