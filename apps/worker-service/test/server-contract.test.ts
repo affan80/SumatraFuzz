@@ -2,12 +2,14 @@ import { X509Certificate } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { connect as netConnect } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { connect } from 'node:tls';
 import { createTlsFixture, issueCertificate } from '@sumatrafuzz/worker-security/test-fixtures';
 import { describe, expect, it, vi } from 'vitest';
 import { ZipFile } from 'yazl';
+import { type AdmissionPolicy, PROVISIONAL_ADMISSION_POLICY } from '../src/admission.js';
 import {
   assertProtocolVersion,
   createExclusiveRequestGate,
@@ -141,6 +143,7 @@ async function withApiFixture(
     };
     ownsRun: ReturnType<typeof vi.fn>;
   }) => Promise<void>,
+  admissionPolicy?: AdmissionPolicy,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'sf-route-policy-'));
   const tlsA = await createTlsFixture(root);
@@ -190,6 +193,7 @@ async function withApiFixture(
     ensureInputCapacity: async () => {},
     maxInputBundleBytes: 64 * 1024 * 1024,
     store: { ownsRun: ownsRun as never },
+    ...(admissionPolicy ? { admissionPolicy } : {}),
     handlers,
   });
   try {
@@ -200,7 +204,296 @@ async function withApiFixture(
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 describe('worker API contract', () => {
+  it('denies per-controller and global work before dispatch and returns capacity after completion', async () => {
+    await withApiFixture(
+      async ({ server, tlsA, tlsB, handlers }) => {
+        const pending = deferred<unknown>();
+        handlers.capabilities.mockImplementation(() => pending.promise);
+        const first = apiRequest(server.address, tlsA, 'GET', '/v1/capabilities');
+        await vi.waitFor(() => expect(handlers.capabilities).toHaveBeenCalledTimes(1));
+        safeError(
+          await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities'),
+          429,
+          'too_many_requests',
+        );
+        const second = apiRequest(server.address, tlsB, 'GET', '/v1/capabilities');
+        await vi.waitFor(() => expect(handlers.capabilities).toHaveBeenCalledTimes(2));
+        safeError(
+          await apiRequest(server.address, tlsB, 'GET', '/v1/capabilities'),
+          503,
+          'service_unavailable',
+        );
+        expect(handlers.capabilities).toHaveBeenCalledTimes(2);
+        pending.resolve({ ready: true });
+        expect((await first).status).toBe(200);
+        expect((await second).status).toBe(200);
+        expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+          200,
+        );
+      },
+      { ...PROVISIONAL_ADMISSION_POLICY, maxRequests: 2, maxRequestsPerController: 1 },
+    );
+  });
+
+  it('enforces controller rate and artifact/replay gates before their expensive handlers', async () => {
+    await withApiFixture(
+      async ({ server, tlsA, handlers }) => {
+        const metadata = deferred<{ etag: string; totalBytes: number }>();
+        const events = deferred<[]>();
+        handlers.artifactMetadata.mockImplementation(() => metadata.promise);
+        handlers.eventsAfter.mockImplementation(() => events.promise);
+        const artifact = apiRequest(
+          server.address,
+          tlsA,
+          'GET',
+          `/v1/runs/${ownedRun}/artifacts/seed`,
+        );
+        await vi.waitFor(() => expect(handlers.artifactMetadata).toHaveBeenCalledOnce());
+        safeError(
+          await apiRequest(server.address, tlsA, 'GET', `/v1/runs/${ownedRun}/artifacts/seed`),
+          429,
+          'too_many_requests',
+        );
+        expect(handlers.artifactMetadata).toHaveBeenCalledOnce();
+        expect(handlers.artifact).not.toHaveBeenCalled();
+        const replay = apiRequest(server.address, tlsA, 'GET', `/v1/runs/${ownedRun}/events`);
+        await vi.waitFor(() => expect(handlers.eventsAfter).toHaveBeenCalledOnce());
+        safeError(
+          await apiRequest(server.address, tlsA, 'GET', `/v1/runs/${ownedRun}/events`),
+          429,
+          'too_many_requests',
+        );
+        expect(handlers.eventsAfter).toHaveBeenCalledOnce();
+        metadata.resolve({ etag: 'a'.repeat(64), totalBytes: 3 });
+        events.resolve([]);
+        expect((await artifact).status).toBe(200);
+        expect((await replay).status).toBe(200);
+      },
+      { ...PROVISIONAL_ADMISSION_POLICY, maxArtifactTransfersPerController: 1 },
+    );
+    await withApiFixture(
+      async ({ server, tlsA, tlsB, handlers }) => {
+        expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+          200,
+        );
+        safeError(
+          await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities'),
+          429,
+          'too_many_requests',
+        );
+        expect((await apiRequest(server.address, tlsB, 'GET', '/v1/capabilities')).status).toBe(
+          200,
+        );
+        expect(handlers.capabilities).toHaveBeenCalledTimes(2);
+      },
+      { ...PROVISIONAL_ADMISSION_POLICY, requestBurst: 1, requestsPerSecond: 1 },
+    );
+  });
+
+  it('bounds the raw target and header bytes before body or handler use', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers }) => {
+      safeError(
+        await apiRequest(
+          server.address,
+          tlsA,
+          'GET',
+          `/v1/capabilities?padding=${'x'.repeat(4096)}`,
+        ),
+        414,
+        'uri_too_long',
+      );
+      safeError(
+        await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities', {
+          'x-padding': 'x'.repeat(16 * 1024),
+        }),
+        431,
+        'headers_too_large',
+      );
+      expect(handlers.capabilities).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['abort', 'idle', 'shutdown'] as const)(
+    'cleans a partial JSON request on %s without launching work',
+    async (reason) => {
+      await withApiFixture(
+        async ({ server, tlsA, handlers }) => {
+          const request = httpsRequest(server.address, {
+            path: '/v1/runs',
+            method: 'POST',
+            ca: tlsA.ca,
+            cert: tlsA.clientCert,
+            key: tlsA.clientKey,
+            agent: false,
+            headers: {
+              'x-sf-protocol-version': '1',
+              'content-type': 'application/json',
+              'content-length': '100',
+              expect: '100-continue',
+            },
+          });
+          request.on('error', () => {});
+          const continued = new Promise<void>((resolve) =>
+            request.once('continue', () => resolve()),
+          );
+          const ended = new Promise<void>((resolve) => request.once('close', () => resolve()));
+          request.flushHeaders();
+          await continued;
+          request.write('{');
+          if (reason === 'abort') request.destroy();
+          if (reason === 'shutdown') await server.close();
+          await ended;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(handlers.startRun).not.toHaveBeenCalled();
+          if (reason !== 'shutdown')
+            await vi.waitFor(async () =>
+              expect(
+                (await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status,
+              ).toBe(200),
+            );
+        },
+        {
+          ...PROVISIONAL_ADMISSION_POLICY,
+          maxSockets: 1,
+          maxRequests: 1,
+          maxRequestsPerController: 1,
+          idleTimeoutMs: 80,
+        },
+      );
+    },
+  );
+
+  it.each(['deadline', 'revoke'] as const)(
+    'keeps dispatched work counted after %s until it settles',
+    async (reason) => {
+      await withApiFixture(
+        async ({ server, tlsA, handlers }) => {
+          const pending = deferred<unknown>();
+          handlers.capabilities.mockImplementationOnce(() => pending.promise);
+          const first = apiRequest(server.address, tlsA, 'GET', '/v1/capabilities').catch(() => ({
+            status: 0,
+          }));
+          await vi.waitFor(() => expect(handlers.capabilities).toHaveBeenCalledOnce());
+          if (reason === 'revoke') server.disconnectController(controllerA);
+          await first;
+          safeError(
+            await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities'),
+            503,
+            'service_unavailable',
+          );
+          expect(handlers.capabilities).toHaveBeenCalledOnce();
+          pending.resolve({ ready: true });
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+            200,
+          );
+        },
+        {
+          ...PROVISIONAL_ADMISSION_POLICY,
+          maxSockets: 1,
+          maxRequests: 1,
+          maxRequestsPerController: 1,
+          requestTimeoutMs: 80,
+        },
+      );
+    },
+  );
+
+  it('bounds initial sockets and incomplete TLS headers with local connections', async () => {
+    await withApiFixture(
+      async ({ server, tlsA, handlers }) => {
+        const socket = netConnect({
+          host: '127.0.0.1',
+          port: Number(new URL(server.address).port),
+        });
+        await new Promise<void>((resolve) => socket.once('connect', resolve));
+        await expect(apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).rejects.toThrow();
+        const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()));
+        socket.destroy();
+        await closed;
+        await vi.waitFor(async () =>
+          expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+            200,
+          ),
+        );
+        const slow = connect({
+          host: '127.0.0.1',
+          port: Number(new URL(server.address).port),
+          ca: tlsA.ca,
+          cert: tlsA.clientCert,
+          key: tlsA.clientKey,
+        });
+        slow.on('error', () => {});
+        slow.once('secureConnect', () => slow.write('GET /v1/capabilities HTTP/1.1\r\nHost:'));
+        await new Promise<void>((resolve) => slow.once('close', () => resolve()));
+        expect(handlers.capabilities).toHaveBeenCalledOnce();
+        await vi.waitFor(async () =>
+          expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+            200,
+          ),
+        );
+      },
+      { ...PROVISIONAL_ADMISSION_POLICY, maxSockets: 1, headersTimeoutMs: 80 },
+    );
+  });
+
+  it('releases an incomplete upload and the exclusive import gate at its absolute deadline', async () => {
+    await withApiFixture(
+      async ({ server, tlsA }) => {
+        const request = httpsRequest(server.address, {
+          path: '/v1/input-bundles',
+          method: 'POST',
+          ca: tlsA.ca,
+          cert: tlsA.clientCert,
+          key: tlsA.clientKey,
+          agent: false,
+          headers: {
+            'x-sf-protocol-version': '1',
+            'content-type': 'application/zip',
+            'content-length': '100',
+            expect: '100-continue',
+          },
+        });
+        request.on('error', () => {});
+        const continued = new Promise<void>((resolve) => request.once('continue', () => resolve()));
+        const ended = new Promise<void>((resolve) => request.once('close', () => resolve()));
+        request.flushHeaders();
+        await continued;
+        request.write('P');
+        await ended;
+        const zip = new ZipFile();
+        zip.addBuffer(Buffer.from('%PDF-1.4\n%%EOF\n'), 'seed.pdf');
+        zip.end();
+        const chunks: Buffer[] = [];
+        for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
+        const result = await apiRequest(
+          server.address,
+          tlsA,
+          'POST',
+          '/v1/input-bundles',
+          { 'content-type': 'application/zip' },
+          Buffer.concat(chunks),
+        );
+        expect(result.status).toBe(201);
+      },
+      {
+        ...PROVISIONAL_ADMISSION_POLICY,
+        maxRequests: 1,
+        maxRequestsPerController: 1,
+        uploadTimeoutMs: 80,
+      },
+    );
+  });
+
   it('uses each TLS principal for capabilities, active run, start and bundle namespace despite identity headers', async () => {
     await withApiFixture(async ({ root, server, tlsA, tlsB, handlers }) => {
       const zip = new ZipFile();
