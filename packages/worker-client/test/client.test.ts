@@ -136,6 +136,32 @@ describe('authenticated worker client', () => {
     );
   });
 
+  it('exposes only validated stable error codes and correlation IDs from safe worker failures', async () => {
+    const correlationId = '55555555-5555-4555-8555-555555555555';
+    const safe = clientWith(async () =>
+      response(404, { error: 'not_found', request_id: correlationId }),
+    );
+    await expect(safe.capabilities()).rejects.toMatchObject({
+      status: 404,
+      code: 'not_found',
+      requestId: correlationId,
+      message: 'worker request failed with status 404',
+    });
+    const unsafe = clientWith(async () =>
+      response(500, {
+        error: '/private/key.pem secret',
+        request_id: 'attacker-id',
+        message: 'stack secret',
+      }),
+    );
+    await expect(unsafe.capabilities()).rejects.toMatchObject({
+      status: 500,
+      code: undefined,
+      requestId: undefined,
+      message: 'worker request failed with status 500',
+    });
+  });
+
   it('fails closed on protocol mismatch, malformed payloads, and oversized worker responses', async () => {
     const mismatch = clientWith(async () => response(426, { error: 'invalid_request' }));
     await expect(mismatch.capabilities()).rejects.toMatchObject({ status: 426 });

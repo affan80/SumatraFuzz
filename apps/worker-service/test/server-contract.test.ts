@@ -1,10 +1,13 @@
 import { X509Certificate } from 'node:crypto';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
+import type { IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
+import { connect } from 'node:tls';
 import { createTlsFixture, issueCertificate } from '@sumatrafuzz/worker-security/test-fixtures';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { ZipFile } from 'yazl';
 import {
   assertProtocolVersion,
   createExclusiveRequestGate,
@@ -55,7 +58,435 @@ function authenticatedGet(
   });
 }
 
+const controllerA = '22222222-2222-4222-8222-222222222222';
+const controllerB = '44444444-4444-4444-8444-444444444444';
+const ownedRun = '33333333-3333-4333-8333-333333333333';
+const workerId = '11111111-1111-4111-8111-111111111111';
+const requestId = '55555555-5555-4555-8555-555555555555';
+const runStatus = {
+  run_id: ownedRun,
+  worker_id: workerId,
+  state: 'running',
+  last_event_seq: '0',
+  stop_reason: null,
+};
+const startRequest = {
+  request_id: requestId,
+  controller_id: controllerA,
+  input_bundle_id: 'bundle-1',
+  target_lock_sha256: 'a'.repeat(64),
+  limits: { max_duration_s: 60, max_memory_bytes: 1024, max_disk_bytes: 2048, max_cpu_percent: 50 },
+  label: 'route authorization fixture',
+};
+
+function apiRequest(
+  baseUrl: string,
+  tls: Awaited<ReturnType<typeof createTlsFixture>>,
+  method: string,
+  requestPath: string,
+  headers: Record<string, string | string[]> = {},
+  payload?: Buffer,
+): Promise<{ status: number; body: Buffer; headers: IncomingHttpHeaders }> {
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      baseUrl,
+      {
+        method,
+        path: requestPath,
+        ca: tls.ca,
+        cert: tls.clientCert,
+        key: tls.clientKey,
+        agent: false,
+        headers: { 'x-sf-protocol-version': '1', ...headers },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on('end', () =>
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.concat(chunks),
+            headers: response.headers,
+          }),
+        );
+        response.on('error', reject);
+      },
+    );
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+function safeError(result: { status: number; body: Buffer }, status: number, code: string) {
+  expect(result.status).toBe(status);
+  const decoded = JSON.parse(result.body.toString('utf8')) as Record<string, unknown>;
+  expect(decoded).toEqual({
+    error: code,
+    request_id: expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+  });
+  expect(decoded.request_id).not.toBe(requestId);
+  return decoded;
+}
+
+async function withApiFixture(
+  test: (fixture: {
+    root: string;
+    server: Awaited<ReturnType<typeof createWorkerServer>>;
+    tlsA: Awaited<ReturnType<typeof createTlsFixture>>;
+    tlsB: Awaited<ReturnType<typeof createTlsFixture>>;
+    handlers: {
+      [K in keyof import('../src/server.js').WorkerApiHandlers]: ReturnType<typeof vi.fn>;
+    };
+    ownsRun: ReturnType<typeof vi.fn>;
+  }) => Promise<void>,
+) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sf-route-policy-'));
+  const tlsA = await createTlsFixture(root);
+  const second = await issueCertificate(
+    root,
+    'second-controller',
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n',
+  );
+  const tlsB = {
+    ...tlsA,
+    clientCert: Buffer.from(second.cert),
+    clientKey: Buffer.from(second.key),
+  };
+  const ownsRun = vi.fn(
+    (controller: string, run: string) => controller === controllerA && run === ownedRun,
+  );
+  const handlers = {
+    capabilities: vi.fn(async (controller: string) => ({ controller_id: controller })),
+    activeRun: vi.fn(async (controller: string) => (controller === controllerA ? runStatus : null)),
+    startRun: vi.fn(async () => runStatus),
+    getRun: vi.fn(async () => runStatus),
+    stopRun: vi.fn(async () => runStatus),
+    eventsAfter: vi.fn(async () => []),
+    manifest: vi.fn(async () => ({ artifacts: [] })),
+    artifactMetadata: vi.fn(async () => ({ etag: 'a'.repeat(64), totalBytes: 3 })),
+    artifact: vi.fn(async () => ({
+      etag: 'a'.repeat(64),
+      totalBytes: 3,
+      start: 0,
+      end: 2,
+      bytes: Buffer.from('pdf'),
+    })),
+  };
+  const server = await createWorkerServer({
+    host: '127.0.0.1',
+    mode: 'local',
+    port: 0,
+    workerId,
+    key: tlsA.workerKey,
+    cert: tlsA.workerCert,
+    ca: tlsA.ca,
+    pairedControllers: new Map([
+      [tlsA.fingerprint, controllerA],
+      [new X509Certificate(second.cert).fingerprint256, controllerB],
+    ]),
+    inputRoot: root,
+    ensureInputCapacity: async () => {},
+    maxInputBundleBytes: 64 * 1024 * 1024,
+    store: { ownsRun: ownsRun as never },
+    handlers,
+  });
+  try {
+    await test({ root, server, tlsA, tlsB, handlers, ownsRun });
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 describe('worker API contract', () => {
+  it('uses each TLS principal for capabilities, active run, start and bundle namespace despite identity headers', async () => {
+    await withApiFixture(async ({ root, server, tlsA, tlsB, handlers }) => {
+      const zip = new ZipFile();
+      zip.addBuffer(Buffer.from('%PDF-1.4\n%%EOF\n'), 'seed.pdf');
+      zip.end();
+      const chunks: Buffer[] = [];
+      for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
+      const archive = Buffer.concat(chunks);
+      for (const [tls, controller, spoofed] of [
+        [tlsA, controllerA, controllerB],
+        [tlsB, controllerB, controllerA],
+      ] as const) {
+        const headers = {
+          'x-controller-id': spoofed,
+          'controller-id': spoofed,
+          'x-request-id': requestId,
+        };
+        const capabilities = await apiRequest(
+          server.address,
+          tls,
+          'GET',
+          '/v1/capabilities',
+          headers,
+        );
+        expect(JSON.parse(capabilities.body.toString())).toEqual({ controller_id: controller });
+        expect(handlers.capabilities).toHaveBeenLastCalledWith(controller);
+        const active = await apiRequest(server.address, tls, 'GET', '/v1/runs/active', headers);
+        expect(JSON.parse(active.body.toString()).active_run).toEqual(
+          controller === controllerA ? runStatus : null,
+        );
+        expect(handlers.activeRun).toHaveBeenLastCalledWith(controller);
+        const payload = { ...startRequest, controller_id: controller };
+        expect(
+          (
+            await apiRequest(
+              server.address,
+              tls,
+              'POST',
+              '/v1/runs',
+              { ...headers, 'content-type': 'application/json', 'idempotency-key': requestId },
+              Buffer.from(JSON.stringify(payload)),
+            )
+          ).status,
+        ).toBe(202);
+        expect(handlers.startRun).toHaveBeenLastCalledWith(controller, payload);
+        const imported = await apiRequest(
+          server.address,
+          tls,
+          'POST',
+          '/v1/input-bundles',
+          { ...headers, 'content-type': 'application/zip' },
+          archive,
+        );
+        expect(imported.status).toBe(201);
+        const bundle = JSON.parse(imported.body.toString()) as { input_bundle_id: string };
+        expect(await readdir(path.join(root, controller, bundle.input_bundle_id))).toEqual([
+          'seed.pdf',
+        ]);
+      }
+      handlers.startRun.mockClear();
+      safeError(
+        await apiRequest(
+          server.address,
+          tlsB,
+          'POST',
+          '/v1/runs',
+          {
+            'content-type': 'application/json',
+            'idempotency-key': requestId,
+            'x-controller-id': controllerA,
+          },
+          Buffer.from(JSON.stringify(startRequest)),
+        ),
+        403,
+        'forbidden',
+      );
+      expect(handlers.startRun).not.toHaveBeenCalled();
+    });
+  });
+
+  it('denies every foreign run subresource before dispatch with the same safe response as unknown routes', async () => {
+    await withApiFixture(async ({ server, tlsA, tlsB, handlers, ownsRun }) => {
+      const routes = [
+        ['GET', '', 'getRun'],
+        ['POST', '/stop', 'stopRun'],
+        ['GET', '/events', 'eventsAfter'],
+        ['GET', '/manifest', 'manifest'],
+        ['GET', '/artifacts/seed', 'artifact'],
+      ] as const;
+      const unknown = safeError(
+        await apiRequest(server.address, tlsB, 'GET', '/v1/unknown'),
+        404,
+        'not_found',
+      );
+      for (const [method, suffix, handler] of routes) {
+        const denied = safeError(
+          await apiRequest(server.address, tlsB, method, `/v1/runs/${ownedRun}${suffix}`, {
+            'x-controller-id': controllerA,
+            'x-request-id': requestId,
+          }),
+          404,
+          'not_found',
+        );
+        expect(denied.error).toBe(unknown.error);
+        expect(denied.request_id).not.toBe(unknown.request_id);
+        expect(handlers[handler]).not.toHaveBeenCalled();
+        expect(handlers.artifactMetadata).not.toHaveBeenCalled();
+        expect(ownsRun).toHaveBeenLastCalledWith(controllerB, ownedRun);
+        const allowed = await apiRequest(
+          server.address,
+          tlsA,
+          method,
+          `/v1/runs/${ownedRun}${suffix}`,
+        );
+        expect(allowed.status).toBe(method === 'POST' ? 202 : 200);
+        expect(handlers[handler].mock.calls.at(-1)?.slice(0, 2)).toEqual([controllerA, ownedRun]);
+        expect(ownsRun.mock.invocationCallOrder.at(-1)).toBeLessThan(
+          handlers[handler].mock.invocationCallOrder.at(-1) ?? 0,
+        );
+        if (suffix.includes('artifacts'))
+          expect(handlers.artifactMetadata).toHaveBeenLastCalledWith(controllerA, ownedRun, 'seed');
+        handlers[handler].mockClear();
+        handlers.artifactMetadata.mockClear();
+      }
+      ownsRun.mockClear();
+      safeError(
+        await apiRequest(server.address, tlsA, 'PUT', `/v1/runs/${ownedRun}`),
+        404,
+        'not_found',
+      );
+      expect(ownsRun).not.toHaveBeenCalled();
+    });
+  });
+
+  it('rejects path aliases before normalization or handler dispatch', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers, ownsRun }) => {
+      for (const target of [
+        '/v1//capabilities',
+        '/v1/capabilities/',
+        '/v1/../v1/capabilities',
+        '/v1/%63apabilities',
+        `/v1//runs/${ownedRun}`,
+        `/v1/runs/${ownedRun}/`,
+        `/v1/runs/${ownedRun}/manifest/`,
+        '/v1/capabilities#fragment',
+      ]) {
+        safeError(await apiRequest(server.address, tlsA, 'GET', target), 404, 'not_found');
+      }
+      expect(ownsRun).not.toHaveBeenCalled();
+      for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
+    });
+  });
+
+  it('rejects unsupported or duplicate content types before dispatch and input I/O', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers, root }) => {
+      for (const [target, type] of [
+        ['/v1/runs', 'application/zip'],
+        ['/v1/input-bundles', 'application/json'],
+        ['/v1/runs', undefined],
+        ['/v1/runs', ['application/json', 'application/json']],
+        ['/v1/runs', 'application/json; charset=latin1'],
+      ] as const) {
+        safeError(
+          await apiRequest(
+            server.address,
+            tlsA,
+            'POST',
+            target,
+            {
+              'idempotency-key': requestId,
+              ...(type === undefined
+                ? {}
+                : { 'content-type': typeof type === 'string' ? type : [...type] }),
+            },
+            Buffer.from(JSON.stringify(startRequest)),
+          ),
+          415,
+          'unsupported_media_type',
+        );
+      }
+      expect(handlers.startRun).not.toHaveBeenCalled();
+      expect(await readdir(root)).not.toContain(controllerA);
+    });
+  });
+
+  it('returns stable errors and generated IDs without reflecting internal exceptions or request IDs', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers }) => {
+      handlers.capabilities.mockRejectedValueOnce(
+        new Error('/private/worker/key.pem secret stack'),
+      );
+      safeError(
+        await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities', {
+          'x-request-id': requestId,
+        }),
+        500,
+        'internal_error',
+      );
+      safeError(
+        await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities', {
+          'x-sf-protocol-version': '2',
+        }),
+        426,
+        'protocol_version_unsupported',
+      );
+      safeError(
+        await apiRequest(
+          server.address,
+          tlsA,
+          'POST',
+          '/v1/runs',
+          { 'content-type': 'application/json' },
+          Buffer.from('{secret'),
+        ),
+        400,
+        'invalid_request',
+      );
+      handlers.capabilities.mockRejectedValueOnce(
+        Object.assign(new Error('secret'), { status: 599 }),
+      );
+      safeError(
+        await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities'),
+        500,
+        'internal_error',
+      );
+    });
+  });
+
+  it('bounds overload retry advice without reflecting exception fields', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers }) => {
+      for (const [status, code] of [
+        [429, 'too_many_requests'],
+        [503, 'service_unavailable'],
+      ] as const) {
+        handlers.capabilities.mockRejectedValueOnce(
+          Object.assign(new Error('private capacity detail'), {
+            status,
+            retryAfter: 'attacker-controlled retry advice',
+          }),
+        );
+        const result = await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities');
+        safeError(result, status, code);
+        expect(result.headers['retry-after']).toBe('1');
+      }
+    });
+  });
+
+  it('rejects ambiguous framing at the HTTP boundary without dispatch', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers }) => {
+      for (const framing of [
+        'Content-Length: 1\r\nContent-Length: 1',
+        'Content-Length: 1\r\nTransfer-Encoding: chunked',
+        'Transfer-Encoding: gzip, chunked',
+      ]) {
+        const raw = await new Promise<string>((resolve, reject) => {
+          const socket = connect(
+            {
+              host: '127.0.0.1',
+              port: Number(new URL(server.address).port),
+              ca: tlsA.ca,
+              cert: tlsA.clientCert,
+              key: tlsA.clientKey,
+            },
+            () => {
+              socket.write(
+                `POST /v1/runs HTTP/1.1\r\nHost: worker\r\nX-SF-Protocol-Version: 1\r\nContent-Type: application/json\r\n${framing}\r\nConnection: close\r\n\r\nx`,
+              );
+            },
+          );
+          let received = '';
+          socket.on('data', (data) => {
+            received += data.toString();
+          });
+          socket.on('end', () => resolve(received));
+          socket.on('error', reject);
+        });
+        expect(raw).toContain('400 Bad Request');
+        safeError(
+          { status: 400, body: Buffer.from(raw.split('\r\n\r\n')[1] ?? '') },
+          400,
+          'invalid_request',
+        );
+      }
+      for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
+    });
+  });
+
   it('permits only one in-flight input import and releases the gate after completion', () => {
     const gate = createExclusiveRequestGate();
     const release = gate.tryAcquire();

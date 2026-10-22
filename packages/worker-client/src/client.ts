@@ -82,6 +82,8 @@ export class WorkerClientError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code?: string,
+    readonly requestId?: string,
   ) {
     super(message);
     this.name = 'WorkerClientError';
@@ -422,7 +424,45 @@ export function createWorkerClient(
             : result.status === 409
               ? 'worker rejected the operation because its state conflicts'
               : `worker request failed with status ${result.status}`;
-      throw new WorkerClientError(result.status, message);
+      let code: string | undefined;
+      let requestId: string | undefined;
+      try {
+        const value = parseJsonResponse(result);
+        const safeCodes = new Set([
+          'invalid_request',
+          'unauthorized',
+          'forbidden',
+          'not_found',
+          'request_timeout',
+          'conflict',
+          'payload_too_large',
+          'unsupported_media_type',
+          'range_not_satisfiable',
+          'protocol_version_unsupported',
+          'too_many_requests',
+          'internal_error',
+          'service_unavailable',
+          'insufficient_storage',
+        ]);
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          const candidate = value as Record<string, unknown>;
+          if (
+            exactKeys(candidate, ['error', 'request_id']) &&
+            typeof candidate.error === 'string' &&
+            safeCodes.has(candidate.error) &&
+            typeof candidate.request_id === 'string' &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+              candidate.request_id,
+            )
+          ) {
+            code = candidate.error;
+            requestId = candidate.request_id;
+          }
+        }
+      } catch {
+        // Older or malformed error payloads still use the locally generated safe status message.
+      }
+      throw new WorkerClientError(result.status, message, code, requestId);
     }
     return result;
   }

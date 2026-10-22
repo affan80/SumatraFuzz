@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import type { PeerCertificate, TLSSocket } from 'node:tls';
 import type { SqliteRunStore } from '@sumatrafuzz/run-store';
@@ -13,6 +14,7 @@ import { TLS_MIN_VERSION, validateEndpointCertificate } from '@sumatrafuzz/worke
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
 import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
+import { type AuthenticatedPrincipal, authorizeRoute } from './route-policy.js';
 
 export interface WorkerEventRecord {
   readonly seq: string;
@@ -83,6 +85,77 @@ const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const WORKER_PROTOCOL_VERSION = '1';
 const FINGERPRINT = /^[0-9a-f]{64}$/i;
 const MAX_SQLITE_SEQUENCE = '9223372036854775807';
+
+// Transitional operator-supplied pairing records grant this explicit fixed set.
+// The persistent trust resolver supplies per-request permissions in the next slice.
+const PAIRED_PERMISSIONS: AuthenticatedPrincipal['permissions'] = [
+  'capabilities:read',
+  'input-bundles:write',
+  'runs:start',
+  'runs:read',
+  'runs:stop',
+  'events:read',
+  'artifacts:read',
+];
+const SAFE_ERROR_CODES = new Map([
+  [400, 'invalid_request'],
+  [401, 'unauthorized'],
+  [403, 'forbidden'],
+  [404, 'not_found'],
+  [408, 'request_timeout'],
+  [409, 'conflict'],
+  [413, 'payload_too_large'],
+  [415, 'unsupported_media_type'],
+  [416, 'range_not_satisfiable'],
+  [426, 'protocol_version_unsupported'],
+  [429, 'too_many_requests'],
+  [500, 'internal_error'],
+  [503, 'service_unavailable'],
+  [507, 'insufficient_storage'],
+]);
+
+function safeFailure(error: unknown, requestId: string): { status: number; value: object } {
+  const candidate = error && typeof error === 'object' && 'status' in error ? error.status : 500;
+  const status = typeof candidate === 'number' && SAFE_ERROR_CODES.has(candidate) ? candidate : 500;
+  return { status, value: { error: SAFE_ERROR_CODES.get(status), request_id: requestId } };
+}
+
+function rejectRequest(status: number): never {
+  throw Object.assign(new Error('worker request rejected'), { status });
+}
+
+/** Node rejects CL/TE conflicts and duplicate CL before dispatch; cover the remaining ambiguity. */
+function validateRequestFraming(request: import('node:http').IncomingMessage): void {
+  const count = (name: string): number =>
+    request.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === name)
+      .length;
+  const length = request.headers['content-length'];
+  const encoding = request.headers['transfer-encoding'];
+  if (
+    count('content-length') > 1 ||
+    count('transfer-encoding') > 1 ||
+    (length !== undefined && encoding !== undefined) ||
+    (length !== undefined &&
+      (!/^(0|[1-9][0-9]*)$/.test(length) || !Number.isSafeInteger(Number(length)))) ||
+    (encoding !== undefined && encoding.toLowerCase() !== 'chunked')
+  )
+    rejectRequest(400);
+}
+
+function requireContentType(
+  request: import('node:http').IncomingMessage,
+  expected: 'application/json' | 'application/zip',
+): void {
+  const values = request.rawHeaders.filter(
+    (value, index) => index % 2 === 0 && value.toLowerCase() === 'content-type',
+  );
+  const type = request.headers['content-type'];
+  const supported =
+    expected === 'application/json'
+      ? /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?\s*$/i
+      : /^application\/zip\s*$/i;
+  if (values.length !== 1 || typeof type !== 'string' || !supported.test(type)) rejectRequest(415);
+}
 
 function peerIdentity(peer: PeerCertificate, authorized: boolean): PeerCertificateIdentity | null {
   if (!peer.fingerprint256 || !peer.valid_from || !peer.valid_to) return null;
@@ -271,47 +344,60 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       minVersion: TLS_MIN_VERSION,
     },
     (request, response) => {
+      const requestId = randomUUID();
       void (async () => {
         const socket = request.socket as TLSSocket;
         const peer = socket.getPeerCertificate(true);
-        if (!socket.authorized || !peer.raw) throw new Error('unauthorized client certificate');
-        validateEndpointCertificate(peer.raw, 'client');
-        const fingerprint = authorizePairedCertificate(
-          peerIdentity(peer, socket.authorized),
-          new Set(pairedControllers.keys()),
-          config.revokedFingerprints ?? new Set(),
-        );
-        const controllerId = pairedControllers.get(fingerprint);
-        if (!controllerId || !isNonNilUuid(controllerId))
-          throw new Error('paired controller identity is invalid');
-        assertProtocolVersion(request.headers['x-sf-protocol-version']);
-        if (
-          !request.url?.startsWith('/') ||
-          request.url.startsWith('//') ||
-          request.url.includes('\\')
-        ) {
-          throw Object.assign(new Error('origin-form request path required'), { status: 400 });
+        if (!socket.authorized || !peer.raw) rejectRequest(401);
+        let fingerprint: string;
+        try {
+          validateEndpointCertificate(peer.raw, 'client');
+          fingerprint = authorizePairedCertificate(
+            peerIdentity(peer, socket.authorized),
+            new Set(pairedControllers.keys()),
+            config.revokedFingerprints ?? new Set(),
+          );
+        } catch {
+          rejectRequest(401);
         }
-        const url = new URL(request.url, 'https://worker.invalid');
-        const segments = url.pathname.split('/').filter(Boolean);
+        const controllerId = pairedControllers.get(fingerprint);
+        if (!controllerId || !isNonNilUuid(controllerId)) rejectRequest(401);
+        assertProtocolVersion(request.headers['x-sf-protocol-version']);
+        const principal: AuthenticatedPrincipal = {
+          controllerId,
+          fingerprint,
+          permissions: PAIRED_PERMISSIONS,
+        };
+        const target = request.url ?? '';
+        const pathname = target.split('?')[0] ?? '';
+        // Authorize the original target first: URL would normalize dot segments and hide aliases.
+        const decision = authorizeRoute(principal, request.method ?? '', pathname);
+        if (!decision.allowed || target.includes('#')) rejectRequest(404);
+        if (
+          decision.scope.kind !== 'controller' &&
+          !config.store.ownsRun(asControllerId(controllerId), asRunId(decision.scope.runId))
+        )
+          rejectRequest(404);
+        validateRequestFraming(request);
+        const url = new URL(target, 'https://worker.invalid');
 
-        if (request.method === 'GET' && url.pathname === '/v1/capabilities') {
+        if (decision.route === 'capabilities') {
           json(response, 200, await config.handlers.capabilities(controllerId));
           return;
         }
-        if (request.method === 'GET' && url.pathname === '/v1/runs/active') {
+        if (decision.route === 'activeRun') {
           const activeRun = await config.handlers.activeRun(controllerId);
           json(response, 200, {
             active_run: activeRun === null ? null : validateRunStatus(activeRun),
           });
           return;
         }
-        if (request.method === 'POST' && url.pathname === '/v1/input-bundles') {
+        if (decision.route === 'importInputBundle') {
+          requireContentType(request, 'application/zip');
           const release = inputImportGate.tryAcquire();
           if (!release) {
             request.resume();
-            json(response, 429, { error: 'another input bundle import is already in progress' });
-            return;
+            rejectRequest(429);
           }
           try {
             json(
@@ -330,7 +416,8 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           }
           return;
         }
-        if (request.method === 'POST' && url.pathname === '/v1/runs') {
+        if (decision.route === 'startRun') {
+          requireContentType(request, 'application/json');
           const raw = await body(request, Math.min(requestLimit, 1024 * 1024));
           let payload: unknown;
           try {
@@ -346,20 +433,17 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           json(response, 202, await config.handlers.startRun(controllerId, runRequest));
           return;
         }
-        if (segments[0] === 'v1' && segments[1] === 'runs' && isNonNilUuid(segments[2] ?? '')) {
-          const runId = segments[2] as string;
-          if (!config.store.ownsRun(asControllerId(controllerId), asRunId(runId))) {
-            throw Object.assign(new Error('run not found'), { status: 404 });
-          }
-          if (request.method === 'GET' && segments.length === 3) {
+        if (decision.scope.kind !== 'controller') {
+          const runId = decision.scope.runId;
+          if (decision.route === 'getRun') {
             json(response, 200, await config.handlers.getRun(controllerId, runId));
             return;
           }
-          if (request.method === 'POST' && segments.length === 4 && segments[3] === 'stop') {
+          if (decision.route === 'stopRun') {
             json(response, 202, await config.handlers.stopRun(controllerId, runId));
             return;
           }
-          if (request.method === 'GET' && segments.length === 4 && segments[3] === 'events') {
+          if (decision.route === 'eventsAfter') {
             const after = url.searchParams.get('after') ?? request.headers['last-event-id'] ?? '0';
             if (typeof after !== 'string')
               throw Object.assign(new Error('invalid event replay sequence'), { status: 400 });
@@ -393,17 +477,12 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             response.end();
             return;
           }
-          if (request.method === 'GET' && segments.length === 4 && segments[3] === 'manifest') {
+          if (decision.route === 'manifest') {
             json(response, 200, await config.handlers.manifest(controllerId, runId));
             return;
           }
-          if (
-            request.method === 'GET' &&
-            segments.length === 5 &&
-            segments[3] === 'artifacts' &&
-            /^[A-Za-z0-9_-]{1,128}$/.test(segments[4] ?? '')
-          ) {
-            const artifactId = segments[4] as string;
+          if (decision.route === 'artifact' && decision.scope.kind === 'artifact') {
+            const artifactId = decision.scope.artifactId;
             const metadata = await config.handlers.artifactMetadata(
               controllerId,
               runId,
@@ -453,21 +532,28 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             return;
           }
         }
-        json(response, 404, { error: 'not_found' });
+        rejectRequest(404);
       })().catch((error: unknown) => {
         if (response.headersSent) {
           response.destroy(error instanceof Error ? error : new Error('worker request failed'));
           return;
         }
-        const status =
-          error && typeof error === 'object' && 'status' in error ? Number(error.status) : 500;
-        json(response, Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500, {
-          error: status === 500 ? 'internal_error' : 'invalid_request',
-          message: status === 500 ? 'worker request failed' : 'request rejected',
-        });
+        request.resume();
+        const failure = safeFailure(error, requestId);
+        if (failure.status === 429 || failure.status === 503)
+          response.setHeader('retry-after', '1');
+        json(response, failure.status, failure.value);
       });
     },
   );
+  server.on('clientError', (_error, socket) => {
+    if (!socket.writable || socket.writableEnded) return;
+    const failure = safeFailure({ status: 400 }, randomUUID());
+    const serialized = serializeBoundedJson(failure.value);
+    socket.end(
+      `HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(serialized)}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n${serialized}`,
+    );
+  });
   server.headersTimeout = 15_000;
   server.requestTimeout = 10 * 60_000;
   server.keepAliveTimeout = 5_000;
