@@ -85,6 +85,7 @@ const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const WORKER_PROTOCOL_VERSION = '1';
 const FINGERPRINT = /^[0-9a-f]{64}$/i;
 const MAX_SQLITE_SEQUENCE = '9223372036854775807';
+const MAX_REQUEST_HEADER_FIELDS = 64;
 
 // Transitional operator-supplied pairing records grant this explicit fixed set.
 // The persistent trust resolver supplies per-request permissions in the next slice.
@@ -126,14 +127,19 @@ function rejectRequest(status: number): never {
 
 /** Node rejects CL/TE conflicts and duplicate CL before dispatch; cover the remaining ambiguity. */
 function validateRequestFraming(request: import('node:http').IncomingMessage): void {
-  const count = (name: string): number =>
-    request.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === name)
-      .length;
-  const length = request.headers['content-length'];
-  const encoding = request.headers['transfer-encoding'];
+  // maxHeadersCount truncates request.headers, not the parser's raw framing input.
+  if (request.rawHeaders.length > MAX_REQUEST_HEADER_FIELDS * 2) rejectRequest(400);
+  const values = (name: string): string[] =>
+    request.rawHeaders.filter(
+      (_value, index) => index % 2 === 1 && request.rawHeaders[index - 1]?.toLowerCase() === name,
+    );
+  const lengths = values('content-length');
+  const encodings = values('transfer-encoding');
+  const length = lengths[0];
+  const encoding = encodings[0];
   if (
-    count('content-length') > 1 ||
-    count('transfer-encoding') > 1 ||
+    lengths.length > 1 ||
+    encodings.length > 1 ||
     (length !== undefined && encoding !== undefined) ||
     (length !== undefined &&
       (!/^(0|[1-9][0-9]*)$/.test(length) || !Number.isSafeInteger(Number(length)))) ||
@@ -557,7 +563,7 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
   server.headersTimeout = 15_000;
   server.requestTimeout = 10 * 60_000;
   server.keepAliveTimeout = 5_000;
-  server.maxHeadersCount = 64;
+  server.maxHeadersCount = MAX_REQUEST_HEADER_FIELDS;
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);

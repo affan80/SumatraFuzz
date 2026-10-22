@@ -487,6 +487,92 @@ describe('worker API contract', () => {
     });
   });
 
+  it('rejects late framing fields beyond the parsed-header cap before application body reads', async () => {
+    await withApiFixture(async ({ server, tlsA, handlers }) => {
+      const payload = JSON.stringify(startRequest);
+      const requestWithLateFraming = (
+        framing: string,
+        wireBody: string,
+        paddingFields = 60,
+      ): Promise<string> =>
+        new Promise((resolve, reject) => {
+          const socket = connect(
+            {
+              host: '127.0.0.1',
+              port: Number(new URL(server.address).port),
+              ca: tlsA.ca,
+              cert: tlsA.clientCert,
+              key: tlsA.clientKey,
+            },
+            () => {
+              // Five required fields + sixty padding fields put framing at field 66.
+              const padding = Array.from(
+                { length: paddingFields },
+                (_, index) => `X-Padding-${index}: x`,
+              ).join('\r\n');
+              socket.write(
+                `POST /v1/runs HTTP/1.1\r\nHost: worker\r\nX-SF-Protocol-Version: 1\r\nContent-Type: application/json\r\nIdempotency-Key: ${requestId}\r\nConnection: close\r\n${padding}\r\n${framing}\r\n\r\n${wireBody}`,
+              );
+            },
+          );
+          const deadline = setTimeout(
+            () => socket.destroy(new Error('worker waited for an over-limit request body')),
+            2000,
+          );
+          let received = '';
+          socket.on('data', (data) => {
+            received += data.toString();
+          });
+          socket.on('end', () => {
+            clearTimeout(deadline);
+            resolve(received);
+          });
+          socket.on('error', (error) => {
+            clearTimeout(deadline);
+            reject(error);
+          });
+        });
+      const atLimit = await requestWithLateFraming(
+        `Content-Length: ${Buffer.byteLength(payload)}`,
+        payload,
+        58,
+      );
+      expect(atLimit).toContain('202 Accepted');
+      expect(handlers.startRun).toHaveBeenCalledOnce();
+      handlers.startRun.mockClear();
+      const cases = [
+        [
+          'Transfer-Encoding: gzip, chunked',
+          `${Buffer.byteLength(payload).toString(16)}\r\n${payload}\r\n0\r\n\r\n`,
+        ],
+        [`Content-Length: 0${Buffer.byteLength(payload)}`, payload],
+        // A response while this declared body remains unsent proves rejection precedes body reads.
+        ['Transfer-Encoding: gzip, chunked', ''],
+        [`Content-Length: ${Buffer.byteLength(payload)}`, ''],
+      ] as const;
+      for (const [framing, wireBody] of cases) {
+        const raw = await requestWithLateFraming(framing, wireBody);
+        expect(raw).toContain('400 Bad Request');
+        const headerEnd = raw.indexOf('\r\n\r\n');
+        let bodyText = raw.slice(headerEnd + 4);
+        if (/\r\ntransfer-encoding: chunked\r\n/i.test(raw.slice(0, headerEnd + 2))) {
+          const chunks: string[] = [];
+          while (bodyText !== '') {
+            const sizeEnd = bodyText.indexOf('\r\n');
+            const size = Number.parseInt(bodyText.slice(0, sizeEnd), 16);
+            if (size === 0) break;
+            expect(size).toBeGreaterThan(0);
+            chunks.push(bodyText.slice(sizeEnd + 2, sizeEnd + 2 + size));
+            bodyText = bodyText.slice(sizeEnd + 2 + size + 2);
+          }
+          bodyText = chunks.join('');
+        }
+        safeError({ status: 400, body: Buffer.from(bodyText) }, 400, 'invalid_request');
+        for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
+      }
+    });
+  });
+
   it('permits only one in-flight input import and releases the gate after completion', () => {
     const gate = createExclusiveRequestGate();
     const release = gate.tryAcquire();
