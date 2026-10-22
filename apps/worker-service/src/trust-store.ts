@@ -168,6 +168,7 @@ function record(row: CertificateRow, revision: number): TrustRecord {
 /** Operator-only persistence. Callers must verify signed provisioning evidence first. */
 export class SqliteWorkerTrustStore implements WorkerTrustRepository {
   private readonly listeners = new Set<(change: TrustRevisionChange) => void>();
+  private notifying = false;
   private constructor(
     private readonly db: Handle,
     private readonly maxOverlapMs: number,
@@ -416,6 +417,7 @@ export class SqliteWorkerTrustStore implements WorkerTrustRepository {
     });
   }
   private mutate<T>(operation: () => T): T {
+    if (this.notifying) throw new TrustStoreError('conflict');
     try {
       const result = this.db
         .transaction(() => {
@@ -452,14 +454,20 @@ export class SqliteWorkerTrustStore implements WorkerTrustRepository {
         })
         .immediate();
       // Notification follows SQLite commit; listener failures never change the committed outcome.
-      if (result.change)
-        for (const listener of [...this.listeners]) {
-          try {
-            listener(result.change);
-          } catch {
-            /* Listener health is not trust authority. */
+      if (result.change) {
+        this.notifying = true;
+        try {
+          for (const listener of [...this.listeners]) {
+            try {
+              listener(result.change);
+            } catch {
+              /* Listener health is not trust authority. */
+            }
           }
+        } finally {
+          this.notifying = false;
         }
+      }
       return result.value;
     } catch (error) {
       throw wrap(error);

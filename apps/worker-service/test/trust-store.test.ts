@@ -377,3 +377,24 @@ describe('bounded committed trust notifications', () => {
     ]);
   });
 });
+
+it('rejects reentrant trust mutation during notification so revisions remain ordered', async () => {
+  const store = open(await file());
+  const errors: unknown[] = [];
+  const revisions: number[] = [];
+  store.subscribe(() => {
+    try {
+      store.revoke(fingerprint());
+    } catch (error) {
+      errors.push(error instanceof Error && 'code' in error ? error.code : 'unsafe');
+    }
+  });
+  store.subscribe((change) => revisions.push(change.revision));
+  store.provision(input());
+  expect(errors).toEqual(['conflict']);
+  expect(revisions).toEqual([1]);
+  expect(store.revision).toBe(1);
+  expect(store.resolveFingerprint(fingerprint(), now)?.status).toBe('active');
+  expect(store.revoke(fingerprint())?.revision).toBe(2);
+  expect(revisions).toEqual([1, 2]);
+});
