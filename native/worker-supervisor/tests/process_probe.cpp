@@ -94,40 +94,42 @@ struct ProbeNamespace {
     if (run_sid) LocalFree(run_sid);
     if (token) CloseHandle(token);
   }
-  bool Initialize(unsigned* failure_stage = nullptr) {
-    const auto fail = [failure_stage](unsigned stage) {
+  bool Initialize(unsigned* failure_stage = nullptr, DWORD* failure_error = nullptr) {
+    const auto fail = [failure_stage, failure_error](unsigned stage, DWORD error) {
       if (failure_stage) *failure_stage = stage;
+      if (failure_error) *failure_error = error;
       return false;
     };
+    const auto fail_last_error = [&fail](unsigned stage) { return fail(stage, GetLastError()); };
     wchar_t alias_text[64]{}, sid_text[185]{};
     const DWORD alias_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_NAMESPACE_ALIAS", alias_text, 64);
     const DWORD sid_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_RUN_SID", sid_text, 185);
-    if (!alias_size || alias_size >= 64 || !sid_size || sid_size >= 185) return fail(1);
+    if (!alias_size || alias_size >= 64 || !sid_size || sid_size >= 185) return fail_last_error(1);
     alias = alias_text;
-    if (!ValidAlias(alias) || !ConvertStringSidToSidW(sid_text, &run_sid) || !RunSid(run_sid)) return fail(2);
+    if (!ValidAlias(alias) || !ConvertStringSidToSidW(sid_text, &run_sid) || !RunSid(run_sid)) return fail_last_error(2);
     LPWSTR canonical = nullptr;
-    if (!ConvertSidToStringSidW(run_sid, &canonical)) return fail(3);
+    if (!ConvertSidToStringSidW(run_sid, &canonical)) return fail_last_error(3);
     const bool exact = std::wstring(canonical) == sid_text;
     LocalFree(canonical);
-    if (!exact) return fail(4);
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return fail(5);
+    if (!exact) return fail_last_error(4);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return fail_last_error(5);
     DWORD bytes = 0;
     GetTokenInformation(token, TokenRestrictedSids, nullptr, 0, &bytes);
-    if (!bytes) return fail(6);
+    if (!bytes) return fail_last_error(6);
     std::vector<BYTE> restrictions(bytes);
-    if (!GetTokenInformation(token, TokenRestrictedSids, restrictions.data(), bytes, &bytes)) return fail(7);
+    if (!GetTokenInformation(token, TokenRestrictedSids, restrictions.data(), bytes, &bytes)) return fail_last_error(7);
     auto* groups = reinterpret_cast<TOKEN_GROUPS*>(restrictions.data());
     unsigned matches = 0, run_sids = 0;
     for (DWORD i = 0; i < groups->GroupCount; ++i) {
       if (RunSid(groups->Groups[i].Sid)) ++run_sids;
       if (EqualSid(groups->Groups[i].Sid, run_sid)) ++matches;
     }
-    if (matches != 1 || run_sids != 1) return fail(8);
+    if (matches != 1 || run_sids != 1) return fail_last_error(8);
     bytes = 0;
     GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
-    if (!bytes) return fail(9);
+    if (!bytes) return fail_last_error(9);
     user.resize(bytes);
-    if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) return fail(10);
+    if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) return fail_last_error(10);
     PSID worker = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
     EXPLICIT_ACCESSW grants[2]{};
     for (auto& grant : grants) {
@@ -137,11 +139,12 @@ struct ProbeNamespace {
     }
     BuildTrusteeWithSidW(&grants[0].Trustee, worker);
     BuildTrusteeWithSidW(&grants[1].Trustee, run_sid);
-    const bool ready = SetEntriesInAclW(2, grants, nullptr, &acl) == ERROR_SUCCESS &&
-        InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) &&
-        SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) &&
-        SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
-    return ready ? true : fail(11);
+    const DWORD acl_error = SetEntriesInAclW(2, grants, nullptr, &acl);
+    if (acl_error != ERROR_SUCCESS) return fail(11, acl_error);
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)) return fail_last_error(12);
+    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) return fail_last_error(13);
+    if (!SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) return fail_last_error(14);
+    return true;
   }
   bool Open(const std::wstring& target_alias) {
     if (!ValidAlias(target_alias)) { SetLastError(ERROR_INVALID_NAME); return false; }
@@ -194,8 +197,9 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
       object_name.find_first_not_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-") != std::wstring::npos) return 30;
   ProbeNamespace ns;
   unsigned namespace_stage = 0;
-  if (!ns.Initialize(&namespace_stage)) {
-    WriteNamespaceFailureDiagnostic(evidence_dir, namespace_stage, GetLastError());
+  DWORD namespace_error = ERROR_SUCCESS;
+  if (!ns.Initialize(&namespace_stage, &namespace_error)) {
+    WriteNamespaceFailureDiagnostic(evidence_dir, namespace_stage, namespace_error);
     return 30;
   }
   if (!ns.Open(ns.alias)) return 31;
