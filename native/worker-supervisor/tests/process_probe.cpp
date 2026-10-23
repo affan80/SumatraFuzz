@@ -103,6 +103,43 @@ void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD er
         output << "default_dacl=invalid\n";
       }
     }
+    if (!user_storage.empty() && !restricted_storage.empty()) {
+      const auto* user = reinterpret_cast<const TOKEN_USER*>(user_storage.data());
+      const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricted_storage.data());
+      if (groups->GroupCount > 0) {
+        EXPLICIT_ACCESSW grants[2]{};
+        for (auto& grant : grants) {
+          grant.grfAccessPermissions = GENERIC_ALL;
+          grant.grfAccessMode = GRANT_ACCESS;
+          grant.grfInheritance = NO_INHERITANCE;
+        }
+        BuildTrusteeWithSidW(&grants[0].Trustee, user->User.Sid);
+        BuildTrusteeWithSidW(&grants[1].Trustee, groups->Groups[0].Sid);
+        PACL explicit_dacl = nullptr;
+        const DWORD acl_error = SetEntriesInAclW(2, grants, nullptr, &explicit_dacl);
+        if (acl_error == ERROR_SUCCESS) {
+          SECURITY_DESCRIPTOR descriptor{};
+          SECURITY_ATTRIBUTES attributes{};
+          attributes.nLength = sizeof(attributes);
+          attributes.lpSecurityDescriptor = &descriptor;
+          BOOL initialized = InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
+          if (initialized) initialized = SetSecurityDescriptorDacl(&descriptor, TRUE, explicit_dacl, FALSE);
+          if (initialized) {
+            const std::wstring explicit_name = std::wstring(L"SumatraFuzz-Explicit-") +
+                                                std::to_wstring(GetCurrentProcessId());
+            HANDLE explicit_event = CreateEventW(&attributes, TRUE, FALSE, explicit_name.c_str());
+            output << "explicit_dacl_event_create=" << (explicit_event ? "success" : "failed") << '\n';
+            if (explicit_event) CloseHandle(explicit_event);
+            else output << "explicit_dacl_event_error=" << GetLastError() << '\n';
+          } else {
+            output << "explicit_dacl_setup_error=" << GetLastError() << '\n';
+          }
+        } else {
+          output << "explicit_dacl_acl_error=" << acl_error << '\n';
+        }
+        if (explicit_dacl) LocalFree(explicit_dacl);
+      }
+    }
     CloseHandle(token);
   }
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
