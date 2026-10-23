@@ -127,6 +127,58 @@ async function main(): Promise<void> {
 
   const firstProfile = await readProfile('controller-1.json');
   const secondProfile = await readProfile('controller-2.json');
+  if (process.env.WORKER_SERVICE_VERIFY_FORCED_TERMINATION === 'true') {
+    const second = client(secondProfile);
+    try {
+      const evidence = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      const forcedRunId = evidence.forced_termination_run_id;
+      const inputBundleId = evidence.forced_termination_input_bundle_id;
+      invariant(typeof forcedRunId === 'string', 'forced-termination run ID is missing');
+      invariant(typeof inputBundleId === 'string', 'forced-termination input bundle ID is missing');
+      const active = await second.activeRun();
+      invariant(
+        active?.run_id === forcedRunId && active.state !== 'completed',
+        'forced service termination fabricated completion or lost the operator-held run',
+      );
+      const capabilities = await second.capabilities();
+      let competingRunDenied = false;
+      try {
+        await second.startRun(
+          validateRunRequest({
+            request_id: randomUUID(),
+            controller_id: asControllerId(secondProfile.controllerId),
+            input_bundle_id: inputBundleId,
+            target_lock_sha256: capabilities.target_lock_sha256,
+            limits: capabilities.max_limits,
+            label: 'forced termination slot reservation check',
+          }),
+        );
+      } catch (error) {
+        competingRunDenied = error instanceof WorkerClientError && error.status === 409;
+      }
+      invariant(competingRunDenied, 'forced termination released the ambiguous worker slot');
+      const activeAfterDeniedStart = await second.activeRun();
+      invariant(
+        activeAfterDeniedStart?.run_id === forcedRunId,
+        'forced termination recovery changed the active run after a denied start',
+      );
+      const treeProof = JSON.parse(
+        await readFile(path.join(fixtureRoot, 'forced-termination-tree-verified.json'), 'utf8'),
+      ) as { descendantsTerminated?: unknown };
+      invariant(treeProof.descendantsTerminated === true, 'forced service descendants were not verified terminated');
+      Object.assign(evidence, {
+        forced_service_termination_recovered_without_completion: true,
+        forced_run_state_after_restart: active.state,
+        slot_remained_reserved_after_forced_termination: true,
+        forced_service_process_tree_terminated: true,
+      });
+      await writeFile(summaryPath, `${JSON.stringify(evidence, null, 2)}\n`);
+      console.log('Verified forced service termination and operator-held run recovery.');
+      return;
+    } finally {
+      second.close();
+    }
+  }
   const verifyRevocation = process.env.WORKER_SERVICE_VERIFY_REVOCATION === 'true';
   if (verifyRevocation) {
     const first = client(firstProfile);
@@ -155,6 +207,8 @@ async function main(): Promise<void> {
   const unpaired = client(unpairedProfile);
   let archive: Buffer | undefined;
   let runId: string | undefined;
+  let forcedRunId: string | undefined;
+  let forcedTerminationArmed = false;
   let stopped = false;
   try {
     const capabilities = await first.capabilities();
@@ -269,6 +323,36 @@ async function main(): Promise<void> {
       'revoking one controller disrupted another controller trust record',
     );
 
+    const secondImported = await second.importInputBundle(archive);
+    const forcedStart = await second.startRun(
+      validateRunRequest({
+        request_id: randomUUID(),
+        controller_id: asControllerId(secondProfile.controllerId),
+        input_bundle_id: secondImported.input_bundle_id,
+        target_lock_sha256: secondCapabilities.target_lock_sha256,
+        limits: secondCapabilities.max_limits,
+        label: 'installed Windows forced-termination recovery acceptance',
+      }),
+    );
+    invariant(forcedStart.state === 'running', 'second controller campaign did not start for forced-stop acceptance');
+    forcedRunId = forcedStart.run_id;
+    execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', serviceProcessTree], {
+      cwd: root,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+    await pause(1_000);
+    invariant(
+      (await second.getRun(forcedStart.run_id)).state === 'running',
+      'forced-stop acceptance campaign did not remain active before host termination',
+    );
+    invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+    await writeFile(
+      path.join(fixtureRoot, 'forced-termination-run.json'),
+      `${JSON.stringify({ runId: forcedStart.run_id, inputBundleId: secondImported.input_bundle_id })}\n`,
+      { flag: 'wx', mode: 0o600 },
+    );
+
     const record = {
       schema_version: 1,
       source_commit: sourceCommit.toLowerCase(),
@@ -285,10 +369,13 @@ async function main(): Promise<void> {
       unpaired_certificate_denied: true,
       cross_controller_run_denied: true,
       controller_disconnect_campaign_continued: afterDisconnect.state === 'running',
+      forced_termination_run_id: forcedStart.run_id,
+      forced_termination_input_bundle_id: secondImported.input_bundle_id,
       live_revocation_destroyed_existing_session: true,
       event_types: eventTypes,
     };
     await writeFile(summaryPath, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+    forcedTerminationArmed = true;
     console.log(`Verified installed mTLS service campaign: ${finalCount} genuine WinAFL executions.`);
   } finally {
     archive?.fill(0);
@@ -297,6 +384,13 @@ async function main(): Promise<void> {
         await first.stopRun(runId);
       } catch {
         // Failed shutdown is recorded by the service journal; do not fabricate a pass summary.
+      }
+    }
+    if (forcedRunId && !forcedTerminationArmed) {
+      try {
+        await second.stopRun(forcedRunId);
+      } catch {
+        // If setup failed, the service journal remains authoritative and the runner fails closed.
       }
     }
     first.close();

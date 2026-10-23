@@ -296,6 +296,67 @@ try {
   node --experimental-strip-types (Join-Path $RepoRoot 'scripts/windows/worker-service-acceptance.ts')
   if ($LASTEXITCODE -ne 0) { throw 'Installed-service mTLS and genuine native acceptance failed' }
 
+  $forcedRunPath = Join-Path $FixtureRoot 'forced-termination-run.json'
+  if (-not (Test-Path -LiteralPath $forcedRunPath -PathType Leaf)) { throw 'Forced-termination run marker is missing' }
+  $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='SumatraFuzzWorker'" -ErrorAction Stop
+  if (-not $service -or $service.State -ne 'Running' -or [uint32]$service.ProcessId -eq 0) { throw 'Worker service is unavailable before forced-stop acceptance' }
+  $serviceProcessId = [uint32]$service.ProcessId
+  $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+  $byParent = @{}
+  foreach ($process in $processes) {
+    $parent = [uint32]$process.ParentProcessId
+    if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = [System.Collections.Generic.List[object]]::new() }
+    $byParent[$parent].Add($process)
+  }
+  $pending = [System.Collections.Generic.Queue[uint32]]::new()
+  $pending.Enqueue($serviceProcessId)
+  $seen = [System.Collections.Generic.HashSet[uint32]]::new()
+  while ($pending.Count -gt 0) {
+    $parent = $pending.Dequeue()
+    if (-not $seen.Add($parent)) { continue }
+    foreach ($child in $byParent[$parent]) { $pending.Enqueue([uint32]$child.ProcessId) }
+  }
+  if ($seen.Count -lt 3) { throw 'Active parser descendants were not present for forced-stop acceptance' }
+  $tree = @($processes | Where-Object { $seen.Contains([uint32]$_.ProcessId) } | ForEach-Object {
+      [ordered]@{ process_id = [uint32]$_.ProcessId; creation_date = [string]$_.CreationDate }
+    })
+  Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop
+  $deadline = [DateTime]::UtcNow.AddSeconds(20)
+  $remainingTree = @($tree)
+  do {
+    Start-Sleep -Milliseconds 250
+    $liveProcesses = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $remainingTree = @($tree | Where-Object {
+        $expected = $_
+        @($liveProcesses | Where-Object {
+            [uint32]$_.ProcessId -eq [uint32]$expected.process_id -and [string]$_.CreationDate -eq $expected.creation_date
+          }).Count -gt 0
+      })
+  } while ($remainingTree.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+  if ($remainingTree.Count -gt 0) { throw 'Forced service termination left a worker or parser descendant alive' }
+  $deadline = [DateTime]::UtcNow.AddSeconds(60)
+  do {
+    Start-Sleep -Milliseconds 250
+    $service = Get-Service -Name 'SumatraFuzzWorker' -ErrorAction SilentlyContinue
+  } while ($service -and $service.Status -ne 'Stopped' -and [DateTime]::UtcNow -lt $deadline)
+  if (-not $service -or $service.Status -ne 'Stopped') { throw 'SCM did not observe forced worker-host termination' }
+  [IO.File]::WriteAllText(
+    (Join-Path $FixtureRoot 'forced-termination-tree-verified.json'),
+    (ConvertTo-Json -InputObject @{ descendantsTerminated = $true } -Compress) + "`n",
+    [Text.UTF8Encoding]::new($false)
+  )
+  Start-Service -Name 'SumatraFuzzWorker' -ErrorAction Stop
+  $deadline = [DateTime]::UtcNow.AddSeconds(60)
+  do {
+    Start-Sleep -Milliseconds 250
+    $service = Get-Service -Name 'SumatraFuzzWorker' -ErrorAction SilentlyContinue
+  } while ($service -and $service.Status -ne 'Running' -and [DateTime]::UtcNow -lt $deadline)
+  if (-not $service -or $service.Status -ne 'Running') { throw 'Worker service did not recover after forced termination' }
+  $env:WORKER_SERVICE_VERIFY_FORCED_TERMINATION = 'true'
+  node --experimental-strip-types (Join-Path $RepoRoot 'scripts/windows/worker-service-acceptance.ts')
+  if ($LASTEXITCODE -ne 0) { throw 'Forced service termination recovery acceptance failed' }
+  Remove-Item Env:\WORKER_SERVICE_VERIFY_FORCED_TERMINATION -ErrorAction SilentlyContinue
+
   $env:WORKER_SERVICE_VERIFY_REVOCATION = 'true'
   node --experimental-strip-types (Join-Path $RepoRoot 'scripts/windows/worker-service-acceptance.ts')
   if ($LASTEXITCODE -ne 0) { throw 'Installed-service live revocation acceptance failed' }
@@ -328,6 +389,7 @@ try {
   if (-not (Test-Path -LiteralPath $dataEvidence -PathType Leaf)) { throw 'Worker uninstall deleted retained evidence' }
   Write-Output 'Verified installed-service mTLS, controller ownership, live revocation, DPAPI restart, quotas, and retained journal.'
 } finally {
+  Remove-Item Env:\WORKER_SERVICE_VERIFY_FORCED_TERMINATION -ErrorAction SilentlyContinue
   Remove-Item Env:\WORKER_SERVICE_VERIFY_REVOCATION -ErrorAction SilentlyContinue
   Remove-Item Env:\WORKER_SERVICE_ACCEPTANCE_CLEANUP -ErrorAction SilentlyContinue
   Remove-Item Env:\WORKER_SERVICE_FIXTURE_ROOT -ErrorAction SilentlyContinue

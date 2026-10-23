@@ -21,6 +21,9 @@ test('required Windows workflow exercises the installed service over authenticat
   assert.match(acceptance, /writeFreshRevocation/);
   assert.match(acceptance, /controller_disconnect_campaign_continued/);
   assert.match(acceptance, /afterDisconnect\.state === 'running'/);
+  assert.match(acceptance, /WORKER_SERVICE_VERIFY_FORCED_TERMINATION/);
+  assert.match(acceptance, /forced_service_termination_recovered_without_completion/);
+  assert.match(acceptance, /slot_remained_reserved_after_forced_termination/);
   assert.match(acceptance, /organization-private\.pem/);
   assert.doesNotMatch(acceptance, /new WorkerRunCoordinator/);
 
@@ -40,6 +43,9 @@ test('required Windows workflow exercises the installed service over authenticat
   assert.match(setup, /Assert-OrdinaryUserDenials/);
   assert.match(setup, /Assert-WorkerQuota -VolumeId/);
   assert.match(setup, /Get-NetTCPConnection -State Listen/);
+  assert.match(setup, /Stop-Process -Id \$serviceProcessId -Force/);
+  assert.match(setup, /WORKER_SERVICE_VERIFY_FORCED_TERMINATION/);
+  assert.match(setup, /forced-termination-run\.json/);
   assert.match(setup, /finally/);
   const denialProbe = read('scripts/windows/assert-worker-files-denied.ps1');
   assert.match(denialProbe, /Worker trust pipe was unavailable instead of denying/);
