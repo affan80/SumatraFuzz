@@ -65,6 +65,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
   const containmentRoot = mkdtempSync(path.join(os.tmpdir(), 'sumatrafuzz-child-scope-'));
   const toolDir = path.join(containmentRoot, 'tool');
   const evidenceDir = path.join(containmentRoot, 'evidence');
+  const siblingEvidenceDir = path.join(containmentRoot, 'sibling-evidence');
   const inputDir = path.join(containmentRoot, 'input');
   const protectedDir = path.join(containmentRoot, 'protected');
   const containmentProbePath = path.join(toolDir, path.basename(probePath));
@@ -76,6 +77,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
   const eventName = `SumatraFuzz-Restricted-Probe-${process.pid}`;
   mkdirSync(toolDir);
   mkdirSync(evidenceDir);
+  mkdirSync(siblingEvidenceDir);
   mkdirSync(inputDir);
   mkdirSync(protectedDir);
   copyFileSync(probePath, containmentProbePath);
@@ -161,6 +163,40 @@ test('Windows supervisor bounds and tears down a child process tree', {
       readdirSync(protectedDir),
       [],
       'restricted child process and its descendant must not write outside run evidence',
+    );
+    const siblingJob = supervisor.launchSuspended({
+      executable: containmentProbePath,
+      argv: [
+        '-D',
+        toolDir,
+        '-i',
+        inputDir,
+        '-o',
+        siblingEvidenceDir,
+        '--deny-open-event',
+        eventName,
+      ],
+      workingDir: containmentRoot,
+      evidenceDir: siblingEvidenceDir,
+      limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
+      fileProofs: [{ ...proof, path: containmentProbePath, root: toolDir }],
+    });
+    let siblingSample;
+    for (let i = 0; i < 100; i++) {
+      siblingSample = supervisor.sampleJob(siblingJob);
+      if (siblingSample.process_count === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const siblingReceipt = supervisor.stopJob(siblingJob, 0);
+    assert.equal(
+      siblingSample.process_count,
+      0,
+      'the sibling authorization probe must exit promptly',
+    );
+    assert.equal(
+      siblingReceipt.exitCode,
+      0,
+      'a separate restricted run must be denied access to this run’s named event',
     );
     const receipt = supervisor.stopJob(job, 0);
     job = undefined;
@@ -258,6 +294,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   assert.match(addon, /SetPrivateRestrictedDefaultDacl/);
   assert.match(addon, /WinRestrictedCodeSid/);
   assert.match(addon, /WinAuthenticatedUserSid/);
+  assert.match(addon, /WinBuiltinUsersSid/);
   assert.match(addon, /WinWorldSid/);
   assert.match(addon, /SetEntriesInAclW\(1, &grant, existing_dacl/);
   assert.match(addon, /grant\.Trustee, sid/);

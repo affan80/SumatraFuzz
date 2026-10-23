@@ -201,6 +201,16 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 int wmain(int argc, wchar_t** argv) {
   wchar_t secret[16]{};
   if (GetEnvironmentVariableW(L"SUMATRAFUZZ_TEST_SECRET", secret, static_cast<DWORD>(std::size(secret))) > 0) return 11;
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::wstring(argv[i]) == L"--deny-open-event") {
+      HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[i + 1]);
+      if (event) {
+        CloseHandle(event);
+        return 41;
+      }
+      return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 42;
+    }
+  }
   if (argc == 3 && std::wstring(argv[1]) == L"--create-event") {
     HANDLE event = CreateEventW(nullptr, TRUE, FALSE, argv[2]);
     if (!event) return 2400 + static_cast<int>(GetLastError());
