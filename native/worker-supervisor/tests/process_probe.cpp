@@ -74,7 +74,7 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
       !ProtectedReadsAndWritesDenied(protected_read, protected_write)) return 21;
   if (child) {
     HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str());
-    if (!event) return 22;
+    if (!event) return 2200 + static_cast<int>(GetLastError());
     const bool signaled = SetEvent(event) != FALSE;
     CloseHandle(event);
     if (!signaled) return 23;
@@ -83,7 +83,7 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   }
 
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-  if (!event) return 24;
+  if (!event) return 2400 + static_cast<int>(GetLastError());
   const std::vector<std::wstring> arguments{
       argv[0], L"--containment-probe", evidence_dir, input_path,
       protected_read, protected_write, event_name, L"--child"};
