@@ -118,6 +118,13 @@ test('Windows supervisor bounds and tears down a child process tree', {
       if (sample.process_count >= 2) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
+    if (sample.process_count < 2) {
+      const receipt = supervisor.stopJob(job, 0);
+      job = undefined;
+      assert.fail(
+        `probe process tree did not start (processes=${sample.process_count}, exit=${receipt.exitCode})`,
+      );
+    }
     assert.ok(
       sample.process_count >= 2,
       'probe child must stay in the job and must not inherit secrets',
