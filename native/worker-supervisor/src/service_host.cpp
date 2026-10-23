@@ -254,7 +254,7 @@ void RequireProtectedDacl(HANDLE file, ServiceWriteAccess service_write = Servic
       if (header->AceSize < offsetof(ACCESS_ALLOWED_OBJECT_ACE, ObjectType)) throw std::runtime_error("invalid object access-control entry");
       const auto* ace = static_cast<ACCESS_ALLOWED_OBJECT_ACE*>(raw);
       mask = ace->Mask;
-      BYTE* sid_start = reinterpret_cast<BYTE*>(const_cast<DWORD*>(&ace->ObjectType));
+      BYTE* sid_start = reinterpret_cast<BYTE*>(const_cast<GUID*>(&ace->ObjectType));
       if ((ace->Flags & ACE_OBJECT_TYPE_PRESENT) != 0) sid_start += sizeof(GUID);
       if ((ace->Flags & ACE_INHERITED_OBJECT_TYPE_PRESENT) != 0) sid_start += sizeof(GUID);
       if (sid_start >= reinterpret_cast<BYTE*>(raw) + header->AceSize) throw std::runtime_error("invalid object access-control SID");

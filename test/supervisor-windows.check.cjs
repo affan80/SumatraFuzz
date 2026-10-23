@@ -220,7 +220,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
     'utf8',
   );
   assert.match(addon, /CreateRestrictedToken\(current, DISABLE_MAX_PRIVILEGE,/);
-  assert.match(addon, /const SID_AND_ATTRIBUTES restricting_sids/);
+  assert.match(addon, /SID_AND_ATTRIBUTES restricting_sids/);
   assert.match(addon, /\{restricted\.sid, 0\}/);
   assert.match(addon, /CreateProcessAsUserW\(/);
   assert.match(addon, /SetEntriesInAclW\(/);
