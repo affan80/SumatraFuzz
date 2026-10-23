@@ -40,6 +40,11 @@ const fingerprint = (certificate) =>
 
 await writeFile(path.join(output, 'organization-public.pem'), signingPublicKey, { mode: 0o600 });
 await writeFile(
+  path.join(output, 'organization-private.pem'),
+  signing.privateKey.export({ type: 'pkcs8', format: 'pem' }),
+  { mode: 0o600 },
+);
+await writeFile(
   path.join(output, 'worker-credentials.json'),
   `${JSON.stringify({
     schema: 1,
@@ -74,28 +79,6 @@ for (let index = 0; index < controllers.length; index++) {
   }
 }
 
-const revokePayload = Buffer.from(
-  JSON.stringify({
-    format: 'sumatrafuzz-worker-trust-operation-v1',
-    workerId,
-    issuedAt: new Date(Date.now() - 1000).toISOString(),
-    expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
-    operation: {
-      type: 'unpair_controller',
-      controllerId: controllers[0].id,
-      fingerprint: null,
-    },
-  }),
-);
-const { sign } = await import('node:crypto');
-const revokeBundle = Buffer.from(
-  JSON.stringify({
-    format: 'sumatrafuzz-worker-pairing-bundle-v1',
-    payload: revokePayload.toString('base64'),
-    signature: sign(null, revokePayload, signingPrivateKey).toString('base64'),
-  }),
-);
-await writeFile(path.join(output, 'revoke-controller-1.sftxn'), revokeBundle, { mode: 0o600 });
 await writeFile(
   path.join(output, 'fixture-summary.json'),
   `${JSON.stringify({ workerId, controllerIds: controllers.map(({ id }) => id) })}\n`,

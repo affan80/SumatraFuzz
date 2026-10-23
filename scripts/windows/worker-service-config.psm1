@@ -203,8 +203,21 @@ function Assert-WorkerDataMountPoint {
   if ($volume.FileSystem -ne 'NTFS') { throw 'Worker data volume is not the expected NTFS volume' }
   $mountedVolume = Get-Volume -FilePath $fullDataRoot -ErrorAction Stop
   # MSFT_Volume.Path is a GUID path; registered mounted folders are partition AccessPaths.
-  $partitions = @(Get-Partition -Volume $volume -ErrorAction Stop)
-  $mountPaths = @($partitions | ForEach-Object { $_.AccessPaths } | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+  $partitions = @(Get-Partition -ErrorAction Stop)
+  $mountPaths = @(
+    $partitions |
+      ForEach-Object { $_.AccessPaths } |
+      Where-Object { $_ } |
+      ForEach-Object {
+        $candidate = [IO.Path]::GetFullPath($_).TrimEnd('\')
+        try {
+          $candidateVolume = Get-Volume -FilePath $candidate -ErrorAction Stop
+          if ((Get-WorkerVolumeGuid $candidateVolume.UniqueId) -eq $expectedGuid) { $candidate }
+        } catch {
+          # An unavailable or ambiguous access path cannot prove mount ownership.
+        }
+      }
+  )
   if ((Get-WorkerVolumeGuid $mountedVolume.UniqueId) -ne $expectedGuid -or $fullDataRoot -notin $mountPaths) {
     throw 'Worker data reparse point is not the exact configured dedicated-volume mount point'
   }

@@ -18,6 +18,8 @@ test('required Windows workflow exercises the installed service over authenticat
   assert.match(acceptance, /importInputBundle/);
   assert.match(acceptance, /startRun/);
   assert.match(acceptance, /stopRun/);
+  assert.match(acceptance, /writeFreshRevocation/);
+  assert.match(acceptance, /organization-private\.pem/);
   assert.doesNotMatch(acceptance, /new WorkerRunCoordinator/);
 
   const setupPath = 'scripts/windows/worker-service-acceptance.ps1';

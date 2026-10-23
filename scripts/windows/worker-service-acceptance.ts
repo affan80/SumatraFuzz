@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPrivateKey, randomUUID, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -70,6 +70,47 @@ function client(profile: FixtureProfile) {
     workerFingerprint: profile.workerFingerprint,
     timeoutMs: 30_000,
   });
+}
+
+async function writeFreshRevocation(profile: FixtureProfile): Promise<string> {
+  invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+  const privateKeyBytes = await readFile(path.join(fixtureRoot, 'organization-private.pem'));
+  const transactionPath = path.join(fixtureRoot, 'revoke-controller-1.sftxn');
+  let payload: Buffer | undefined;
+  let signature: Buffer | undefined;
+  let envelope: Buffer | undefined;
+  try {
+    const privateKey = createPrivateKey(privateKeyBytes);
+    const issuedAt = new Date();
+    payload = Buffer.from(
+      JSON.stringify({
+        format: 'sumatrafuzz-worker-trust-operation-v1',
+        workerId: profile.workerId,
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: new Date(issuedAt.getTime() + 5 * 60_000).toISOString(),
+        operation: {
+          type: 'unpair_controller',
+          controllerId: profile.controllerId,
+          fingerprint: null,
+        },
+      }),
+    );
+    signature = sign(null, payload, privateKey);
+    envelope = Buffer.from(
+      JSON.stringify({
+        format: 'sumatrafuzz-worker-pairing-bundle-v1',
+        payload: payload.toString('base64'),
+        signature: signature.toString('base64'),
+      }),
+    );
+    await writeFile(transactionPath, envelope, { flag: 'wx', mode: 0o600 });
+    return transactionPath;
+  } finally {
+    privateKeyBytes.fill(0);
+    payload?.fill(0);
+    signature?.fill(0);
+    envelope?.fill(0);
+  }
 }
 
 async function main(): Promise<void> {
@@ -193,7 +234,7 @@ async function main(): Promise<void> {
     invariant(teardown >= 0 && finalized > teardown && completed > finalized, 'service event history does not prove ordered teardown and finalization');
 
     invariant(process.env.WORKER_SERVICE_PROVISIONER_PATH, 'live trust provisioner path is unavailable');
-    invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+    const revocationPath = await writeFreshRevocation(firstProfile);
     execFileSync(
       'pwsh',
       [
@@ -202,7 +243,7 @@ async function main(): Promise<void> {
         '-File',
         process.env.WORKER_SERVICE_PROVISIONER_PATH,
         '-TrustOperationPath',
-        path.join(fixtureRoot, 'revoke-controller-1.sftxn'),
+        revocationPath,
         '-Live',
       ],
       { cwd: root, stdio: 'pipe', windowsHide: true },
