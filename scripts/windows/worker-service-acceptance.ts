@@ -150,7 +150,7 @@ async function main(): Promise<void> {
   }
   const unpairedProfile = await readProfile('controller-3.json');
   invariant(firstProfile.workerId === secondProfile.workerId, 'test controllers do not share a worker identity');
-  const first = client(firstProfile);
+  let first = client(firstProfile);
   const second = client(secondProfile);
   const unpaired = client(unpairedProfile);
   let archive: Buffer | undefined;
@@ -187,6 +187,15 @@ async function main(): Promise<void> {
     const started = await first.startRun(request);
     invariant(started.state === 'running', 'installed service did not start a running campaign');
     runId = started.run_id;
+
+    first.close();
+    await pause(2_000);
+    first = client(firstProfile);
+    const afterDisconnect = await first.getRun(started.run_id);
+    invariant(
+      afterDisconnect.state === 'running',
+      'controller disconnect stopped or lost the active installed-service campaign',
+    );
 
     let crossControllerDenied = false;
     try {
@@ -275,6 +284,7 @@ async function main(): Promise<void> {
       paired_controllers: 2,
       unpaired_certificate_denied: true,
       cross_controller_run_denied: true,
+      controller_disconnect_campaign_continued: afterDisconnect.state === 'running',
       live_revocation_destroyed_existing_session: true,
       event_types: eventTypes,
     };

@@ -19,6 +19,8 @@ test('required Windows workflow exercises the installed service over authenticat
   assert.match(acceptance, /startRun/);
   assert.match(acceptance, /stopRun/);
   assert.match(acceptance, /writeFreshRevocation/);
+  assert.match(acceptance, /controller_disconnect_campaign_continued/);
+  assert.match(acceptance, /afterDisconnect\.state === 'running'/);
   assert.match(acceptance, /organization-private\.pem/);
   assert.doesNotMatch(acceptance, /new WorkerRunCoordinator/);
 

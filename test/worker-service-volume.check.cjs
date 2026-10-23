@@ -6,7 +6,9 @@ test('install and provisioning share the exact dedicated-volume mount validation
   const module = readFileSync('scripts/windows/worker-service-config.psm1', 'utf8');
   const provision = readFileSync('scripts/windows/provision-worker-service.ps1', 'utf8');
   assert.match(module, /function Assert-WorkerDataMountPoint/);
-  assert.match(module, /Get-Partition -Volume \$volume/);
+  assert.match(module, /Get-Partition -ErrorAction Stop/);
+  assert.match(module, /Get-Volume -FilePath \$fullDataRoot/);
+  assert.match(module, /Get-Volume -FilePath \$candidate/);
   assert.match(module, /\.AccessPaths/);
   assert.match(module, /Assert-WorkerDataMountPoint -DataRoot \$DataRoot/);
   assert.match(provision, /Assert-WorkerDataMountPoint -DataRoot \$dataRoot/);
