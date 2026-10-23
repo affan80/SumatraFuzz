@@ -293,12 +293,6 @@ RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) 
     CloseHandle(current);
     throw std::runtime_error("could not initialize namespace restricting SID");
   }
-  std::array<BYTE, SECURITY_MAX_SID_SIZE> builtin_users_buffer{};
-  DWORD builtin_users_size = static_cast<DWORD>(builtin_users_buffer.size());
-  if (!CreateWellKnownSid(WinBuiltinUsersSid, nullptr, builtin_users_buffer.data(), &builtin_users_size)) {
-    CloseHandle(current);
-    throw std::runtime_error("could not initialize local users restricting SID");
-  }
   PSID restricted_code_buffer = nullptr;
   DWORD restricted_code_size = 0;
   CreateWellKnownSid(WinRestrictedCodeSid, nullptr, nullptr, &restricted_code_size);
@@ -315,17 +309,14 @@ RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) 
   SID_AND_ATTRIBUTES restricting_sids[] = {
       {restricted.sid, 0},
       {restricted_code_buffer, 0},
-      // The session's BaseNamedObjects directory grants authenticated users
-      // and local users namespace access. Include both SIDs only in the
-      // restricting check; the token default DACL still grants new objects
-      // only to the worker and this run's random SID, preserving sibling-run
-      // isolation.
+      // Keep this SID in the restricting check for session namespace access;
+      // it is not added to the token's default object DACL, which grants new
+      // objects only to the worker and this run's random SID.
       {authenticated_users_buffer.data(), 0},
-      {builtin_users_buffer.data(), 0},
       {everyone_buffer.data(), 0},
   };
   const BOOL created = CreateRestrictedToken(current, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr,
-                                              5, restricting_sids, &restricted.handle);
+                                              4, restricting_sids, &restricted.handle);
   if (created) {
     try {
       SetPrivateRestrictedDefaultDacl(current, restricted.handle, restricted.sid);
