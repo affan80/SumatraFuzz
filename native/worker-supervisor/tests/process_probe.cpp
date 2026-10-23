@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,88 @@ bool WriteNamedEventMarker(const std::wstring& evidence_dir) {
   const bool okay = WriteFile(file, data, sizeof(data), &written, nullptr) && written == sizeof(data);
   CloseHandle(file);
   return okay;
+}
+
+std::string SidText(PSID sid) {
+  if (!sid || !IsValidSid(sid)) return "invalid";
+  const auto* authority = GetSidIdentifierAuthority(sid);
+  const DWORD count = *GetSidSubAuthorityCount(sid);
+  std::ostringstream output;
+  output << "S-" << static_cast<unsigned>(SID_REVISION) << '-';
+  unsigned long long identifier = 0;
+  for (unsigned int i = 0; i < 6; ++i) identifier = (identifier << 8) | authority->Value[i];
+  output << identifier;
+  for (DWORD i = 0; i < count; ++i) output << '-' << *GetSidSubAuthority(sid, i);
+  return output.str();
+}
+
+void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error) {
+  std::ostringstream output;
+  output << "CreateEventW_error=" << error << '\n';
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    output << "OpenProcessToken_error=" << GetLastError() << '\n';
+  } else {
+    auto read_token_information = [&](TOKEN_INFORMATION_CLASS kind, const char* label) {
+      DWORD bytes = 0;
+      GetTokenInformation(token, kind, nullptr, 0, &bytes);
+      if (bytes == 0) {
+        output << label << "_error=" << GetLastError() << '\n';
+        return std::vector<BYTE>{};
+      }
+      std::vector<BYTE> storage(bytes);
+      if (!GetTokenInformation(token, kind, storage.data(), bytes, &bytes)) {
+        output << label << "_error=" << GetLastError() << '\n';
+        return std::vector<BYTE>{};
+      }
+      return storage;
+    };
+    const auto user_storage = read_token_information(TokenUser, "TokenUser");
+    if (!user_storage.empty()) {
+      const auto* user = reinterpret_cast<const TOKEN_USER*>(user_storage.data());
+      output << "user=" << SidText(user->User.Sid) << '\n';
+    }
+    const auto restricted_storage = read_token_information(TokenRestrictedSids, "TokenRestrictedSids");
+    if (!restricted_storage.empty()) {
+      const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricted_storage.data());
+      output << "restricted_sid_count=" << groups->GroupCount << '\n';
+      for (DWORD i = 0; i < groups->GroupCount; ++i) {
+        output << "restricted_sid=" << SidText(groups->Groups[i].Sid) << '\n';
+      }
+    }
+    const auto dacl_storage = read_token_information(TokenDefaultDacl, "TokenDefaultDacl");
+    if (!dacl_storage.empty()) {
+      const auto* token_dacl = reinterpret_cast<const TOKEN_DEFAULT_DACL*>(dacl_storage.data());
+      if (token_dacl->DefaultDacl && IsValidAcl(token_dacl->DefaultDacl)) {
+        output << "default_dacl_ace_count=" << token_dacl->DefaultDacl->AceCount << '\n';
+        for (DWORD i = 0; i < token_dacl->DefaultDacl->AceCount; ++i) {
+          void* raw_ace = nullptr;
+          if (!GetAce(token_dacl->DefaultDacl, i, &raw_ace)) continue;
+          const auto* header = static_cast<const ACE_HEADER*>(raw_ace);
+          if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+            output << "default_allow=" << ace->Mask << ':'
+                   << SidText(const_cast<DWORD*>(&ace->SidStart)) << '\n';
+          } else if (header->AceType == ACCESS_DENIED_ACE_TYPE) {
+            const auto* ace = static_cast<const ACCESS_DENIED_ACE*>(raw_ace);
+            output << "default_deny=" << ace->Mask << ':'
+                   << SidText(const_cast<DWORD*>(&ace->SidStart)) << '\n';
+          }
+        }
+      } else {
+        output << "default_dacl=invalid\n";
+      }
+    }
+    CloseHandle(token);
+  }
+  const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
+  HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (report == INVALID_HANDLE_VALUE) return;
+  const std::string contents = output.str();
+  DWORD written = 0;
+  WriteFile(report, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr);
+  CloseHandle(report);
 }
 
 bool ProtectedReadsAndWritesDenied(const std::wstring& protected_read,
@@ -83,7 +166,11 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   }
 
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-  if (!event) return 2400 + static_cast<int>(GetLastError());
+  if (!event) {
+    const DWORD error = GetLastError();
+    WriteNamedEventFailureDiagnostic(evidence_dir, error);
+    return 2400 + static_cast<int>(error);
+  }
   const std::vector<std::wstring> arguments{
       argv[0], L"--containment-probe", evidence_dir, input_path,
       protected_read, protected_write, event_name, L"--child"};

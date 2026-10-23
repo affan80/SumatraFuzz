@@ -135,8 +135,14 @@ test('Windows supervisor bounds and tears down a child process tree', {
     if (sample.process_count < 2) {
       const receipt = supervisor.stopJob(job, 0);
       job = undefined;
+      const eventDiagnostic = readdirSync(evidenceDir)
+        .filter((name) => name === 'named-event-diagnostic.txt')
+        .map((name) => readFileSync(path.join(evidenceDir, name), 'utf8'))
+        .join('\n');
       assert.fail(
-        `probe process tree did not start (processes=${sample.process_count}, exit=${receipt.exitCode})`,
+        `probe process tree did not start (processes=${sample.process_count}, exit=${receipt.exitCode})${
+          eventDiagnostic ? `\n${eventDiagnostic}` : ''
+        }`,
       );
     }
     assert.ok(
