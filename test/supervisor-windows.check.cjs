@@ -83,6 +83,13 @@ test('Windows supervisor bounds and tears down a child process tree', {
   copyFileSync(probePath, containmentProbePath);
   writeFileSync(inputPath, 'pdf input sentinel');
   writeFileSync(protectedReadPath, 'service-only trust and DPAPI sentinel');
+  // Temporary directories may grant BUILTIN\Users access. Match the worker's
+  // protected trust/credential ACL so adding namespace-only restricting SIDs
+  // cannot accidentally make this sentinel readable to the probe.
+  execFileSync('icacls.exe', [protectedDir, '/inheritance:d', '/T'], { stdio: 'ignore' });
+  execFileSync('icacls.exe', [protectedDir, '/remove:g', '*S-1-5-32-545', '/T'], {
+    stdio: 'ignore',
+  });
   const baselineEnvironment = { ...process.env };
   delete baselineEnvironment.SUMATRAFUZZ_TEST_SECRET;
   execFileSync(containmentProbePath, ['--create-event', `${eventName}-baseline`], {
