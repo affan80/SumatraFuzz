@@ -94,15 +94,25 @@
 **Files:**
 - Create: `scripts/windows/worker-service-acceptance.ts`
 - Create: `scripts/windows/tests/worker-service-acceptance.Tests.ps1`
+- Modify: `native/worker-supervisor/include/service_host.h`
+- Modify: `native/worker-supervisor/src/service_host.cpp`
+- Modify: `native/worker-supervisor/tests/service_host_contract_tests.cpp`
+- Modify: `apps/worker-service/src/service-control.ts`
+- Modify: `apps/worker-service/src/service-entry.ts`
+- Modify: `apps/worker-service/test/service-control.test.ts`
 - Modify: `.github/workflows/electron-typescript.yml`
 - Modify: `.github/workflows/repository-checks.yml`
 - Modify: `scripts/windows/ci-native-gate.ps1`
 - Modify: `docs/security/worker-trust-acceptance.md`
 
-- [ ] Add failing workflow-contract tests requiring install/start/revoke/stop/restart/uninstall and the native worker acceptance to use the installed service path.
-- [ ] Run static workflow tests and confirm the current direct-coordinator acceptance does not satisfy them.
+- [x] Add failing workflow-contract tests requiring install/start/revoke/stop/restart/uninstall and the native worker acceptance to use the installed service path.
+- [x] Run the static workflow tests; the direct-coordinator acceptance failed the contract and the installed-service route passes it.
 - [ ] Add a disposable Windows x64 job where only install/configuration is elevated; assert service, Node worker, and parser descendants run as the service SID.
 - [ ] Pair with two controllers; verify wrong user, revoked reused session, cross-controller resource access, loopback/private adapter, scoped firewall, controller disconnect, disk/quota failure, DPAPI failure, and forced stop.
+- [ ] While the installed service is running, submit a signed revoke/unpair transaction through the native host's administrator-only local named pipe; verify the pipe rejects remote and nonadministrator callers, bounds frames/timeouts, returns only generic results, and the worker verifies/audits against the same persistent trust store used by the HTTPS listener.
+- [ ] Submit a signed controller pairing/rotation bundle through the same pipe and verify the ignored `controllerPrivateKeyPem` never reaches audit/storage; keep worker key/certificate replacement on the protected stopped-service bootstrap path.
+- [ ] Verify a revoked controller's already-open keep-alive/TLS connection is denied and destroyed after the durable trust mutation; verify audit-intent failure leaves trust unchanged and mutation/result-audit ambiguity returns failure without leaking transaction data.
+- [ ] Retain protected startup staging for initial pairing/credential bootstrap and operations while stopped; verify the provisioner uses the live pipe for an active service and never reports success before worker confirmation.
 - [ ] Execute genuine pinned WinAFL/DynamoRIO/SumatraPDF acceptance through the installed mTLS service; require actual execution counts, valid receipts, and hash-verified final artifacts.
 - [ ] Upload only bounded sanitized metadata, hashes, identity/token assertions, and receipts; never upload credentials, PDF corpora, raw private logs, or key material.
 - [ ] Run the exact Windows workflow and all required checks on its exact source commit; keep issue #91 open until review, merge, and linked Windows evidence exist.

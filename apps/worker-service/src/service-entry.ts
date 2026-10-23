@@ -511,7 +511,11 @@ function validateCredentials(key: Buffer, certificate: Buffer, ca: Buffer): void
   }
 }
 
-async function startWorkerService(): Promise<{ close(): Promise<void> }> {
+async function startWorkerService(): Promise<{
+  close(): Promise<void>;
+  applyTrustOperation(bundle: Buffer): Promise<void>;
+  applyPairingBundle(bundle: Buffer): Promise<void>;
+}> {
   if (process.platform !== 'win32' || process.arch !== 'x64')
     throw new Error('unsupported worker service platform');
   const paths = deriveWorkerServicePaths(
@@ -545,6 +549,7 @@ async function startWorkerService(): Promise<{ close(): Promise<void> }> {
   let stagedCredentials: { key: Buffer; certificate: Buffer; ca: Buffer } | undefined;
   let trust: SqliteWorkerTrustStore | undefined;
   let audit: FileSecurityAudit | undefined;
+  let trustAdministration: AuditedTrustAdministration | undefined;
   try {
     const signingKey = await readBoundedRegularFile(paths.signingKeyPath, SIGNING_KEY_MAX_BYTES);
     let signingKeyPem: string;
@@ -637,29 +642,33 @@ async function startWorkerService(): Promise<{ close(): Promise<void> }> {
     });
     const auditHealth = await audit.verifyAndRecover();
     if (auditHealth.state !== 'healthy') throw new Error('worker service audit is unavailable');
+    trustAdministration = new AuditedTrustAdministration(trust, audit);
+    const workerCertificatePem = credentials.certificate.toString('utf8');
+    const trustedCaPem = credentials.ca.toString('utf8');
+    const pairingPermissions = [
+      'capabilities:read',
+      'input-bundles:write',
+      'runs:start',
+      'runs:read',
+      'runs:stop',
+      'events:read',
+      'artifacts:read',
+    ] as const;
     if (stagedPairingBundle?.length) {
       await verifyAndProvisionPairingBundle(stagedPairingBundle, {
         expectedWorkerId: config.workerId,
-        workerCertificatePem: credentials.certificate.toString('utf8'),
-        trustedCaPem: credentials.ca.toString('utf8'),
+        workerCertificatePem,
+        trustedCaPem,
         trustedOrgPublicKeys: [signingKeyPem],
-        permissions: [
-          'capabilities:read',
-          'input-bundles:write',
-          'runs:start',
-          'runs:read',
-          'runs:stop',
-          'events:read',
-          'artifacts:read',
-        ],
-        trust: new AuditedTrustAdministration(trust, audit),
+        permissions: pairingPermissions,
+        trust: trustAdministration,
       });
     }
     if (stagedTrustOperation?.length) {
       await verifyAndApplySignedTrustOperation(stagedTrustOperation, {
         expectedWorkerId: config.workerId,
         trustedOrgPublicKeys: [signingKeyPem],
-        trust: new AuditedTrustAdministration(trust, audit),
+        trust: trustAdministration,
       });
     }
     const now = new Date();
@@ -690,17 +699,44 @@ async function startWorkerService(): Promise<{ close(): Promise<void> }> {
     });
     trust = undefined;
     audit = undefined;
-    if (config.bind.mode === 'local') return app;
-    const monitor = monitorNetworkBinding(
-      () =>
-        supervisor.assertWorkerServiceNetworkBinding(config.bind.adapterGuid, config.bind.address),
-      () => app.server.close(),
-    );
+    const monitor =
+      config.bind.mode === 'remote'
+        ? monitorNetworkBinding(
+            () =>
+              supervisor.assertWorkerServiceNetworkBinding(
+                config.bind.adapterGuid,
+                config.bind.address,
+              ),
+            () => app.server.close(),
+          )
+        : undefined;
     return {
       async close() {
-        const results = await Promise.allSettled([monitor.stop(), app.close()]);
+        const results = await Promise.allSettled([
+          ...(monitor ? [monitor.stop()] : []),
+          app.close(),
+        ]);
         if (results.some((result) => result.status === 'rejected'))
           throw new Error('worker service shutdown failed');
+      },
+      async applyTrustOperation(bundle) {
+        if (!trustAdministration) throw new Error('worker trust operation failed');
+        await verifyAndApplySignedTrustOperation(bundle, {
+          expectedWorkerId: config.workerId,
+          trustedOrgPublicKeys: [signingKeyPem],
+          trust: trustAdministration,
+        });
+      },
+      async applyPairingBundle(bundle) {
+        if (!trustAdministration) throw new Error('Worker pairing provisioning failed');
+        await verifyAndProvisionPairingBundle(bundle, {
+          expectedWorkerId: config.workerId,
+          workerCertificatePem,
+          trustedCaPem,
+          trustedOrgPublicKeys: [signingKeyPem],
+          permissions: pairingPermissions,
+          trust: trustAdministration,
+        });
       },
     };
   } catch (error) {

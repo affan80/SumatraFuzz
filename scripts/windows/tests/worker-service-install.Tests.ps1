@@ -4,6 +4,18 @@ BeforeAll {
 }
 
 Describe 'Worker service policy validation' {
+  It 'parses the protected provisioning entrypoint and live-pipe identity check' {
+    $scriptPath = Join-Path $PSScriptRoot '../provision-worker-service.ps1'
+    $tokens = $null
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    $parseErrors | Should -BeNullOrEmpty
+    $source = [IO.File]::ReadAllText($scriptPath)
+    $source | Should -Match 'GetNamedPipeServerProcessId'
+    $source | Should -Match '\$serverProcessId\s+-ne\s+\$ExpectedServerProcessId'
+    $source | Should -Match '\$useLive\s*=\s*\[bool\]\$Live\s*-or'
+  }
+
   It 'locks the runtime root and validates every existing descendant before service startup' {
     $root = Join-Path $TestDrive 'runtime-state'
     $nested = Join-Path $root 'security'
@@ -263,16 +275,23 @@ Describe 'Worker service policy validation' {
   }
 
   It 'accepts only the exact dedicated-volume mount at the fixed worker data root' {
-    $dataRoot = Join-Path $TestDrive 'SumatraFuzz\Worker'
+    $dataRoot = Join-Path ([IO.Path]::GetPathRoot($env:SystemRoot)) 'ProgramData\SumatraFuzz\Worker'
     $installRoot = Join-Path $TestDrive 'Program Files\SumatraFuzz'
-    [void](New-Item -ItemType Directory -Path $dataRoot -Force)
     [void](New-Item -ItemType Directory -Path $installRoot -Force)
-    $expected = [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = @($dataRoot) }
+    $expected = [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = '\\?\Volume{11111111-1111-1111-1111-111111111111}\' }
     $system = [pscustomobject]@{ UniqueId = 'volume{22222222-2222-2222-2222-222222222222}'; FileSystem = 'NTFS'; Path = @((Split-Path -Qualifier $installRoot) + '\') }
     Mock Get-Volume -ModuleName worker-service-config {
+      if ($FilePath -eq $dataRoot) { return $expected }
       if ($FilePath) { return $system }
       return @($expected)
     }
+    Mock Get-Partition -ModuleName worker-service-config { [pscustomobject]@{ AccessPaths = @(($dataRoot + '\'), $expected.Path) } }
+    Mock Get-Item -ModuleName worker-service-config {
+      $attributes = [IO.FileAttributes]::Directory
+      if ($LiteralPath -eq $dataRoot) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      [pscustomobject]@{ PSIsContainer = $true; Attributes = $attributes }
+    }
+    Mock Get-ChildItem -ModuleName worker-service-config { @() }
 
     (Assert-WorkerDataVolume -DataRoot $dataRoot -InstallRoot $installRoot -ExpectedVolumeId $expected.UniqueId).UniqueId | Should -Be $expected.UniqueId
   }
@@ -285,6 +304,75 @@ Describe 'Worker service policy validation' {
 
   It 'requires the fixed native-host install root name' {
     { Resolve-WorkerInstallLayout -InstallRoot 'C:\Program Files\OtherName' } | Should -Throw '*fixed SumatraFuzz directory*'
+  }
+}
+
+Describe 'Exact worker data mount policy shared by installation and provisioning' {
+  BeforeEach {
+    $script:mountDataRoot = Join-Path ([IO.Path]::GetPathRoot($env:SystemRoot)) 'ProgramData\SumatraFuzz\Worker'
+    $script:mountVolume = [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = '\\?\Volume{11111111-1111-1111-1111-111111111111}\' }
+    $script:mountSystem = [pscustomobject]@{ UniqueId = 'volume{22222222-2222-2222-2222-222222222222}'; FileSystem = 'NTFS' }
+    $script:mountAccessPaths = @(($script:mountDataRoot + '\'), $script:mountVolume.Path)
+    $script:mountRootAttributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+    Mock Get-Volume -ModuleName worker-service-config {
+      if (-not $FilePath -or $FilePath -eq $script:mountDataRoot) { return $script:mountVolume }
+      return $script:mountSystem
+    }
+    Mock Get-Partition -ModuleName worker-service-config { [pscustomobject]@{ AccessPaths = $script:mountAccessPaths } }
+    Mock Get-Item -ModuleName worker-service-config {
+      $attributes = if ($LiteralPath -eq $script:mountDataRoot) { $script:mountRootAttributes } else { [IO.FileAttributes]::Directory }
+      [pscustomobject]@{ PSIsContainer = $true; Attributes = $attributes }
+    }
+  }
+
+  It 'allows the exact registered mount and returns its verified NTFS volume' {
+    (Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId).UniqueId | Should -Be 'volume{11111111-1111-1111-1111-111111111111}'
+  }
+
+  It 'rejects a normal directory even when volume metadata claims the expected volume' {
+    $script:mountRootAttributes = [IO.FileAttributes]::Directory
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*mount point*'
+  }
+
+  It 'rejects an ordinary junction that is not a registered volume access path' {
+    $script:mountAccessPaths = @('D:\', $script:mountVolume.Path)
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*exact configured*'
+  }
+
+  It 'rejects a volume mounted at the parent instead of the exact worker root' {
+    $script:mountAccessPaths = @((Split-Path -Parent $script:mountDataRoot) + '\')
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*exact configured*'
+  }
+
+  It 'rejects an unavailable expected GUID' {
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId 'volume{33333333-3333-3333-3333-333333333333}' } | Should -Throw '*unavailable or ambiguous*'
+  }
+
+  It 'rejects a non-NTFS data volume' {
+    $script:mountVolume.FileSystem = 'ReFS'
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*NTFS*'
+  }
+
+  It 'rejects a mount redirected to another volume after enumeration' {
+    Mock Get-Volume -ModuleName worker-service-config {
+      if ($FilePath) { return $script:mountSystem }
+      return $script:mountVolume
+    }
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*exact configured*'
+  }
+
+  It 'rejects data on the Windows or installed-code volume' {
+    $script:mountSystem = $script:mountVolume
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*separate*'
+  }
+
+  It 'rejects a redirected ancestor of the fixed worker root' {
+    Mock Get-Item -ModuleName worker-service-config { [pscustomobject]@{ PSIsContainer = $true; Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint } }
+    { Assert-WorkerDataMountPoint -DataRoot $script:mountDataRoot -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*ancestor*'
+  }
+
+  It 'rejects an alternate data-root path' {
+    { Assert-WorkerDataMountPoint -DataRoot 'D:\Worker' -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId $script:mountVolume.UniqueId } | Should -Throw '*fixed*'
   }
 }
 

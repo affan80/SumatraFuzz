@@ -171,64 +171,70 @@ function Get-WorkerVolumeGuid {
   return "volume{$($match.Groups[1].Value.ToLowerInvariant())}"
 }
 
-function Assert-WorkerDataVolume {
+function Assert-WorkerDataMountPoint {
   [CmdletBinding()]
   param(
-    [Parameter(Mandatory)][string]$DataRoot = $script:WorkerDataRoot,
+    [string]$DataRoot = $script:WorkerDataRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
     [Parameter(Mandatory)][string]$ExpectedVolumeId
   )
-
+  $fullDataRoot = [IO.Path]::GetFullPath($DataRoot).TrimEnd('\')
+  if ($fullDataRoot -ine [IO.Path]::GetFullPath($script:WorkerDataRoot).TrimEnd('\')) {
+    throw 'Worker data must use the fixed dedicated-volume mount point'
+  }
+  $rootItem = Get-Item -LiteralPath $fullDataRoot -Force -ErrorAction Stop
+  if (-not $rootItem.PSIsContainer -or -not ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'Worker data root must be a dedicated-volume mount point'
+  }
+  $ancestor = Split-Path -Parent $fullDataRoot
+  while ($ancestor) {
+    $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw 'Worker data ancestor is missing or redirected'
+    }
+    $parent = Split-Path -Parent $ancestor
+    if ($parent -eq $ancestor) { break }
+    $ancestor = $parent
+  }
   $expectedGuid = Get-WorkerVolumeGuid $ExpectedVolumeId
   $volumeMatches = @(Get-Volume -ErrorAction Stop | Where-Object { try { (Get-WorkerVolumeGuid $_.UniqueId) -eq $expectedGuid } catch { $false } })
   if ($volumeMatches.Count -ne 1) { throw 'Expected worker data volume is unavailable or ambiguous' }
   $volume = $volumeMatches[0]
-  if ($volume.FileSystem -ne 'NTFS' -or (Get-WorkerVolumeGuid $volume.UniqueId) -ne $expectedGuid) {
-    throw 'Worker data volume is not the expected NTFS volume'
+  if ($volume.FileSystem -ne 'NTFS') { throw 'Worker data volume is not the expected NTFS volume' }
+  $mountedVolume = Get-Volume -FilePath $fullDataRoot -ErrorAction Stop
+  # MSFT_Volume.Path is a GUID path; registered mounted folders are partition AccessPaths.
+  $partitions = @(Get-Partition -Volume $volume -ErrorAction Stop)
+  $mountPaths = @($partitions | ForEach-Object { $_.AccessPaths } | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+  if ((Get-WorkerVolumeGuid $mountedVolume.UniqueId) -ne $expectedGuid -or $fullDataRoot -notin $mountPaths) {
+    throw 'Worker data reparse point is not the exact configured dedicated-volume mount point'
   }
-  $installVolume = Get-Volume -FilePath $InstallRoot -ErrorAction Stop
-  if ((Get-WorkerVolumeGuid $installVolume.UniqueId) -eq $expectedGuid) {
-    throw 'Worker data must use a dedicated volume separate from installed code'
+  foreach ($protectedPath in @($InstallRoot, $env:SystemRoot)) {
+    $protectedVolume = Get-Volume -FilePath $protectedPath -ErrorAction Stop
+    if ((Get-WorkerVolumeGuid $protectedVolume.UniqueId) -eq $expectedGuid) {
+      throw 'Worker data must use a dedicated volume separate from installed code and Windows'
+    }
   }
+  return $volume
+}
 
-  $mounts = @($volume.Path | Where-Object { $_ })
-  $fullDataRoot = [IO.Path]::GetFullPath($DataRoot).TrimEnd('\')
-  $mount = $mounts | Where-Object {
-    $candidate = [IO.Path]::GetFullPath($_).TrimEnd('\')
-    $fullDataRoot.Equals($candidate, [StringComparison]::OrdinalIgnoreCase) -or $fullDataRoot.StartsWith($candidate + '\', [StringComparison]::OrdinalIgnoreCase)
-  } | Sort-Object Length -Descending | Select-Object -First 1
-  if (-not $mount) { throw 'Expected worker data volume is not mounted at the host fixed data path' }
-  $mountRoot = [IO.Path]::GetFullPath($mount).TrimEnd('\')
-  $relative = $fullDataRoot.Substring($mountRoot.Length).TrimStart('\', '/')
-  $segments = @($relative -split '[\\/]+' | Where-Object { $_ })
-  $expectedRelative = @('Worker', 'SumatraFuzz\Worker', '')
-  if (($segments -join '\') -notin $expectedRelative) {
-    throw 'Worker data volume must be mounted at SumatraFuzz, Worker, or the exact data root'
-  }
-
+function Assert-WorkerDataVolume {
+  [CmdletBinding()]
+  param(
+    [string]$DataRoot = $script:WorkerDataRoot,
+    [Parameter(Mandatory)][string]$InstallRoot,
+    [Parameter(Mandatory)][string]$ExpectedVolumeId
+  )
+  $volume = Assert-WorkerDataMountPoint -DataRoot $DataRoot -InstallRoot $InstallRoot -ExpectedVolumeId $ExpectedVolumeId
   $allowedSystemNames = @('$RECYCLE.BIN', 'System Volume Information')
-  $entries = if (Test-Path -LiteralPath $mount) { @(Get-ChildItem -LiteralPath $mount -Force -ErrorAction Stop) } else { @() }
-  foreach ($entry in $entries) {
-    $expectedTop = if ($segments.Count -eq 0) {
-      @('worker-config.json', 'credentials.dpapi', 'staging', 'trust', 'runs', 'evidence', 'tmp', 'state', 'security', 'inputs', 'outputs')
-    } elseif ($segments.Count -eq 1 -and $segments[0] -eq 'Worker') { @('Worker', 'InstallState') } elseif ($segments.Count -eq 2) { @('SumatraFuzz') } else { @() }
-    if ($segments.Count -gt 0 -and $entry.Name -notin $allowedSystemNames -and $entry.Name -notin $expectedTop) {
-      throw 'Worker data volume contains unrelated top-level data'
-    }
-    if ($segments.Count -eq 0 -and $entry.Name -notin $allowedSystemNames -and $entry.Name -notin $expectedTop) {
+  $expectedTop = @('worker-config.json', 'credentials.dpapi', 'staging', 'trust', 'runs', 'evidence', 'tmp', 'state', 'security', 'inputs', 'outputs')
+  foreach ($entry in @(Get-ChildItem -LiteralPath $DataRoot -Force -ErrorAction Stop)) {
+    if ($entry.Name -notin $allowedSystemNames -and $entry.Name -notin $expectedTop) {
       throw 'Worker data volume contains unrelated top-level data'
     }
   }
-  if ($segments.Count -eq 0) {
-    $dataParent = Split-Path -Parent $fullDataRoot
-    $parentEntries = @(Get-ChildItem -LiteralPath $dataParent -Force -ErrorAction Stop | Where-Object { $_.Name -notin @('Worker', 'InstallState') })
-    if ($parentEntries.Count -gt 0) { throw 'Worker data parent contains unrelated SumatraFuzz data' }
-  }
-  $familyRoot = if ($segments.Count -eq 2) { Join-Path $mount 'SumatraFuzz' } elseif ($segments.Count -eq 1 -and $segments[0] -eq 'Worker') { $mount } else { $null }
-  if ($familyRoot -and $segments.Count -gt 0 -and (Test-Path -LiteralPath $familyRoot)) {
-    $children = @(Get-ChildItem -LiteralPath $familyRoot -Force -ErrorAction Stop | Where-Object { $_.Name -notin @('Worker', 'InstallState') -and $_.Name -notin $allowedSystemNames })
-    if ($children.Count -gt 0) { throw 'Worker data volume contains unrelated SumatraFuzz data' }
-  }
+  $dataParent = Split-Path -Parent $DataRoot
+  $parentEntries = @(Get-ChildItem -LiteralPath $dataParent -Force -ErrorAction Stop | Where-Object { $_.Name -notin @('Worker', 'InstallState') })
+  if ($parentEntries.Count -gt 0) { throw 'Worker data parent contains unrelated SumatraFuzz data' }
   return $volume
 }
 
@@ -758,16 +764,7 @@ function Install-SumatrafuzzWorkerService {
     if (-not (Test-Path -LiteralPath $dataParent)) { [void](New-Item -ItemType Directory -Path $dataParent -Force) }
     $parentItem = Get-Item -LiteralPath $dataParent -Force -ErrorAction Stop
     if ($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Worker data parent contains a reparse point' }
-    $dataRootItem = Get-Item -LiteralPath $script:WorkerDataRoot -Force -ErrorAction Stop
-    if ($dataRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-      $mountedVolume = Get-Volume -FilePath $script:WorkerDataRoot -ErrorAction Stop
-      $expectedMount = [IO.Path]::GetFullPath($script:WorkerDataRoot).TrimEnd('\')
-      $mountPaths = @($mountedVolume.Path | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
-      if ((Get-WorkerVolumeGuid $mountedVolume.UniqueId) -ne (Get-WorkerVolumeGuid $volume.UniqueId) -or
-          $expectedMount -notin $mountPaths) {
-        throw 'Worker data reparse point is not the exact configured dedicated-volume mount point'
-      }
-    }
+    [void](Assert-WorkerDataMountPoint -DataRoot $script:WorkerDataRoot -InstallRoot $layout.Root -ExpectedVolumeId $volume.UniqueId)
     Set-WorkerProtectedAcl -Path $dataParent -ServiceSid $serviceSid -ServiceAccess AdminOnly -Directory
     # Keep the fixed data-root directory read-only to the service so its
     # DELETE_CHILD right cannot replace the administrator-provisioned config
@@ -892,4 +889,4 @@ function Uninstall-SumatrafuzzWorkerService {
   Write-WorkerInstallMarker $marker
 }
 
-Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService
+Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataMountPoint, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService

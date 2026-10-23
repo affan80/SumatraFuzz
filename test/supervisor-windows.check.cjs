@@ -164,7 +164,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
       const receipt = supervisor.stopJob(job, 0);
       job = undefined;
       const eventDiagnostic = readdirSync(evidenceDir)
-        .filter((name) => name === 'named-event-diagnostic.txt')
+        .filter((name) => ['named-event-diagnostic.txt', 'namespace-diagnostic.txt'].includes(name))
         .map((name) => readFileSync(path.join(evidenceDir, name), 'utf8'))
         .join('\n');
       assert.fail(
@@ -425,6 +425,186 @@ test('service host protects the exact worker staging and runtime ACL layout', ()
   assert.match(host, /VerifyDedicatedDataVolumeMountPoint/);
   assert.match(host, /GetVolumePathNameW\(data_path/);
   assert.match(host, /worker data volume must be separate from installed code and Windows/);
+  const identity = host.slice(
+    host.indexOf('void RequireServiceIdentity()'),
+    host.indexOf('\n}\n\nstd::vector<wchar_t> BuildSanitizedEnvironment'),
+  );
+  assert.match(
+    identity,
+    /DuplicateTokenEx\(token\.Get\(\), TOKEN_QUERY, nullptr, SecurityImpersonation, TokenImpersonation,/,
+  );
+  assert.match(
+    identity,
+    /CheckTokenMembership\(membership_token\.Get\(\), admin_bytes\.data\(\), &is_admin\)/,
+  );
+  assert.match(
+    identity,
+    /CheckTokenMembership\(membership_token\.Get\(\), const_cast<BYTE\*>\(service_sid\.data\(\)\), &is_admin\)/,
+  );
+});
+
+test('native service host exposes only a bounded local administrator trust-operation pipe', () => {
+  const host = readFileSync(
+    path.join(__dirname, '..', 'native', 'worker-supervisor', 'src', 'service_host.cpp'),
+    'utf8',
+  );
+  const contract = readFileSync(
+    path.join(__dirname, '..', 'native', 'worker-supervisor', 'include', 'service_host.h'),
+    'utf8',
+  );
+  const workerControl = readFileSync(
+    path.join(__dirname, '..', 'apps', 'worker-service', 'src', 'service-control.ts'),
+    'utf8',
+  );
+  const provision = readFileSync(
+    path.join(__dirname, '..', 'scripts', 'windows', 'provision-worker-service.ps1'),
+    'utf8',
+  );
+  assert.match(host, /SumatraFuzzWorker-trust/);
+  assert.match(host, /PIPE_REJECT_REMOTE_CLIENTS/);
+  assert.match(host, /FILE_FLAG_FIRST_PIPE_INSTANCE/);
+  assert.match(host, /D:P\(A;;GA;;;BA\)\(A;;GA;;;SY\)/);
+  assert.match(host, /AuthorizeElevatedLocalAdministrator/);
+  assert.match(host, /ImpersonateNamedPipeClient/);
+  const trustPipeBody = host.slice(
+    host.indexOf('void ServeLocalTrustPipe('),
+    host.indexOf('\n}\n\nvoid ServiceMain', host.indexOf('void ServeLocalTrustPipe(')),
+  );
+  assert.ok(
+    trustPipeBody.indexOf('ReadPipeExact(pipe.Get(), header.data()') <
+      trustPipeBody.indexOf('AuthorizeElevatedLocalAdministrator(pipe.Get())'),
+    'the host must read the bounded client frame header before impersonating the named-pipe client',
+  );
+  assert.equal(
+    (trustPipeBody.match(/CreateNamedPipeW\(/g) ?? []).length,
+    1,
+    'keep the first-instance pipe open across requests',
+  );
+  assert.ok(trustPipeBody.indexOf('CreateNamedPipeW(') < trustPipeBody.indexOf('while ('));
+  assert.ok(
+    trustPipeBody.indexOf('DisconnectNamedPipe(pipe.Get())') > trustPipeBody.indexOf('while ('),
+  );
+  assert.match(trustPipeBody, /if \(!DisconnectNamedPipe\(pipe\.Get\(\)\)\) return/);
+  assert.match(host, /if \(!RevertToSelf\(\)\) return PipeClientAuthorization::Fatal/);
+  assert.match(host, /client_authorization == PipeClientAuthorization::Fatal/);
+  assert.match(host, /kTrustPipeReadTimeoutMs/);
+  assert.match(host, /kTrustOperationTimeoutMs/);
+  assert.match(host, /kTrustPipeReceiptAck\s*=\s*0xa5/);
+  assert.match(
+    host,
+    /ReadPipeExact\(pipe\.Get\(\),\s*&acknowledgement,\s*sizeof\(acknowledgement\),\s*kTrustPipeReadTimeoutMs\)/,
+  );
+  assert.match(
+    provision,
+    /Write-PipeBytesWithTimeout -Stream \$pipe -Bytes \(\[byte\[\]\]@\(0xa5\)\)/,
+  );
+  assert.ok(
+    provision.indexOf('Read-PipeBytesExactly -Stream $pipe -Count 1') <
+      provision.indexOf('Write-PipeBytesWithTimeout -Stream $pipe -Bytes ([byte[]]@(0xa5))'),
+    'the provisioner must acknowledge only after reading the complete operation receipt',
+  );
+  assert.match(provision, /PipeOptions\]::Asynchronous/);
+  const readPipeHelper = provision.slice(
+    provision.indexOf('function Read-PipeBytesExactly'),
+    provision.indexOf('function Write-PipeBytesWithTimeout'),
+  );
+  assert.match(
+    readPipeHelper,
+    /ReadAsync\(\$bytes,\s*\$offset,\s*\$Count\s*-\s*\$offset,\s*\$CancellationToken\)/,
+  );
+  assert.match(provision, /WriteAsync\(\$Bytes,\s*0,[\s\S]*\$timeout\.Token/);
+  assert.match(
+    provision,
+    /\$receiptTimeout = \[Threading\.CancellationTokenSource\]::new\(75000\)/,
+  );
+  assert.match(
+    provision,
+    /Read-PipeBytesExactly -Stream \$pipe -Count 4 -CancellationToken \$receiptTimeout\.Token/,
+  );
+  assert.doesNotMatch(provision, /\$pipe\.(?:Read|Write)Timeout\s*=/);
+  assert.match(host, /CreateOverlappedControlPipe\(&child\.control_read, &child\.control_write\)/);
+  assert.match(
+    host,
+    /std::wstring pipe_name = std::wstring\(L"[^"]*"\) \+ identifier_text\.data\(\);/,
+  );
+  assert.match(
+    host,
+    /FrameRead ReadFrameUntil\(HANDLE pipe, HANDLE process, DWORD timeout_ms, ControlFrame\* frame,\s*bool observe_stop = true\)/,
+  );
+  const readFrameBody = host.slice(
+    host.indexOf('FrameRead ReadFrameUntil('),
+    host.indexOf(
+      '\n}\n\nvoid CreateOverlappedControlPipe',
+      host.indexOf('FrameRead ReadFrameUntil('),
+    ),
+  );
+  assert.ok(
+    readFrameBody.indexOf('PeekNamedPipe(') <
+      readFrameBody.indexOf('WaitForSingleObject(process, 0)'),
+    'the service host must drain a buffered final frame before reporting child exit',
+  );
+  assert.match(host, /bool WriteFrame\(HANDLE pipe, ControlFrame frame, DWORD timeout_ms\)/);
+  const stopChildBody = host.slice(
+    host.indexOf('bool StopChild('),
+    host.indexOf('\n}\n\nbool WaitOverlapped', host.indexOf('bool StopChild(')),
+  );
+  assert.match(stopChildBody, /const ULONGLONG deadline = GetTickCount64\(\) \+ stop_timeout_ms/);
+  assert.match(
+    stopChildBody,
+    /WriteFrame\(child\.control_write\.Get\(\), ControlFrame::Stop, static_cast<DWORD>\(deadline - now\)\)/,
+  );
+  assert.match(
+    stopChildBody,
+    /ReadFrameUntil\(child\.ready_read\.Get\(\), child\.process\.Get\(\),\s*static_cast<DWORD>\(deadline - now\), &response, false\)/,
+  );
+  assert.match(host, /PIPE_ACCESS_OUTBOUND\s*\|\s*FILE_FLAG_OVERLAPPED/);
+  assert.match(
+    host,
+    /WritePipeBounded\(child\.control_write\.Get\(\), frame\.data\(\),[\s\S]*kTrustOperationTimeoutMs/,
+  );
+  assert.match(host, /struct VectorScrubber/);
+  assert.match(host, /VectorScrubber command_scrubber\{command\}/);
+  assert.match(host, /VectorScrubber frame_scrubber\{frame\}/);
+  assert.match(host, /SecureZeroMemory\(bytes\.data\(\), bytes\.size\(\)\)/);
+  assert.match(contract, /kMaxTrustOperationBytes = 1024 \* 1024 \+ 1/);
+  assert.match(host, /length >= 2 && length <= sumatrafuzz::service_host::kMaxTrustOperationBytes/);
+  assert.match(host, /command\[0\] == 0x10 \|\| command\[0\] == 0x12/);
+  assert.match(host, /EncodeTrustOperationRequest\(command\)/);
+  assert.match(host, /DecodeTrustOperationResponse\(response, succeeded\)/);
+  assert.match(host, /trust_pipe_thread\.join\(\)/);
+  assert.match(workerControl, /APPLY_SIGNED_TRUST_OPERATION = 0x10/);
+  assert.match(workerControl, /APPLY_SIGNED_PAIRING_BUNDLE = 0x12/);
+  assert.match(workerControl, /service\.applyTrustOperation/);
+  assert.match(workerControl, /service\.applyPairingBundle/);
+  assert.match(workerControl, /frame\.fill\(0\)/);
+});
+
+test('live trust provisioning authenticates the named-pipe server and prefers the running worker', () => {
+  const provision = readFileSync(
+    path.join(__dirname, '..', 'scripts', 'windows', 'provision-worker-service.ps1'),
+    'utf8',
+  );
+  assert.match(provision, /GetNamedPipeServerProcessId/);
+  assert.match(
+    provision,
+    /serverProcessId[^\n]*service\.ProcessId|service\.ProcessId[^\n]*serverProcessId/i,
+  );
+  assert.match(provision, /\$useLive\s*=\s*\[bool\]\$Live\s*-or/);
+  assert.match(
+    provision,
+    /\$service\.State\s+-eq\s+'Running'\s+-and\s+-not\s+\$hasCredentials\s+-and\s+\[string\]::IsNullOrWhiteSpace\(\$ConfigurationPath\)/,
+  );
+  assert.match(
+    provision,
+    /if \(\$hasPairing\)\s*\{\s*Write-ProtectedDestination[\s\S]+worker-pairing\.sfpair/,
+  );
+  assert.match(
+    provision,
+    /\$installedConfigurationPath\s*=\s*Join-Path\s+\$dataRoot\s+'worker-config\.json'/,
+  );
+  assert.doesNotMatch(provision, /\$configurationPath\s*=\s*Join-Path\s+\$dataRoot/i);
+  assert.match(provision, /\$service\.State\s+-eq\s+'Running'/);
+  assert.match(provision, /if \(\$useLive\)/);
 });
 
 test('native quota sampling accepts only an exact mounted volume root and uses caller quota capacity', () => {

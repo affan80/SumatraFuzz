@@ -1,6 +1,7 @@
 #include "service_host.h"
 #include "command_line.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <string>
@@ -14,12 +15,15 @@
 #endif
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <cwchar>
 #include <cwctype>
 #include <memory>
+#include <objbase.h>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -34,6 +38,9 @@ constexpr wchar_t kNodeRelativePath[] = L"runtime\\node.exe";
 constexpr DWORD kReadyTimeoutMs = 30000;
 constexpr DWORD kStopTimeoutMs = 60000;
 constexpr DWORD kExitAfterStopTimeoutMs = 5000;
+constexpr DWORD kTrustPipeReadTimeoutMs = 10000;
+constexpr DWORD kTrustOperationTimeoutMs = 30000;
+constexpr BYTE kTrustPipeReceiptAck = 0xa5;
 constexpr DWORD kPollMs = 25;
 constexpr DWORD kForcedStopCode = 0x2001;
 constexpr DWORD kStartupFailureCode = 0x2002;
@@ -58,6 +65,13 @@ struct Handle final {
   explicit operator bool() const { return value && value != INVALID_HANDLE_VALUE; }
 };
 
+struct VectorScrubber final {
+  std::vector<std::uint8_t>& bytes;
+  ~VectorScrubber() {
+    if (!bytes.empty()) SecureZeroMemory(bytes.data(), bytes.size());
+  }
+};
+
 SERVICE_STATUS_HANDLE g_status_handle = nullptr;
 SERVICE_STATUS g_status{};
 HANDLE g_stop_event = nullptr;
@@ -67,6 +81,8 @@ SRWLOCK g_status_lock = SRWLOCK_INIT;
 std::wstring WinError(const wchar_t* what, DWORD error = GetLastError()) {
   return std::wstring(what) + L" (Windows error " + std::to_wstring(error) + L")";
 }
+
+bool WritePipeBounded(HANDLE pipe, const BYTE* source, DWORD size, DWORD timeout_ms, bool observe_stop);
 
 void SetStatus(DWORD state, DWORD win32_exit = NO_ERROR, DWORD service_exit = 0) {
   if (!g_status_handle) return;
@@ -510,15 +526,21 @@ void RequireServiceIdentity() {
   user = reinterpret_cast<TOKEN_USER*>(user_buffer.data());
   if (!GetTokenInformation(token.Get(), TokenUser, user, user_size, &returned)) throw WinError(L"cannot inspect service account");
   if (EqualSid(user->User.Sid, sid_bytes.data())) throw std::runtime_error("worker service must not run as LocalSystem");
+  HANDLE raw_membership_token = nullptr;
+  if (!DuplicateTokenEx(token.Get(), TOKEN_QUERY, nullptr, SecurityImpersonation, TokenImpersonation,
+                        &raw_membership_token)) {
+    throw WinError(L"cannot inspect service group membership");
+  }
+  Handle membership_token(raw_membership_token);
   BOOL is_admin = FALSE;
   std::array<BYTE, SECURITY_MAX_SID_SIZE> admin_bytes{};
   DWORD admin_size = static_cast<DWORD>(admin_bytes.size());
   if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admin_bytes.data(), &admin_size)) throw WinError(L"cannot resolve administrator group");
-  if (!CheckTokenMembership(token.Get(), admin_bytes.data(), &is_admin)) throw WinError(L"cannot inspect administrator membership");
+  if (!CheckTokenMembership(membership_token.Get(), admin_bytes.data(), &is_admin)) throw WinError(L"cannot inspect administrator membership");
   if (is_admin) throw std::runtime_error("worker service must not run as an administrator");
 
   const std::vector<BYTE> service_sid = ResolveServiceSid();
-  if (!CheckTokenMembership(token.Get(), const_cast<BYTE*>(service_sid.data()), &is_admin) || !is_admin) {
+  if (!CheckTokenMembership(membership_token.Get(), const_cast<BYTE*>(service_sid.data()), &is_admin) || !is_admin) {
     throw std::runtime_error("worker process lacks its dedicated service SID");
   }
 }
@@ -550,21 +572,20 @@ std::vector<wchar_t> BuildSanitizedEnvironment(const InstallPaths& paths) {
   return block;
 }
 
-bool WriteFrame(HANDLE pipe, ControlFrame frame) {
+bool WriteFrame(HANDLE pipe, ControlFrame frame, DWORD timeout_ms) {
   const auto bytes = sumatrafuzz::service_host::EncodeControlFrame(frame);
-  DWORD written = 0;
-  return WriteFile(pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size();
+  return WritePipeBounded(pipe, bytes.data(), static_cast<DWORD>(bytes.size()), timeout_ms, false);
 }
 
 enum class FrameRead { Complete, Timeout, Invalid, PipeError, ChildExited };
 
-FrameRead ReadFrameUntil(HANDLE pipe, HANDLE process, DWORD timeout_ms, ControlFrame* frame) {
+FrameRead ReadFrameUntil(HANDLE pipe, HANDLE process, DWORD timeout_ms, ControlFrame* frame,
+                         bool observe_stop = true) {
   const ULONGLONG deadline = GetTickCount64() + timeout_ms;
   std::array<std::uint8_t, 4 + sumatrafuzz::service_host::kMaxControlFrameBytes> bytes{};
   size_t expected = 4;
   size_t used = 0;
   while (GetTickCount64() < deadline) {
-    if (process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return FrameRead::ChildExited;
     DWORD available = 0;
     if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
       if (GetLastError() == ERROR_BROKEN_PIPE) return FrameRead::ChildExited;
@@ -588,7 +609,10 @@ FrameRead ReadFrameUntil(HANDLE pipe, HANDLE process, DWORD timeout_ms, ControlF
       }
       continue;
     }
-    if (g_stop_event && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) return FrameRead::Timeout;
+    if (process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return FrameRead::ChildExited;
+    if (observe_stop && g_stop_event && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) {
+      return FrameRead::Timeout;
+    }
     Sleep(kPollMs);
   }
   return FrameRead::Timeout;
@@ -611,10 +635,77 @@ void CreatePipePair(Handle* read_end, Handle* write_end, bool read_inheritable, 
   if (!write_inheritable && !SetHandleInformation(write_end->Get(), HANDLE_FLAG_INHERIT, 0)) throw WinError(L"cannot secure pipe handle inheritance");
 }
 
+void CreateOverlappedControlPipe(Handle* child_read, Handle* parent_write) {
+  const std::vector<BYTE> service_sid = ResolveServiceSid();
+  LPWSTR service_sid_text = nullptr;
+  if (!ConvertSidToStringSidW(const_cast<BYTE*>(service_sid.data()), &service_sid_text)) {
+    throw WinError(L"cannot format worker service SID for control pipe");
+  }
+  const std::wstring sddl = L"D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;" + std::wstring(service_sid_text) + L")";
+  LocalFree(service_sid_text);
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+    throw WinError(L"cannot protect worker control pipe");
+  }
+  std::unique_ptr<void, decltype(&LocalFree)> descriptor_owner(descriptor, LocalFree);
+  SECURITY_ATTRIBUTES server_security{sizeof(server_security), descriptor, FALSE};
+  SECURITY_ATTRIBUTES child_security{sizeof(child_security), nullptr, TRUE};
+  GUID identifier{};
+  if (CoCreateGuid(&identifier) != S_OK) throw WinError(L"cannot create worker control pipe identity");
+  std::array<wchar_t, 40> identifier_text{};
+  if (StringFromGUID2(identifier, identifier_text.data(), static_cast<int>(identifier_text.size())) == 0) {
+    throw std::runtime_error("cannot format worker control pipe identity");
+  }
+  const std::wstring pipe_name = std::wstring(L"\\\\.\\pipe\\SumatraFuzzWorker-control-") + identifier_text.data();
+  Handle server(CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                 1, 4096, 0, 0, &server_security));
+  if (!server) throw WinError(L"cannot create protected worker control pipe");
+  Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (!event) throw WinError(L"cannot create worker control pipe event");
+  OVERLAPPED operation{};
+  operation.hEvent = event.Get();
+  bool connect_pending = false;
+  if (!ConnectNamedPipe(server.Get(), &operation)) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_IO_PENDING) {
+      connect_pending = true;
+    } else if (error != ERROR_PIPE_CONNECTED) {
+      throw WinError(L"cannot begin child worker control pipe connection", error);
+    }
+  }
+  Handle client(CreateFileW(pipe_name.c_str(), GENERIC_READ, 0, &child_security, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!client) {
+    if (connect_pending) {
+      CancelIoEx(server.Get(), &operation);
+      DWORD ignored = 0;
+      GetOverlappedResult(server.Get(), &operation, &ignored, TRUE);
+    }
+    throw WinError(L"cannot connect child worker control pipe");
+  }
+  if (connect_pending) {
+    if (WaitForSingleObject(event.Get(), 2000) != WAIT_OBJECT_0) {
+      CancelIoEx(server.Get(), &operation);
+      DWORD ignored = 0;
+      GetOverlappedResult(server.Get(), &operation, &ignored, TRUE);
+      throw WinError(L"cannot complete child worker control pipe connection", ERROR_TIMEOUT);
+    }
+    DWORD ignored = 0;
+    if (!GetOverlappedResult(server.Get(), &operation, &ignored, FALSE)) {
+      throw WinError(L"cannot complete child worker control pipe connection");
+    }
+  }
+  child_read->value = client.value;
+  client.value = nullptr;
+  parent_write->value = server.value;
+  server.value = nullptr;
+}
+
 Child LaunchWorker(const InstallPaths& paths) {
   Child child;
   CreatePipePair(&child.ready_read, &child.ready_write, false, true);
-  CreatePipePair(&child.control_read, &child.control_write, true, false);
+  CreateOverlappedControlPipe(&child.control_read, &child.control_write);
   SECURITY_ATTRIBUTES null_security{sizeof(null_security), nullptr, TRUE};
   Handle null_device(CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  &null_security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -684,19 +775,44 @@ DWORD ChildExitCode(HANDLE process) {
   return code;
 }
 
-bool StopChild(Child& child, bool* graceful) {
+bool StopChild(Child& child, bool* graceful, DWORD stop_timeout_ms = kStopTimeoutMs) {
   *graceful = false;
   if (!child.process) return true;
   if (WaitForSingleObject(child.process.Get(), 0) == WAIT_OBJECT_0) return false;
-  if (!WriteFrame(child.control_write.Get(), ControlFrame::Stop)) return false;
-  ControlFrame response{};
-  const FrameRead result = ReadFrameUntil(child.ready_read.Get(), child.process.Get(), kStopTimeoutMs, &response);
-  if (result != FrameRead::Complete || response != ControlFrame::Stopped) {
+  const ULONGLONG deadline = GetTickCount64() + stop_timeout_ms;
+  if (stop_timeout_ms == 0) {
     TerminateJobObject(child.job.Get(), kForcedStopCode);
     WaitForSingleObject(child.process.Get(), 5000);
     return false;
   }
-  const DWORD wait = WaitForSingleObject(child.process.Get(), kExitAfterStopTimeoutMs);
+  ULONGLONG now = GetTickCount64();
+  if (now >= deadline ||
+      !WriteFrame(child.control_write.Get(), ControlFrame::Stop, static_cast<DWORD>(deadline - now))) {
+    TerminateJobObject(child.job.Get(), kForcedStopCode);
+    WaitForSingleObject(child.process.Get(), 5000);
+    return false;
+  }
+  for (;;) {
+    now = GetTickCount64();
+    if (now >= deadline) {
+      TerminateJobObject(child.job.Get(), kForcedStopCode);
+      WaitForSingleObject(child.process.Get(), 5000);
+      return false;
+    }
+    ControlFrame response{};
+    const FrameRead result = ReadFrameUntil(child.ready_read.Get(), child.process.Get(),
+                                             static_cast<DWORD>(deadline - now), &response, false);
+    if (result != FrameRead::Complete ||
+        (response != ControlFrame::Stopped && response != ControlFrame::TrustOperationResult)) {
+      TerminateJobObject(child.job.Get(), kForcedStopCode);
+      WaitForSingleObject(child.process.Get(), 5000);
+      return false;
+    }
+    if (response == ControlFrame::Stopped) break;
+  }
+  now = GetTickCount64();
+  const DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+  const DWORD wait = WaitForSingleObject(child.process.Get(), std::min(remaining, kExitAfterStopTimeoutMs));
   if (wait != WAIT_OBJECT_0 || ChildExitCode(child.process.Get()) != 0) {
     TerminateJobObject(child.job.Get(), kForcedStopCode);
     WaitForSingleObject(child.process.Get(), 5000);
@@ -704,6 +820,224 @@ bool StopChild(Child& child, bool* graceful) {
   }
   *graceful = true;
   return true;
+}
+
+bool WaitOverlapped(HANDLE pipe, OVERLAPPED* operation, DWORD timeout_ms, bool observe_stop = true) {
+  HANDLE waits[] = {g_stop_event, operation->hEvent};
+  const DWORD wait = observe_stop && g_stop_event
+    ? WaitForMultipleObjects(2, waits, FALSE, timeout_ms)
+    : WaitForSingleObject(operation->hEvent, timeout_ms) == WAIT_OBJECT_0 ? WAIT_OBJECT_0 + 1 : WAIT_TIMEOUT;
+  if (wait != WAIT_OBJECT_0 + 1) {
+    CancelIoEx(pipe, operation);
+    DWORD ignored = 0;
+    GetOverlappedResult(pipe, operation, &ignored, TRUE);
+    return false;
+  }
+  DWORD transferred = 0;
+  return GetOverlappedResult(pipe, operation, &transferred, FALSE) != FALSE;
+}
+
+bool WritePipeBounded(HANDLE pipe, const BYTE* source, DWORD size, DWORD timeout_ms, bool observe_stop) {
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  DWORD offset = 0;
+  while (offset < size) {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!event) return false;
+    OVERLAPPED operation{};
+    operation.hEvent = event.Get();
+    DWORD written = 0;
+    const BOOL complete = WriteFile(pipe, source + offset, size - offset, &written, &operation);
+    if (!complete && GetLastError() != ERROR_IO_PENDING) return false;
+    if (!complete) {
+      if (!WaitOverlapped(pipe, &operation, static_cast<DWORD>(deadline - now), observe_stop) ||
+          !GetOverlappedResult(pipe, &operation, &written, FALSE)) {
+        return false;
+      }
+    }
+    if (written == 0 || written > size - offset) return false;
+    offset += written;
+  }
+  return true;
+}
+
+bool ReadPipeExact(HANDLE pipe, BYTE* destination, DWORD size, DWORD timeout_ms) {
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  DWORD offset = 0;
+  while (offset < size) {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!event) return false;
+    OVERLAPPED operation{};
+    operation.hEvent = event.Get();
+    DWORD read = 0;
+    const BOOL complete = ReadFile(pipe, destination + offset, size - offset, &read, &operation);
+    if (!complete && GetLastError() != ERROR_IO_PENDING) return false;
+    if (!complete) {
+      if (!WaitOverlapped(pipe, &operation, static_cast<DWORD>(deadline - now))) return false;
+      if (!GetOverlappedResult(pipe, &operation, &read, FALSE)) return false;
+    }
+    if (read == 0 || read > size - offset) return false;
+    offset += read;
+  }
+  return true;
+}
+
+bool WritePipeExact(HANDLE pipe, const BYTE* source, DWORD size, DWORD timeout_ms, bool allow_during_stop = false) {
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  DWORD offset = 0;
+  while (offset < size) {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!event) return false;
+    OVERLAPPED operation{};
+    operation.hEvent = event.Get();
+    DWORD written = 0;
+    const BOOL complete = WriteFile(pipe, source + offset, size - offset, &written, &operation);
+    if (!complete && GetLastError() != ERROR_IO_PENDING) return false;
+    if (!complete) {
+      if (!WaitOverlapped(pipe, &operation, static_cast<DWORD>(deadline - now), !allow_during_stop)) return false;
+      if (!GetOverlappedResult(pipe, &operation, &written, FALSE)) return false;
+    }
+    if (written == 0 || written > size - offset) return false;
+    offset += written;
+  }
+  return true;
+}
+
+bool ConnectLocalAdminPipe(HANDLE pipe) {
+  Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (!event) return false;
+  OVERLAPPED operation{};
+  operation.hEvent = event.Get();
+  if (ConnectNamedPipe(pipe, &operation)) return true;
+  const DWORD error = GetLastError();
+  if (error == ERROR_PIPE_CONNECTED) return true;
+  if (error != ERROR_IO_PENDING) return false;
+  return WaitOverlapped(pipe, &operation, INFINITE);
+}
+
+enum class PipeClientAuthorization { Denied, Authorized, Fatal };
+
+PipeClientAuthorization AuthorizeElevatedLocalAdministrator(HANDLE pipe) {
+  if (!ImpersonateNamedPipeClient(pipe)) return PipeClientAuthorization::Denied;
+  bool allowed = false;
+  HANDLE token = nullptr;
+  if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+    Handle token_handle(token);
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> admin_bytes{};
+    DWORD admin_size = static_cast<DWORD>(admin_bytes.size());
+    TOKEN_ELEVATION elevation{};
+    DWORD returned = 0;
+    BOOL member = FALSE;
+    if (CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admin_bytes.data(), &admin_size) &&
+        GetTokenInformation(token_handle.Get(), TokenElevation, &elevation, sizeof(elevation), &returned) &&
+        CheckTokenMembership(token_handle.Get(), admin_bytes.data(), &member)) {
+      allowed = member && elevation.TokenIsElevated != 0;
+    }
+  }
+  if (!RevertToSelf()) return PipeClientAuthorization::Fatal;
+  return allowed ? PipeClientAuthorization::Authorized : PipeClientAuthorization::Denied;
+}
+
+bool ReadTrustOperationResultUntil(HANDLE pipe, HANDLE process, DWORD timeout_ms, bool* succeeded) {
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  std::array<std::uint8_t, 10> bytes{};
+  size_t used = 0;
+  while (GetTickCount64() < deadline) {
+    if (process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return false;
+    DWORD available = 0;
+    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return false;
+    if (available > 0) {
+      const DWORD wanted = static_cast<DWORD>(std::min<size_t>(available, bytes.size() - used));
+      DWORD read = 0;
+      if (!ReadFile(pipe, bytes.data() + used, wanted, &read, nullptr) || read == 0) return false;
+      used += read;
+      if (used >= 4) {
+        const std::uint32_t length = static_cast<std::uint32_t>(bytes[0]) |
+          (static_cast<std::uint32_t>(bytes[1]) << 8) | (static_cast<std::uint32_t>(bytes[2]) << 16) |
+          (static_cast<std::uint32_t>(bytes[3]) << 24);
+        if (length != 2 || used > length + 4) return false;
+        if (used == length + 4) {
+          const std::vector<std::uint8_t> response(bytes.begin(), bytes.begin() + used);
+          return sumatrafuzz::service_host::DecodeTrustOperationResponse(response, succeeded);
+        }
+      }
+      continue;
+    }
+    Sleep(kPollMs);
+  }
+  return false;
+}
+
+void ServeLocalTrustPipe(Child& child) {
+  constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\SumatraFuzzWorker-trust";
+  const std::vector<BYTE> service_sid = ResolveServiceSid();
+  LPWSTR service_sid_text = nullptr;
+  if (!ConvertSidToStringSidW(const_cast<BYTE*>(service_sid.data()), &service_sid_text)) return;
+  std::wstring sddl = L"D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;" + std::wstring(service_sid_text) + L")";
+  LocalFree(service_sid_text);
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) return;
+  std::unique_ptr<void, decltype(&LocalFree)> descriptor_owner(descriptor, LocalFree);
+  SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+  Handle pipe(CreateNamedPipeW(kPipeName, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                               PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                               1, 4096, 4096, 0, &attributes));
+  if (!pipe) return;
+  while (!g_stop_event || WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
+    if (!ConnectLocalAdminPipe(pipe.Get())) {
+      if (g_stop_event && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) break;
+      return;
+    }
+    bool succeeded = false;
+    std::array<BYTE, 4> header{};
+    if (ReadPipeExact(pipe.Get(), header.data(), static_cast<DWORD>(header.size()), kTrustPipeReadTimeoutMs)) {
+      const std::uint32_t length = static_cast<std::uint32_t>(header[0]) |
+        (static_cast<std::uint32_t>(header[1]) << 8) | (static_cast<std::uint32_t>(header[2]) << 16) |
+        (static_cast<std::uint32_t>(header[3]) << 24);
+      if (length >= 2 && length <= sumatrafuzz::service_host::kMaxTrustOperationBytes) {
+        const auto client_authorization = AuthorizeElevatedLocalAdministrator(pipe.Get());
+        if (client_authorization == PipeClientAuthorization::Fatal) {
+          if (g_stop_event) SetEvent(g_stop_event);
+          return;
+        }
+        if (client_authorization == PipeClientAuthorization::Authorized) {
+          std::vector<std::uint8_t> command(length);
+          VectorScrubber command_scrubber{command};
+          if (ReadPipeExact(pipe.Get(), command.data(), length, kTrustPipeReadTimeoutMs) &&
+              (command[0] == 0x10 || command[0] == 0x12)) {
+            auto frame = sumatrafuzz::service_host::EncodeTrustOperationRequest(command);
+            VectorScrubber frame_scrubber{frame};
+            if (frame.empty() ||
+                !WritePipeBounded(child.control_write.Get(), frame.data(), static_cast<DWORD>(frame.size()),
+                                  kTrustOperationTimeoutMs, true) ||
+                !ReadTrustOperationResultUntil(child.ready_read.Get(), child.process.Get(), kTrustOperationTimeoutMs, &succeeded)) {
+              // A partial command or missing/malformed receipt desynchronizes stdio. Stop this
+              // worker instead of risking a later administrator request matching a stale receipt.
+              if (g_stop_event) SetEvent(g_stop_event);
+              return;
+            }
+          }
+        }
+      }
+    }
+    const BYTE status = succeeded ? 0 : 1;
+    const std::array<BYTE, 5> response{1, 0, 0, 0, status};
+    if (!WritePipeExact(pipe.Get(), response.data(), static_cast<DWORD>(response.size()), 2000, true)) {
+      return;
+    }
+    BYTE acknowledgement = 0;
+    if (!ReadPipeExact(pipe.Get(), &acknowledgement, sizeof(acknowledgement), kTrustPipeReadTimeoutMs) ||
+        acknowledgement != kTrustPipeReceiptAck) {
+      if (!DisconnectNamedPipe(pipe.Get())) return;
+      continue;
+    }
+    if (!DisconnectNamedPipe(pipe.Get())) return;
+  }
 }
 
 void ServiceMain(DWORD, wchar_t**) {
@@ -715,6 +1049,7 @@ void ServiceMain(DWORD, wchar_t**) {
   DWORD service_exit = 0;
   DWORD win32_exit = NO_ERROR;
   Child child;
+  std::thread trust_pipe_thread;
   try {
     RequireServiceIdentity();
     InstallPaths paths = ResolveAndVerifyInstall();
@@ -738,13 +1073,25 @@ void ServiceMain(DWORD, wchar_t**) {
             win32_exit = ERROR_SERVICE_SPECIFIC_ERROR;
           }
         } else {
+          trust_pipe_thread = std::thread([&child] {
+            try { ServeLocalTrustPipe(child); } catch (...) {}
+            if (g_stop_event && WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) SetEvent(g_stop_event);
+          });
           SetStatus(SERVICE_RUNNING);
           HANDLE waits[] = {g_stop_event, child.process.Get()};
           const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+          const ULONGLONG stop_deadline = GetTickCount64() + kStopTimeoutMs;
+          if (g_stop_event) SetEvent(g_stop_event);
+          if (trust_pipe_thread.joinable()) {
+            CancelSynchronousIo(trust_pipe_thread.native_handle());
+            trust_pipe_thread.join();
+          }
           if (wait == WAIT_OBJECT_0) {
             SetStatus(SERVICE_STOP_PENDING);
             bool graceful = false;
-            if (!StopChild(child, &graceful) || !graceful) {
+            const ULONGLONG now = GetTickCount64();
+            const DWORD remaining = now < stop_deadline ? static_cast<DWORD>(stop_deadline - now) : 0;
+            if (!StopChild(child, &graceful, remaining) || !graceful) {
               service_exit = kForcedStopCode;
               win32_exit = ERROR_SERVICE_SPECIFIC_ERROR;
             }
@@ -760,6 +1107,11 @@ void ServiceMain(DWORD, wchar_t**) {
   } catch (...) {
     service_exit = kStartupFailureCode;
     win32_exit = ERROR_SERVICE_SPECIFIC_ERROR;
+    if (g_stop_event) SetEvent(g_stop_event);
+    if (trust_pipe_thread.joinable()) {
+      CancelSynchronousIo(trust_pipe_thread.native_handle());
+      trust_pipe_thread.join();
+    }
     if (child.job) TerminateJobObject(child.job.Get(), kStartupFailureCode);
     if (child.process) WaitForSingleObject(child.process.Get(), 5000);
   }
@@ -836,11 +1188,35 @@ bool DecodeControlFrame(const std::vector<std::uint8_t>& bytes, ControlFrame* fr
     (static_cast<std::uint32_t>(bytes[1]) << 8) | (static_cast<std::uint32_t>(bytes[2]) << 16) |
     (static_cast<std::uint32_t>(bytes[3]) << 24);
   if (length == 0 || length > kMaxControlFrameBytes || bytes.size() != 4 + length) return false;
+  if (length == 2 && bytes[4] == 0x11 && bytes[5] <= 1) {
+    *frame = ControlFrame::TrustOperationResult;
+    return true;
+  }
   const std::string token(bytes.begin() + 4, bytes.end());
   if (token == "READY") *frame = ControlFrame::Ready;
   else if (token == "STOP") *frame = ControlFrame::Stop;
   else if (token == "STOPPED") *frame = ControlFrame::Stopped;
   else return false;
+  return true;
+}
+
+std::vector<std::uint8_t> EncodeTrustOperationRequest(const std::vector<std::uint8_t>& bundle) {
+  if (bundle.size() < 2 || bundle.size() > kMaxTrustOperationBytes ||
+      (bundle[0] != 0x10 && bundle[0] != 0x12)) return {};
+  const std::uint32_t length = static_cast<std::uint32_t>(bundle.size());
+  std::vector<std::uint8_t> bytes(4 + length);
+  bytes[0] = static_cast<std::uint8_t>(length);
+  bytes[1] = static_cast<std::uint8_t>(length >> 8);
+  bytes[2] = static_cast<std::uint8_t>(length >> 16);
+  bytes[3] = static_cast<std::uint8_t>(length >> 24);
+  std::copy(bundle.begin(), bundle.end(), bytes.begin() + 4);
+  return bytes;
+}
+
+bool DecodeTrustOperationResponse(const std::vector<std::uint8_t>& bytes, bool* succeeded) {
+  if (!succeeded || bytes.size() != 6 || bytes[0] != 2 || bytes[1] != 0 ||
+      bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 0x11 || bytes[5] > 1) return false;
+  *succeeded = bytes[5] == 0;
   return true;
 }
 

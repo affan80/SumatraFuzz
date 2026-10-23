@@ -5,11 +5,25 @@ param(
   [string]$WorkerCredentialsPath,
   [string]$PairingBundlePath,
   [string]$TrustOperationPath,
+  [switch]$Live,
   [ValidateRange(1, 300)][int]$StartTimeoutSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'worker-service-config.psm1') -Force
+
+if (-not ('SumatraFuzz.NamedPipeIdentity' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace SumatraFuzz {
+  public static class NamedPipeIdentity {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint serverProcessId);
+  }
+}
+'@
+}
 
 function Read-ProtectedSource {
   param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][long]$MaximumBytes)
@@ -82,6 +96,100 @@ function Write-ProtectedDestination {
   }
 }
 
+function Read-PipeBytesExactly {
+  param(
+    [Parameter(Mandatory)][IO.Stream]$Stream,
+    [Parameter(Mandatory)][int]$Count,
+    [Parameter(Mandatory)][Threading.CancellationToken]$CancellationToken
+  )
+  $bytes = [byte[]]::new($Count)
+  $offset = 0
+  try {
+    while ($offset -lt $Count) {
+      $read = $Stream.ReadAsync($bytes, $offset, $Count - $offset, $CancellationToken).GetAwaiter().GetResult()
+      if ($read -le 0) { throw 'Worker returned an invalid local trust response' }
+      $offset += $read
+    }
+    return ,$bytes
+  } catch {
+    [Array]::Clear($bytes, 0, $bytes.Length)
+    throw
+  }
+}
+
+function Write-PipeBytesWithTimeout {
+  param(
+    [Parameter(Mandatory)][IO.Stream]$Stream,
+    [Parameter(Mandatory)][byte[]]$Bytes,
+    [ValidateRange(1, 120000)][int]$TimeoutMilliseconds = 10000
+  )
+  $timeout = [Threading.CancellationTokenSource]::new($TimeoutMilliseconds)
+  try {
+    $Stream.WriteAsync($Bytes, 0, $Bytes.Length, $timeout.Token).GetAwaiter().GetResult()
+  } finally {
+    $timeout.Dispose()
+  }
+}
+
+function Invoke-LiveTrustOperation {
+  param(
+    [Parameter(Mandatory)][byte[]]$Bundle,
+    [Parameter(Mandatory)][ValidateSet(16, 18)][byte]$Opcode,
+    [Parameter(Mandatory)][uint32]$ExpectedServerProcessId,
+    [Parameter(Mandatory)][string]$ExpectedHostPath
+  )
+  if ($Bundle.Length -lt 1 -or $Bundle.Length -gt 1048576) { throw 'Signed trust input exceeds its byte limit' }
+  $payload = [byte[]]::new($Bundle.Length + 1)
+  $lengthBytes = $null
+  $responseLength = $null
+  $response = $null
+  $receiptTimeout = $null
+  $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', 'SumatraFuzzWorker-trust', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+  try {
+    $payload[0] = $Opcode
+    [Array]::Copy($Bundle, 0, $payload, 1, $Bundle.Length)
+    $lengthBytes = [BitConverter]::GetBytes([uint32]$payload.Length)
+    if (-not [BitConverter]::IsLittleEndian) { throw 'Unsupported local host byte order' }
+    $pipe.Connect(10000)
+    [uint32]$serverProcessId = 0
+    if (-not [SumatraFuzz.NamedPipeIdentity]::GetNamedPipeServerProcessId($pipe.SafePipeHandle, [ref]$serverProcessId) -or
+        $serverProcessId -eq 0 -or $serverProcessId -ne $ExpectedServerProcessId) {
+      throw 'Connected pipe is not owned by the installed worker service'
+    }
+    $liveService = Get-WorkerServiceCim
+    if (-not $liveService -or $liveService.State -ne 'Running' -or
+        [uint32]$liveService.ProcessId -ne $serverProcessId) {
+      throw 'Connected pipe is not owned by the running worker service'
+    }
+    $serverProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$serverProcessId" -ErrorAction Stop
+    if (-not $serverProcess -or [IO.Path]::GetFullPath([string]$serverProcess.ExecutablePath) -ine [IO.Path]::GetFullPath($ExpectedHostPath)) {
+      throw 'Connected pipe server executable does not match the protected worker host'
+    }
+    Write-PipeBytesWithTimeout -Stream $pipe -Bytes $lengthBytes
+    Write-PipeBytesWithTimeout -Stream $pipe -Bytes $payload
+
+    $receiptTimeout = [Threading.CancellationTokenSource]::new(75000)
+    $responseLength = Read-PipeBytesExactly -Stream $pipe -Count 4 -CancellationToken $receiptTimeout.Token
+    if ([BitConverter]::ToUInt32($responseLength, 0) -ne 1) { throw 'Worker returned an invalid local trust response' }
+    $response = Read-PipeBytesExactly -Stream $pipe -Count 1 -CancellationToken $receiptTimeout.Token
+    Write-PipeBytesWithTimeout -Stream $pipe -Bytes ([byte[]]@(0xa5))
+    if ($response[0] -ne 0) { throw 'Worker rejected the signed trust operation' }
+    Write-Output 'Live trust operation applied.'
+  } catch {
+    if ($_.Exception.Message -like 'Worker rejected the signed trust operation' -or
+        $_.Exception.Message -like 'Worker returned an invalid local trust response' -or
+        $_.Exception.Message -like 'Signed trust input exceeds its byte limit' -or
+        $_.Exception.Message -like 'Unsupported local host byte order') { throw }
+    throw 'Unable to apply the live trust operation through the protected worker channel'
+  } finally {
+    if ($receiptTimeout) { $receiptTimeout.Dispose() }
+    if ($pipe) { $pipe.Dispose() }
+    foreach ($bytes in @($payload, $lengthBytes, $responseLength, $response)) {
+      if ($bytes -is [byte[]]) { [Array]::Clear($bytes, 0, $bytes.Length) }
+    }
+  }
+}
+
 function Assert-ConfigurationMatchesInstall {
   param([Parameter(Mandatory)][object]$Configuration, [Parameter(Mandatory)][object]$Marker)
   if ($Configuration.schema -ne 1 -or
@@ -108,7 +216,9 @@ Assert-WorkerPlatform -RequireElevation
 $hasPairing = -not [string]::IsNullOrWhiteSpace($PairingBundlePath)
 $hasTrustOperation = -not [string]::IsNullOrWhiteSpace($TrustOperationPath)
 $hasCredentials = -not [string]::IsNullOrWhiteSpace($WorkerCredentialsPath)
-if (($hasPairing -ne $hasCredentials) -or ($hasPairing -and $hasTrustOperation) -or (-not $hasPairing -and -not $hasTrustOperation)) {
+if (($hasPairing -and $hasTrustOperation) -or (-not $hasPairing -and -not $hasTrustOperation) -or
+    ($hasCredentials -and -not $hasPairing) -or
+    ($Live -and ($hasCredentials -or -not [string]::IsNullOrWhiteSpace($ConfigurationPath)))) {
   throw 'Provide worker credentials with a signed pairing bundle, or one signed trust-operation transaction'
 }
 
@@ -120,11 +230,10 @@ Assert-WorkerServiceMatchesMarker $marker
 $serviceSid = Resolve-WorkerSid 'NT SERVICE\SumatraFuzzWorker'
 $dataRoot = [string]$marker.data_root
 $stagingRoot = Join-Path $dataRoot 'staging'
-foreach ($directory in @($dataRoot, $stagingRoot)) {
-  $item = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
-  if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw 'Protected worker provisioning path is missing or redirected'
-  }
+[void](Assert-WorkerDataMountPoint -DataRoot $dataRoot -InstallRoot ([string]$marker.install_root) -ExpectedVolumeId ([string]$marker.volume_id))
+$stagingItem = Get-Item -LiteralPath $stagingRoot -Force -ErrorAction Stop
+if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+  throw 'Protected worker provisioning path is missing or redirected'
 }
 
 $configBytes = $null
@@ -132,11 +241,11 @@ $credentialBytes = $null
 $pairingBytes = $null
 $trustOperationBytes = $null
 try {
-  $configurationPath = Join-Path $dataRoot 'worker-config.json'
+  $installedConfigurationPath = Join-Path $dataRoot 'worker-config.json'
   if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
     $configBytes = Read-ProtectedSource -Path $ConfigurationPath -MaximumBytes 65536
   } else {
-    $configBytes = [IO.File]::ReadAllBytes($configurationPath)
+    $configBytes = [IO.File]::ReadAllBytes($installedConfigurationPath)
     if ($configBytes.Length -lt 1) { throw 'Initial provisioning requires an explicit worker configuration input' }
     if ($configBytes.Length -gt 65536) { throw 'Worker configuration exceeds its byte limit' }
   }
@@ -144,11 +253,27 @@ try {
   $configuration = ConvertFrom-Json -InputObject $utf8.GetString($configBytes) -AsHashtable -Depth 32 -ErrorAction Stop
   Assert-ConfigurationMatchesInstall -Configuration $configuration -Marker $marker
 
-  if ($hasCredentials) {
-    $credentialBytes = Read-ProtectedSource -Path $WorkerCredentialsPath -MaximumBytes 1048576
+  if ($hasPairing) {
     $pairingBytes = Read-ProtectedSource -Path $PairingBundlePath -MaximumBytes 1048576
+    if ($hasCredentials) { $credentialBytes = Read-ProtectedSource -Path $WorkerCredentialsPath -MaximumBytes 1048576 }
   } else {
     $trustOperationBytes = Read-ProtectedSource -Path $TrustOperationPath -MaximumBytes 1048576
+  }
+
+  $useLive = [bool]$Live -or
+    ($service.State -eq 'Running' -and -not $hasCredentials -and [string]::IsNullOrWhiteSpace($ConfigurationPath))
+  if ($useLive) {
+    if ($service.State -ne 'Running') { throw 'Live trust operations require the installed worker service to be running' }
+    $liveService = Get-WorkerServiceCim
+    if (-not $liveService -or $liveService.State -ne 'Running' -or [uint32]$liveService.ProcessId -eq 0) {
+      throw 'Live trust operations require the installed worker service to be running'
+    }
+    if ($hasPairing) {
+      Invoke-LiveTrustOperation -Bundle $pairingBytes -Opcode 18 -ExpectedServerProcessId ([uint32]$liveService.ProcessId) -ExpectedHostPath ([string]$marker.host_path)
+    } else {
+      Invoke-LiveTrustOperation -Bundle $trustOperationBytes -Opcode 16 -ExpectedServerProcessId ([uint32]$liveService.ProcessId) -ExpectedHostPath ([string]$marker.host_path)
+    }
+    return
   }
 
   if ($hasCredentials -and (Get-Item -LiteralPath $marker.credentials_path -Force).Length -eq 0 -and [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
@@ -165,11 +290,13 @@ try {
   }
 
   if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
-    Write-ProtectedDestination -Bytes $configBytes -Destination $configurationPath -ServiceSid $serviceSid -ServiceAccess Read
+    Write-ProtectedDestination -Bytes $configBytes -Destination $installedConfigurationPath -ServiceSid $serviceSid -ServiceAccess Read
   }
-  if ($hasCredentials) {
-    Write-ProtectedDestination -Bytes $credentialBytes -Destination (Join-Path $stagingRoot 'worker-credentials.json') -ServiceSid $serviceSid -ServiceAccess ReadDelete
+  if ($hasPairing) {
     Write-ProtectedDestination -Bytes $pairingBytes -Destination (Join-Path $stagingRoot 'worker-pairing.sfpair') -ServiceSid $serviceSid -ServiceAccess ReadDelete
+    if ($hasCredentials) {
+      Write-ProtectedDestination -Bytes $credentialBytes -Destination (Join-Path $stagingRoot 'worker-credentials.json') -ServiceSid $serviceSid -ServiceAccess ReadDelete
+    }
   } else {
     Write-ProtectedDestination -Bytes $trustOperationBytes -Destination (Join-Path $stagingRoot 'worker-trust-operation.sftxn') -ServiceSid $serviceSid -ServiceAccess ReadDelete
   }
