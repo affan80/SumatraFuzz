@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createAdmissionController, PROVISIONAL_ADMISSION_POLICY } from '../src/admission.js';
+import {
+  createAdmissionController,
+  createAuditEventLimiter,
+  PROVISIONAL_ADMISSION_POLICY,
+} from '../src/admission.js';
 
 const policy = {
   ...PROVISIONAL_ADMISSION_POLICY,
@@ -31,6 +35,19 @@ function fixture(overrides: Partial<typeof policy> = {}) {
 }
 
 describe('provisional bounded API admission', () => {
+  it('bounds unauthenticated TLS rejection records and refills them gradually', () => {
+    let now = 0;
+    const allow = createAuditEventLimiter(2, 1000, () => now);
+    expect(allow()).toBe(true);
+    expect(allow()).toBe(true);
+    expect(allow()).toBe(false);
+    now = 500;
+    expect(allow()).toBe(true);
+    expect(allow()).toBe(false);
+    now = 1000;
+    expect(allow()).toBe(true);
+  });
+
   it('caps initial sockets and releases monotonically, including handshake deadlines', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     const { admission, socket, disconnect } = fixture();

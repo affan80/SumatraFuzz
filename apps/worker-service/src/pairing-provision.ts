@@ -8,7 +8,8 @@ import {
 import { WindowsJobSupervisor } from '@sumatrafuzz/worker-core';
 import { isNonNilUuid } from '@sumatrafuzz/worker-protocol';
 import { validateEndpointCertificate } from '@sumatrafuzz/worker-security';
-import type { TrustPermission, TrustRecord, WorkerTrustRepository } from './trust-store.js';
+import type { AuditedTrustAdministration } from './audited-trust-administration.js';
+import type { TrustPermission, TrustRecord } from './trust-store.js';
 
 /** All expected values are supplied by protected service configuration, never HTTP/renderer input. */
 export interface PairingProvisionContext {
@@ -17,7 +18,7 @@ export interface PairingProvisionContext {
   readonly trustedCaPem: string;
   readonly trustedOrgPublicKeys: readonly string[];
   readonly permissions: readonly TrustPermission[];
-  readonly trust: WorkerTrustRepository;
+  readonly trust: AuditedTrustAdministration;
 }
 export interface CredentialProtector {
   protect(plaintext: Buffer): Promise<Buffer>;
@@ -216,13 +217,25 @@ export async function verifyAndProvisionPairingBundle(
     validateEndpointCertificate(client.raw, 'client', now);
     assertIssuedBy(client, ca);
     // The verified payload binds the certificate bytes to the signed controller UUID.
-    return context.trust.provision({
+    const trustInput = {
       fingerprint: fingerprint(client),
       controllerId: profile.controllerId,
       permissions: [...context.permissions],
       notBefore: new Date(client.validFrom).toISOString(),
       notAfter: new Date(client.validTo).toISOString(),
-    });
+    };
+    const current = context.trust
+      .listActive()
+      .find((record) => record.controllerId === profile.controllerId);
+    if (current && current.fingerprint !== trustInput.fingerprint) {
+      const overlapUntil = new Date(
+        Math.min(now.getTime() + 60 * 60 * 1000, Date.parse(current.notAfter)),
+      );
+      if (overlapUntil.getTime() <= now.getTime())
+        throw new Error('pairing rotation overlap is unavailable');
+      return await context.trust.rotate(trustInput, overlapUntil, now);
+    }
+    return await context.trust.provision(trustInput);
   } catch {
     // Never attach input, certificate bodies, private keys or underlying exception causes.
     throw new Error('Worker pairing provisioning failed');
@@ -259,6 +272,83 @@ export async function protectWorkerPrivateKey(
     throw new Error('Worker credential protection failed');
   } finally {
     if (Buffer.isBuffer(plaintext)) plaintext.fill(0);
+  }
+}
+
+export interface SignedTrustOperationContext {
+  readonly expectedWorkerId: string;
+  readonly trustedOrgPublicKeys: readonly string[];
+  readonly trust: AuditedTrustAdministration;
+}
+
+/** Apply an organization-signed, short-lived administrator transaction from protected staging. */
+export async function verifyAndApplySignedTrustOperation(
+  bundle: Buffer,
+  context: SignedTrustOperationContext,
+  now = new Date(),
+): Promise<void> {
+  let payloadBytes: Buffer | undefined;
+  let signature: Buffer | undefined;
+  try {
+    requireCondition(
+      Buffer.isBuffer(bundle) && bundle.length > 0 && bundle.length <= MAX_BUNDLE_BYTES,
+    );
+    exact(context, ['expectedWorkerId', 'trustedOrgPublicKeys', 'trust']);
+    requireCondition(
+      validUuid(context.expectedWorkerId) && now instanceof Date && Number.isFinite(now.getTime()),
+    );
+    requireCondition(
+      context.trust &&
+        typeof context.trust.revoke === 'function' &&
+        typeof context.trust.unpair === 'function',
+    );
+    const trustedRoots = roots(context.trustedOrgPublicKeys);
+    const envelope = parse(bundle);
+    exact(envelope, ['format', 'payload', 'signature']);
+    requireCondition(envelope.format === 'sumatrafuzz-worker-pairing-bundle-v1');
+    payloadBytes = decode(envelope.payload, MAX_BUNDLE_BYTES);
+    signature = decode(envelope.signature, 64);
+    requireCondition(
+      signature.length === 64 &&
+        trustedRoots.some((key) => verify(null, payloadBytes as Buffer, key, signature as Buffer)),
+    );
+    const payload = parse(payloadBytes);
+    exact(payload, ['format', 'workerId', 'issuedAt', 'expiresAt', 'operation']);
+    requireCondition(payload.format === 'sumatrafuzz-worker-trust-operation-v1');
+    requireCondition(payload.workerId === context.expectedWorkerId);
+    const issuedAt = time(payload.issuedAt);
+    const expiresAt = time(payload.expiresAt);
+    requireCondition(
+      issuedAt <= now.getTime() + CLOCK_SKEW_MS &&
+        now.getTime() < expiresAt &&
+        expiresAt > issuedAt &&
+        expiresAt - issuedAt <= 60 * 60 * 1000,
+    );
+    const operation = payload.operation;
+    exact(operation, ['type', 'controllerId', 'fingerprint']);
+    requireCondition(validUuid(operation.controllerId));
+    const active = context.trust
+      .listActive()
+      .filter((record) => record.controllerId === operation.controllerId);
+    if (operation.type === 'revoke_certificate') {
+      requireCondition(
+        typeof operation.fingerprint === 'string' &&
+          /^[0-9a-f]{64}$/.test(operation.fingerprint) &&
+          active.some((record) => record.fingerprint === operation.fingerprint),
+      );
+      await context.trust.revoke(operation.fingerprint as string);
+    } else if (operation.type === 'unpair_controller') {
+      requireCondition(operation.fingerprint === null && active.length > 0);
+      await context.trust.unpair(operation.controllerId as string);
+    } else {
+      requireCondition(false);
+    }
+  } catch {
+    throw new Error('Worker trust operation failed');
+  } finally {
+    payloadBytes?.fill(0);
+    signature?.fill(0);
+    bundle.fill(0);
   }
 }
 

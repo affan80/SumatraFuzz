@@ -15,6 +15,7 @@ import { TLS_MIN_VERSION, validateEndpointCertificate } from '@sumatrafuzz/worke
 import {
   type AdmissionPolicy,
   createAdmissionController,
+  createAuditEventLimiter,
   PROVISIONAL_ADMISSION_POLICY,
   type RequestLease,
   type SocketLease,
@@ -23,7 +24,14 @@ import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth
 import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
 import { type AuthenticatedPrincipal, authorizeRoute } from './route-policy.js';
-import type { WorkerTrustRepository } from './trust-store.js';
+import {
+  type AuditAction,
+  AuditError,
+  type AuditRecord,
+  type AuditResource,
+  type SecurityAudit,
+} from './security-audit.js';
+import type { WorkerTrustRequestSource } from './trust-store.js';
 
 export interface WorkerEventRecord {
   readonly seq: string;
@@ -73,7 +81,8 @@ export interface WorkerServerConfig {
   readonly cert: Buffer;
   readonly ca: Buffer;
   /** Single service-owned repository; all supported operator mutations use this instance. */
-  readonly trust: WorkerTrustRepository;
+  readonly trust: WorkerTrustRequestSource;
+  readonly audit: SecurityAudit;
   readonly handlers: WorkerApiHandlers;
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
   readonly inputRoot: string;
@@ -128,6 +137,20 @@ function safeFailure(error: unknown, requestId: string): { status: number; value
 
 function rejectRequest(status: number): never {
   throw Object.assign(new Error('worker request rejected'), { status });
+}
+
+function auditErrorCode(error: unknown): AuditRecord['errorCode'] {
+  if (error instanceof AuditError) return 'audit_degraded';
+  const status = error && typeof error === 'object' && 'status' in error ? error.status : 500;
+  if (status === 400) return 'invalid_request';
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 408) return 'request_timeout';
+  if (status === 409) return 'conflict';
+  if (status === 413 || status === 429 || status === 507) return 'resource_limit';
+  if (status === 503) return 'service_unavailable';
+  return 'operation_failed';
 }
 
 /** Node rejects CL/TE conflicts and duplicate CL before dispatch; cover the remaining ambiguity. */
@@ -337,6 +360,12 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     typeof config.trust.subscribe !== 'function'
   )
     throw new TypeError('live worker trust repository is required');
+  if (
+    !config.audit ||
+    typeof config.audit.append !== 'function' ||
+    config.audit.health.state !== 'healthy'
+  )
+    throw new TypeError('healthy durable worker audit is required');
   if (typeof config.ensureInputCapacity !== 'function')
     throw new TypeError('input bundle disk capacity check is required');
   validateEndpointCertificate(config.cert, 'server');
@@ -345,6 +374,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     ...(config.admissionPolicy ?? PROVISIONAL_ADMISSION_POLICY),
   });
   const admission = createAdmissionController(admissionPolicy);
+  const allowTlsRejectionAudit = createAuditEventLimiter(10, 60_000);
+  const allowUnauthenticatedDenialAudit = createAuditEventLimiter(10, 60_000);
+  const allowAdmissionDenialAudit = createAuditEventLimiter(20, 60_000);
   const shutdownTimeoutMs = config.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
   if (
     !Number.isSafeInteger(shutdownTimeoutMs) ||
@@ -450,14 +482,51 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           };
           connection.fingerprint = record.fingerprint;
         } catch {
+          if (allowUnauthenticatedDenialAudit()) {
+            const fingerprint =
+              typeof peer.fingerprint256 === 'string' &&
+              /^[0-9a-f]{64}$/i.test(peer.fingerprint256.replaceAll(':', ''))
+                ? peer.fingerprint256.replaceAll(':', '').toLowerCase()
+                : undefined;
+            try {
+              await config.audit.append({
+                timestamp: new Date().toISOString(),
+                requestId,
+                action: 'authorize',
+                resource: 'unknown',
+                decision: 'deny',
+                trustRevision: config.trust.revision,
+                ...(fingerprint === undefined ? {} : { fingerprint }),
+                errorCode: 'unauthorized',
+              });
+            } catch {
+              // Authentication remains denied even if the audit store is unavailable.
+            }
+          }
           rejectRequest(401);
         }
         const controllerId = principal.controllerId;
-        assertProtocolVersion(request.headers['x-sf-protocol-version']);
+        const protocolValid = request.headers['x-sf-protocol-version'] === WORKER_PROTOCOL_VERSION;
         const target = request.url ?? '';
         const pathname = target.split('?')[0] ?? '';
         // Authorize the original target first: URL would normalize dot segments and hide aliases.
         const decision = authorizeRoute(principal, request.method ?? '', pathname);
+        const resource: AuditResource = decision.allowed ? decision.route : 'unknown';
+        const auditBase = {
+          timestamp: new Date().toISOString(),
+          requestId,
+          action: 'authorize' as const,
+          resource,
+          trustRevision: config.trust.revision,
+          fingerprint: principal.fingerprint,
+          controllerId: principal.controllerId,
+          ...(decision.allowed && decision.scope.kind !== 'controller'
+            ? { runId: decision.scope.runId }
+            : {}),
+          ...(decision.allowed && decision.scope.kind === 'artifact'
+            ? { artifactId: decision.scope.artifactId }
+            : {}),
+        };
         const scope =
           decision.allowed && decision.route === 'importInputBundle'
             ? { kind: 'upload' as const }
@@ -469,14 +538,82 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
                 ? { kind: 'replay' as const, runId: decision.scope.runId }
                 : { kind: 'ordinary' as const };
         const permitted = admission.acquireRequest(connection.lease, controllerId, scope);
-        if (!permitted.allowed) rejectRequest(permitted.status);
+        if (!permitted.allowed) {
+          if (allowAdmissionDenialAudit()) {
+            try {
+              await config.audit.append({
+                ...auditBase,
+                decision: 'deny',
+                errorCode: permitted.status === 429 ? 'resource_limit' : 'service_unavailable',
+              });
+            } catch {
+              // Admission denial remains bounded and cannot be bypassed by audit failure.
+            }
+          }
+          rejectRequest(permitted.status);
+        }
         lease = permitted.lease;
+        await config.audit.append({
+          ...auditBase,
+          decision: decision.allowed && protocolValid ? 'allow' : 'deny',
+          ...(!protocolValid ? { errorCode: 'invalid_request' as const } : {}),
+        });
+        if (!protocolValid) assertProtocolVersion(request.headers['x-sf-protocol-version']);
         if (!decision.allowed || target.includes('#')) rejectRequest(404);
         if (
           decision.scope.kind !== 'controller' &&
           !config.store.ownsRun(asControllerId(controllerId), asRunId(decision.scope.runId))
-        )
+        ) {
+          await config.audit.append({ ...auditBase, decision: 'deny', errorCode: 'not_found' });
           rejectRequest(404);
+        }
+
+        const auditedMutation = async <T>(
+          action: AuditAction,
+          resource: AuditResource,
+          operation: () => Promise<T>,
+        ): Promise<T> => {
+          if (config.audit.health.state !== 'healthy') {
+            throw Object.assign(new AuditError('degraded'), { status: 503 });
+          }
+          const record = {
+            ...auditBase,
+            action,
+            resource,
+            decision: 'intent' as const,
+          };
+          await config.audit.append(record);
+          try {
+            const result = await operation();
+            const resultRunId =
+              result &&
+              typeof result === 'object' &&
+              'run_id' in result &&
+              typeof result.run_id === 'string' &&
+              isNonNilUuid(result.run_id)
+                ? result.run_id
+                : undefined;
+            await config.audit.append({
+              ...record,
+              decision: 'success',
+              ...(resultRunId === undefined ? {} : { runId: resultRunId }),
+            });
+            return result;
+          } catch (error) {
+            try {
+              await config.audit.append({
+                ...record,
+                decision: 'failure',
+                ...(auditErrorCode(error) === undefined
+                  ? {}
+                  : { errorCode: auditErrorCode(error) as NonNullable<AuditRecord['errorCode']> }),
+              });
+            } catch {
+              // Preserve the operation error; audit health is already degraded and gates later work.
+            }
+            throw error;
+          }
+        };
 
         const url = new URL(target, 'https://worker.invalid');
 
@@ -502,13 +639,15 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             json(
               response,
               201,
-              await admitted(() =>
-                importInputBundleFrom(
-                  config.inputRoot,
-                  controllerId,
-                  () => admitted(() => body(request, requestLimit)),
-                  config.maxInputBundleBytes,
-                  { ensureCapacity: config.ensureInputCapacity },
+              await auditedMutation('input_bundle_import', 'importInputBundle', () =>
+                admitted(() =>
+                  importInputBundleFrom(
+                    config.inputRoot,
+                    controllerId,
+                    () => admitted(() => body(request, requestLimit)),
+                    config.maxInputBundleBytes,
+                    { ensureCapacity: config.ensureInputCapacity },
+                  ),
                 ),
               ),
             );
@@ -534,7 +673,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           json(
             response,
             202,
-            await admitted(() => config.handlers.startRun(controllerId, runRequest)),
+            await auditedMutation('run_start', 'startRun', () =>
+              admitted(() => config.handlers.startRun(controllerId, runRequest)),
+            ),
           );
           return;
         }
@@ -545,7 +686,13 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             return;
           }
           if (decision.route === 'stopRun') {
-            json(response, 202, await admitted(() => config.handlers.stopRun(controllerId, runId)));
+            json(
+              response,
+              202,
+              await auditedMutation('run_stop', 'stopRun', () =>
+                admitted(() => config.handlers.stopRun(controllerId, runId)),
+              ),
+            );
             return;
           }
           if (decision.route === 'eventsAfter') {
@@ -652,7 +799,10 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             return;
           }
           request.resume();
-          const failure = safeFailure(error, requestId);
+          const failure =
+            error instanceof AuditError
+              ? { status: 503, value: { error: 'service_unavailable', request_id: requestId } }
+              : safeFailure(error, requestId);
           if (failure.status === 429 || failure.status === 503)
             response.setHeader('retry-after', '1');
           json(response, failure.status, failure.value);
@@ -707,6 +857,23 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     socket.end(
       `HTTP/1.1 ${status} ${status === 431 ? 'Request Header Fields Too Large' : 'Bad Request'}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(serialized)}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n${serialized}`,
     );
+  });
+  server.on('tlsClientError', () => {
+    if (!allowTlsRejectionAudit()) return;
+    try {
+      void config.audit
+        .append({
+          timestamp: new Date().toISOString(),
+          requestId: randomUUID(),
+          action: 'tls_rejected',
+          decision: 'deny',
+          trustRevision: config.trust.revision,
+          errorCode: 'unauthorized',
+        })
+        .catch(() => {});
+    } catch {
+      // A rejected handshake stays rejected even when trust state cannot be read.
+    }
   });
   server.headersTimeout = admissionPolicy.headersTimeoutMs;
   server.requestTimeout = admissionPolicy.uploadTimeoutMs;

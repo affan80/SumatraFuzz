@@ -14,10 +14,16 @@
 #include <stdexcept>
 #include <cwctype>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <aclapi.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 #include <bcrypt.h>
 #include <dpapi.h>
 #include <objbase.h>
@@ -79,6 +85,15 @@ std::wstring Lower(std::wstring value) {
   return value;
 }
 
+std::wstring FullLocalPath(const std::wstring& value) {
+  std::wstring buffer(32768, L'\0');
+  const DWORD count = GetFullPathNameW(value.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+  if (count == 0 || count >= buffer.size()) throw std::runtime_error("could not normalize local launch path");
+  buffer.resize(count);
+  while (buffer.size() > 3 && (buffer.back() == L'\\' || buffer.back() == L'/')) buffer.pop_back();
+  return Lower(buffer);
+}
+
 bool IsOrdinaryLocalPath(const std::wstring& value) {
   return value.size() >= 3 && std::iswalpha(value[0]) && value[1] == L':' &&
          (value[2] == L'\\' || value[2] == L'/') && value.rfind(L"\\\\", 0) != 0;
@@ -110,6 +125,194 @@ std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, con
   }
   block.push_back(L'\0');
   return block;
+}
+
+struct RestrictedToken {
+  HANDLE handle = nullptr;
+  PSID sid = nullptr;
+  RestrictedToken() = default;
+  RestrictedToken(const RestrictedToken&) = delete;
+  RestrictedToken& operator=(const RestrictedToken&) = delete;
+  RestrictedToken(RestrictedToken&& other) noexcept : handle(other.handle), sid(other.sid) {
+    other.handle = nullptr;
+    other.sid = nullptr;
+  }
+  ~RestrictedToken() {
+    if (handle) CloseHandle(handle);
+    if (sid) LocalFree(sid);
+  }
+};
+
+PSID CreateRunRestrictedSid() {
+  SID_IDENTIFIER_AUTHORITY authority{{0x53, 0x46, 0x57, 0x52, 0x4b, 0x31}};  // SFW-RK1 private SID authority.
+  PSID sid = LocalAlloc(LMEM_FIXED, SECURITY_MAX_SID_SIZE);
+  if (!sid) throw std::runtime_error("could not allocate child restricting SID");
+  GUID run{};
+  if (CoCreateGuid(&run) != S_OK || !InitializeSid(sid, &authority, 3)) {
+    LocalFree(sid);
+    throw std::runtime_error("could not initialize child restricting SID");
+  }
+  *GetSidSubAuthority(sid, 0) = run.Data1;
+  *GetSidSubAuthority(sid, 1) = run.Data2 | (static_cast<DWORD>(run.Data3) << 16);
+  *GetSidSubAuthority(sid, 2) = static_cast<DWORD>(run.Data4[0]) << 24 |
+                                  static_cast<DWORD>(run.Data4[1]) << 16 |
+                                  static_cast<DWORD>(run.Data4[2]) << 8 |
+                                  static_cast<DWORD>(run.Data4[3]);
+  return sid;
+}
+
+void AddRestrictedSidAccess(const std::wstring& directory_path, PSID sid, DWORD permissions,
+                            bool inherit) {
+  if (!IsOrdinaryLocalPath(directory_path)) throw std::runtime_error("restricted access path must be an ordinary local Windows path");
+  HANDLE directory = CreateFileW(directory_path.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (directory == INVALID_HANDLE_VALUE) throw std::runtime_error("could not open restricted access directory securely");
+  BY_HANDLE_FILE_INFORMATION info{};
+  const bool safe_directory = GetFileInformationByHandle(directory, &info) &&
+      (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+      !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+  if (!safe_directory) {
+    CloseHandle(directory);
+    throw std::runtime_error("restricted access path is redirected or is not a directory");
+  }
+  PACL existing_dacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD read_acl = GetSecurityInfo(directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, &existing_dacl, nullptr, &descriptor);
+  if (read_acl != ERROR_SUCCESS || !existing_dacl) {
+    if (descriptor) LocalFree(descriptor);
+    CloseHandle(directory);
+    throw std::runtime_error("could not read run evidence permissions");
+  }
+  EXPLICIT_ACCESSW grant{};
+  grant.grfAccessPermissions = permissions;
+  grant.grfAccessMode = GRANT_ACCESS;
+  grant.grfInheritance = inherit ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
+  BuildTrusteeWithSidW(&grant.Trustee, sid);
+  PACL updated_dacl = nullptr;
+  const DWORD acl_result = SetEntriesInAclW(1, &grant, existing_dacl, &updated_dacl);
+  if (acl_result != ERROR_SUCCESS) {
+    LocalFree(descriptor);
+    CloseHandle(directory);
+    throw std::runtime_error("could not prepare run evidence permissions");
+  }
+  const DWORD set_acl = SetSecurityInfo(directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                       nullptr, nullptr, updated_dacl, nullptr);
+  LocalFree(updated_dacl);
+  LocalFree(descriptor);
+  CloseHandle(directory);
+  if (set_acl != ERROR_SUCCESS) throw std::runtime_error("could not protect restricted directory permissions");
+}
+
+constexpr DWORD kRestrictedEvidenceWrite = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES |
+                                          FILE_READ_EA | READ_CONTROL | SYNCHRONIZE | FILE_READ_DATA |
+                                          FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY |
+                                          FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES |
+                                          FILE_WRITE_EA | FILE_DELETE_CHILD;
+
+void PrepareEvidenceDirectory(const std::wstring& evidence_dir) {
+  if (!IsOrdinaryLocalPath(evidence_dir)) throw std::runtime_error("evidence path must be an ordinary local Windows path");
+  if (!CreateDirectoryW(evidence_dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    throw std::runtime_error("could not create run evidence directory");
+  }
+  HANDLE directory = CreateFileW(evidence_dir.c_str(), FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (directory == INVALID_HANDLE_VALUE) throw std::runtime_error("could not open run evidence directory securely");
+  BY_HANDLE_FILE_INFORMATION info{};
+  const bool safe_directory = GetFileInformationByHandle(directory, &info) &&
+      (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+      !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+  CloseHandle(directory);
+  if (!safe_directory) throw std::runtime_error("run evidence path is redirected or is not a directory");
+  WIN32_FIND_DATAW entry{};
+  const std::wstring pattern = evidence_dir + L"\\*";
+  HANDLE search = FindFirstFileW(pattern.c_str(), &entry);
+  bool empty = search != INVALID_HANDLE_VALUE;
+  if (search != INVALID_HANDLE_VALUE) {
+    do {
+      if (wcscmp(entry.cFileName, L".") != 0 && wcscmp(entry.cFileName, L"..") != 0) {
+        empty = false;
+        break;
+      }
+    } while (FindNextFileW(search, &entry));
+    FindClose(search);
+  }
+  if (!empty) throw std::runtime_error("run evidence directory must be empty before launch");
+}
+
+void SetPrivateRestrictedDefaultDacl(HANDLE source_token, HANDLE restricted_token, PSID run_sid) {
+  DWORD user_bytes = 0;
+  GetTokenInformation(source_token, TokenUser, nullptr, 0, &user_bytes);
+  if (user_bytes < sizeof(TOKEN_USER)) throw std::runtime_error("could not inspect worker token owner");
+  std::vector<BYTE> user_storage(user_bytes);
+  auto* user = reinterpret_cast<TOKEN_USER*>(user_storage.data());
+  DWORD returned = 0;
+  if (!GetTokenInformation(source_token, TokenUser, user, user_bytes, &returned)) {
+    throw std::runtime_error("could not inspect worker token owner");
+  }
+  EXPLICIT_ACCESSW grants[2]{};
+  for (auto& grant : grants) {
+    grant.grfAccessPermissions = GENERIC_ALL;
+    grant.grfAccessMode = GRANT_ACCESS;
+    grant.grfInheritance = NO_INHERITANCE;
+  }
+  BuildTrusteeWithSidW(&grants[0].Trustee, user->User.Sid);
+  BuildTrusteeWithSidW(&grants[1].Trustee, run_sid);
+  PACL private_dacl = nullptr;
+  const DWORD acl_result = SetEntriesInAclW(2, grants, nullptr, &private_dacl);
+  if (acl_result != ERROR_SUCCESS) throw std::runtime_error("could not prepare restricted child object permissions");
+  TOKEN_DEFAULT_DACL token_default{private_dacl};
+  const BOOL set = SetTokenInformation(restricted_token, TokenDefaultDacl, &token_default,
+                                       sizeof(token_default));
+  LocalFree(private_dacl);
+  if (!set) throw std::runtime_error("could not restrict child-created kernel objects");
+}
+
+RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) {
+  RestrictedToken restricted;
+  restricted.sid = CreateRunRestrictedSid();
+  PrepareEvidenceDirectory(evidence_dir);
+  AddRestrictedSidAccess(evidence_dir, restricted.sid, kRestrictedEvidenceWrite, true);
+  HANDLE current = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
+                       &current)) {
+    throw std::runtime_error("could not open worker token for restricted launch");
+  }
+  std::array<BYTE, SECURITY_MAX_SID_SIZE> everyone_buffer{};
+  DWORD everyone_size = static_cast<DWORD>(everyone_buffer.size());
+  if (!CreateWellKnownSid(WinWorldSid, nullptr, everyone_buffer.data(), &everyone_size)) {
+    CloseHandle(current);
+    throw std::runtime_error("could not initialize public read restricting SID");
+  }
+  PSID restricted_code_buffer = nullptr;
+  DWORD restricted_code_size = 0;
+  CreateWellKnownSid(WinRestrictedCodeSid, nullptr, nullptr, &restricted_code_size);
+  if (restricted_code_size == 0) {
+    CloseHandle(current);
+    throw std::runtime_error("could not size restricted-code SID");
+  }
+  std::vector<BYTE> restricted_code_storage(restricted_code_size);
+  restricted_code_buffer = restricted_code_storage.data();
+  if (!CreateWellKnownSid(WinRestrictedCodeSid, nullptr, restricted_code_buffer, &restricted_code_size)) {
+    CloseHandle(current);
+    throw std::runtime_error("could not initialize restricted-code SID");
+  }
+  PSID restricting_sids[] = {restricted.sid, restricted_code_buffer, everyone_buffer.data()};
+  const BOOL created = CreateRestrictedToken(current, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr,
+                                              3, restricting_sids, &restricted.handle);
+  if (created) {
+    try {
+      SetPrivateRestrictedDefaultDacl(current, restricted.handle, restricted.sid);
+    } catch (...) {
+      CloseHandle(current);
+      throw;
+    }
+  }
+  CloseHandle(current);
+  if (!created) throw std::runtime_error("could not create restricted worker token");
+  return restricted;
 }
 
 struct OpenProof {
@@ -222,7 +425,9 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     Napi::Object spec = info[0].As<Napi::Object>();
     const std::wstring executable = Wide(spec.Get("executable"), "executable");
     const std::wstring working_dir = Wide(spec.Get("workingDir"), "workingDir");
+    const std::wstring evidence_dir = Wide(spec.Get("evidenceDir"), "evidenceDir");
     if (!IsOrdinaryLocalPath(executable) || !IsOrdinaryLocalPath(working_dir)) throw std::runtime_error("launch paths must be ordinary local Windows paths");
+    if (!IsOrdinaryLocalPath(evidence_dir)) throw std::runtime_error("evidence path must be an ordinary local Windows path");
     Napi::Array argv = spec.Get("argv").As<Napi::Array>();
     Napi::Array proofs = spec.Get("fileProofs").As<Napi::Array>();
     Napi::Object limits = spec.Get("limits").As<Napi::Object>();
@@ -236,13 +441,35 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     std::wstring command = sumatrafuzz::supervisor::BuildWindowsCommandLine(arguments);
     if (command.size() > 32766) throw std::runtime_error("command line exceeds Windows limit");
     std::wstring tool_dir;
+    std::wstring input_dir;
+    std::wstring output_arg;
     for (size_t i = 0; i + 1 < arguments.size(); ++i) {
       if (arguments[i] == L"-D") { tool_dir = arguments[i + 1]; break; }
     }
+    for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+      if (arguments[i] == L"-i") {
+        if (!input_dir.empty()) throw std::runtime_error("duplicate WinAFL input directory argument");
+        input_dir = arguments[i + 1];
+      } else if (arguments[i] == L"-o") {
+        if (!output_arg.empty()) throw std::runtime_error("duplicate WinAFL evidence directory argument");
+        output_arg = arguments[i + 1];
+      }
+    }
     if (tool_dir.empty()) throw std::runtime_error("verified DynamoRIO tool directory is missing from argv");
     if (!IsOrdinaryLocalPath(tool_dir)) throw std::runtime_error("DynamoRIO tool directory is not an ordinary local Windows path");
+    if (input_dir.empty() || !IsOrdinaryLocalPath(input_dir) || output_arg.empty() ||
+        FullLocalPath(output_arg) != FullLocalPath(evidence_dir)) {
+      throw std::runtime_error("WinAFL input and evidence paths are not bound to the verified launch");
+    }
+    const std::wstring full_evidence = FullLocalPath(evidence_dir);
+    const size_t evidence_separator = full_evidence.find_last_of(L'\\');
+    if (evidence_separator == std::wstring::npos ||
+        full_evidence.substr(0, evidence_separator) != FullLocalPath(working_dir)) {
+      throw std::runtime_error("evidence directory must be a direct child of the protected run root");
+    }
     [[maybe_unused]] std::vector<OpenProof> opened_proofs = VerifyProofs(proofs, executable, tool_dir);
-    std::vector<wchar_t> environment = BuildWorkerEnvironment(working_dir, tool_dir);
+    RestrictedToken restricted = CreateEvidenceRestrictedToken(evidence_dir);
+    std::vector<wchar_t> environment = BuildWorkerEnvironment(evidence_dir, tool_dir);
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
@@ -257,8 +484,9 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     cpu_limit.CpuRate = static_cast<DWORD>(cpu * 100.0);
     if (!SetInformationJobObject(job_handle, JobObjectCpuRateControlInformation, &cpu_limit, sizeof(cpu_limit))) { CloseHandle(job_handle); throw std::runtime_error("Job CPU quota setup failed"); }
     const DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, flags, environment.data(), working_dir.c_str(), &startup, &process)) {
-      CloseHandle(job_handle); throw std::runtime_error("CreateProcessW failed");
+    if (!CreateProcessAsUserW(restricted.handle, executable.c_str(), command.data(), nullptr, nullptr,
+                              FALSE, flags, environment.data(), working_dir.c_str(), &startup, &process)) {
+      CloseHandle(job_handle); throw std::runtime_error("CreateProcessAsUserW failed");
     }
     if (!AssignProcessToJobObject(job_handle, process.hProcess)) {
       TerminateProcess(process.hProcess, ERROR_ACCESS_DENIED); WaitForSingleObject(process.hProcess, 5000);
@@ -365,25 +593,229 @@ Napi::Value SampleVolumeUsage(const Napi::CallbackInfo& info) {
     const std::wstring directory = Wide(info[0], "worker-volume directory");
     if (!IsOrdinaryLocalPath(directory)) throw std::runtime_error("worker volume must be an ordinary local path");
     const DWORD attributes = GetFileAttributesW(directory.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
-        (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
       throw std::runtime_error("worker-volume directory is unavailable or redirected");
     }
-    ULARGE_INTEGER available{}, quota{}, volume_free{};
-    if (!GetDiskFreeSpaceExW(directory.c_str(), &available, &quota, &volume_free)) {
+    std::array<wchar_t, 32768> volume_path{};
+    if (!GetVolumePathNameW(directory.c_str(), volume_path.data(), static_cast<DWORD>(volume_path.size()))) {
+      throw std::runtime_error("could not resolve worker-volume identity");
+    }
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+      // Mounted folders are reparse points by design. Permit one only when
+      // this exact input is itself the volume root; junctions into a subtree
+      // or another path remain rejected.
+      std::wstring expected_root(directory);
+      if (expected_root.back() != L'\\' && expected_root.back() != L'/') expected_root.push_back(L'\\');
+      std::wstring resolved_root(volume_path.data());
+      while (expected_root.size() > 3 && (expected_root.back() == L'\\' || expected_root.back() == L'/')) expected_root.pop_back();
+      while (resolved_root.size() > 3 && (resolved_root.back() == L'\\' || resolved_root.back() == L'/')) resolved_root.pop_back();
+      if (_wcsicmp(expected_root.c_str(), resolved_root.c_str()) != 0) {
+        throw std::runtime_error("worker data path is redirected or is not a volume mount root");
+      }
+    }
+    std::array<wchar_t, 128> volume_name{};
+    if (!GetVolumeNameForVolumeMountPointW(volume_path.data(), volume_name.data(),
+                                           static_cast<DWORD>(volume_name.size()))) {
+      throw std::runtime_error("could not resolve worker-volume identity");
+    }
+    ULARGE_INTEGER available{}, user_total_available{}, volume_free{};
+    if (!GetDiskFreeSpaceExW(directory.c_str(), &available, &user_total_available, &volume_free)) {
       throw std::runtime_error("could not sample worker-volume quota");
     }
+    std::array<wchar_t, 32> filesystem{};
+    if (!GetVolumeInformationW(volume_path.data(), nullptr, 0, nullptr, nullptr, nullptr,
+                               filesystem.data(), static_cast<DWORD>(filesystem.size())) ||
+        _wcsicmp(filesystem.data(), L"NTFS") != 0) {
+      throw std::runtime_error("worker data volume must use NTFS");
+    }
     constexpr ULONGLONG max_safe_integer = 9007199254740991ULL;
-    if (quota.QuadPart == 0 || available.QuadPart > quota.QuadPart ||
-        quota.QuadPart > max_safe_integer) {
+    // GetDiskFreeSpaceExW's second result is the total capacity available to
+    // the calling service account; NTFS per-user quotas may cap it below the
+    // physical volume size. Installer policy independently verifies the
+    // service SID's enforced quota against this configured capacity.
+    if (user_total_available.QuadPart == 0 || available.QuadPart > user_total_available.QuadPart ||
+        user_total_available.QuadPart > max_safe_integer) {
       throw std::runtime_error("worker-volume quota is unavailable or exceeds supported bounds");
     }
     Napi::Object sample = Napi::Object::New(env);
-    sample.Set("quota_bytes", static_cast<double>(quota.QuadPart));
+    sample.Set("quota_bytes", static_cast<double>(user_total_available.QuadPart));
     sample.Set("available_bytes", static_cast<double>(available.QuadPart));
-    sample.Set("used_bytes", static_cast<double>(quota.QuadPart - available.QuadPart));
+    sample.Set("used_bytes", static_cast<double>(user_total_available.QuadPart - available.QuadPart));
+    const std::wstring volume_id(volume_name.data());
+    sample.Set("volume_id", Napi::String::New(env, std::u16string(volume_id.begin(), volume_id.end())));
     return sample;
   } catch (const std::exception& error) { throw NativeError(env, error.what()); }
+}
+
+Napi::Value AssertWorkerServiceNetworkBinding(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  try {
+    if (info.Length() != 2) throw std::runtime_error("Worker network binding verification failed");
+    const std::wstring adapter_value = Wide(info[0], "adapter GUID");
+    const std::wstring address_value = Wide(info[1], "bind address");
+    std::wstring canonical_guid = adapter_value;
+    if (canonical_guid.size() == 38 && canonical_guid.front() == L'{' &&
+        canonical_guid.back() == L'}') {
+      canonical_guid = canonical_guid.substr(1, 36);
+    }
+    if (canonical_guid.size() != 36 || address_value.empty() || address_value.size() > 64 ||
+        address_value.find(L'%') != std::wstring::npos) {
+      throw std::runtime_error("Worker network binding verification failed");
+    }
+    for (size_t index = 0; index < canonical_guid.size(); ++index) {
+      if (index == 8 || index == 13 || index == 18 || index == 23) {
+        if (canonical_guid[index] != L'-')
+          throw std::runtime_error("Worker network binding verification failed");
+        continue;
+      }
+      const wchar_t c = canonical_guid[index];
+      if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') ||
+            (c >= L'A' && c <= L'F'))) {
+        throw std::runtime_error("Worker network binding verification failed");
+      }
+    }
+    const std::wstring guid_text = L"{" + canonical_guid + L"}";
+    GUID adapter_guid{};
+    if (CLSIDFromString(guid_text.c_str(), &adapter_guid) != S_OK) {
+      throw std::runtime_error("Worker network binding verification failed");
+    }
+    NET_LUID adapter_luid{};
+    if (ConvertInterfaceGuidToLuid(&adapter_guid, &adapter_luid) != NO_ERROR) {
+      throw std::runtime_error("Worker network binding verification failed");
+    }
+    MIB_IF_ROW2 adapter{};
+    adapter.InterfaceLuid = adapter_luid;
+    if (GetIfEntry2(&adapter) != NO_ERROR || adapter.OperStatus != IfOperStatusUp) {
+      throw std::runtime_error("Worker network binding verification failed");
+    }
+
+    IN_ADDR expected_v4{};
+    IN6_ADDR expected_v6{};
+    ADDRESS_FAMILY family = AF_UNSPEC;
+    if (InetPtonW(AF_INET, address_value.c_str(), &expected_v4) == 1) family = AF_INET;
+    else if (InetPtonW(AF_INET6, address_value.c_str(), &expected_v6) == 1) family = AF_INET6;
+    else throw std::runtime_error("Worker network binding verification failed");
+
+    PMIB_UNICASTIPADDRESS_TABLE table = nullptr;
+    if (GetUnicastIpAddressTable(AF_UNSPEC, &table) != NO_ERROR || !table) {
+      throw std::runtime_error("Worker network binding verification failed");
+    }
+    struct AddressTableGuard {
+      PMIB_UNICASTIPADDRESS_TABLE table;
+      ~AddressTableGuard() { if (table) FreeMibTable(table); }
+    } table_guard{table};
+
+    bool exact_address_found = false;
+    for (ULONG index = 0; index < table->NumEntries; ++index) {
+      const MIB_UNICASTIPADDRESS_ROW& row = table->Table[index];
+      if (row.InterfaceLuid.Value != adapter_luid.Value || row.DadState != IpDadStatePreferred ||
+          row.Address.si_family != family) continue;
+      if (family == AF_INET &&
+          std::memcmp(&row.Address.Ipv4.sin_addr, &expected_v4, sizeof(expected_v4)) == 0) {
+        exact_address_found = true;
+        break;
+      }
+      if (family == AF_INET6 &&
+          std::memcmp(&row.Address.Ipv6.sin6_addr, &expected_v6, sizeof(expected_v6)) == 0) {
+        exact_address_found = true;
+        break;
+      }
+    }
+    if (!exact_address_found) throw std::runtime_error("Worker network binding verification failed");
+    return env.Undefined();
+  } catch (...) {
+    throw NativeError(env, "Worker network binding verification failed");
+  }
+}
+
+Napi::Value AssertWorkerServiceIdentity(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  try {
+    if (info.Length() != 0) throw std::runtime_error("worker service identity verification failed");
+
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    struct TokenHandle {
+      HANDLE value;
+      ~TokenHandle() { if (value) CloseHandle(value); }
+    } token_handle{token};
+
+    DWORD user_bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &user_bytes);
+    if (user_bytes == 0 || user_bytes > 1024 * 1024) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    std::vector<BYTE> user_storage(user_bytes);
+    if (!GetTokenInformation(token, TokenUser, user_storage.data(), user_bytes, &user_bytes)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    const auto* user = reinterpret_cast<const TOKEN_USER*>(user_storage.data());
+    if (!IsValidSid(user->User.Sid)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+
+    DWORD group_bytes = 0;
+    GetTokenInformation(token, TokenGroups, nullptr, 0, &group_bytes);
+    if (group_bytes == 0 || group_bytes > 1024 * 1024) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    std::vector<BYTE> group_storage(group_bytes);
+    if (!GetTokenInformation(token, TokenGroups, group_storage.data(), group_bytes, &group_bytes)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(group_storage.data());
+
+    DWORD service_sid_bytes = 0;
+    DWORD service_domain_chars = 0;
+    SID_NAME_USE account_use{};
+    LookupAccountNameW(nullptr, L"NT SERVICE\\SumatraFuzzWorker", nullptr, &service_sid_bytes,
+                       nullptr, &service_domain_chars, &account_use);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || service_sid_bytes == 0 ||
+        service_sid_bytes > SECURITY_MAX_SID_SIZE || service_domain_chars > 32767) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    std::vector<BYTE> service_sid_storage(service_sid_bytes);
+    std::vector<wchar_t> service_domain(service_domain_chars);
+    if (!LookupAccountNameW(nullptr, L"NT SERVICE\\SumatraFuzzWorker", service_sid_storage.data(),
+                            &service_sid_bytes, service_domain.data(), &service_domain_chars, &account_use) ||
+        account_use != SidTypeUser) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    PSID service_sid = service_sid_storage.data();
+    if (!IsValidSid(service_sid) || !EqualSid(user->User.Sid, service_sid)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> system_sid_storage{};
+    DWORD system_sid_bytes = static_cast<DWORD>(system_sid_storage.size());
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_sid_storage.data(), &system_sid_bytes) ||
+        EqualSid(user->User.Sid, system_sid_storage.data())) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> administrators_sid_storage{};
+    DWORD administrators_sid_bytes = static_cast<DWORD>(administrators_sid_storage.size());
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators_sid_storage.data(),
+                            &administrators_sid_bytes)) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    if (EqualSid(user->User.Sid, administrators_sid_storage.data())) {
+      throw std::runtime_error("worker service identity verification failed");
+    }
+    for (DWORD i = 0; i < groups->GroupCount; ++i) {
+      if (IsValidSid(groups->Groups[i].Sid) &&
+          EqualSid(groups->Groups[i].Sid, administrators_sid_storage.data())) {
+        throw std::runtime_error("worker service identity verification failed");
+      }
+    }
+
+    return env.Undefined();
+  } catch (const std::exception&) {
+    // Do not return SID, group, token, or operating-system details to JavaScript.
+    throw NativeError(env, "worker service identity verification failed");
+  }
 }
 
 Napi::Value ProtectSecret(const Napi::CallbackInfo& info) {
@@ -416,6 +848,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stopJob", Napi::Function::New(env, StopJob));
   exports.Set("sampleJob", Napi::Function::New(env, SampleJob));
   exports.Set("sampleVolumeUsage", Napi::Function::New(env, SampleVolumeUsage));
+  exports.Set("assertWorkerServiceNetworkBinding", Napi::Function::New(env, AssertWorkerServiceNetworkBinding));
+  exports.Set("assertWorkerServiceIdentity", Napi::Function::New(env, AssertWorkerServiceIdentity));
   exports.Set("protectSecret", Napi::Function::New(env, ProtectSecret));
   exports.Set("unprotectSecret", Napi::Function::New(env, UnprotectSecret));
 #else
@@ -423,6 +857,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stopJob", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
   exports.Set("sampleJob", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
   exports.Set("sampleVolumeUsage", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
+  exports.Set("assertWorkerServiceNetworkBinding", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
+  exports.Set("assertWorkerServiceIdentity", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value { throw Napi::Error::New(info.Env(), "Windows x64 supervisor is unsupported on this platform"); }));
 #endif
   return exports;
 }

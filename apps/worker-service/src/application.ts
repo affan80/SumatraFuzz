@@ -8,6 +8,7 @@ import {
 import { FileEvidenceRepository } from './artifacts.js';
 import { type WorkerCoordinatorConfig, WorkerRunCoordinator } from './run-coordinator.js';
 import { createWorkerServer, type WorkerServer, type WorkerServerConfig } from './server.js';
+import type { WorkerTrustRuntime } from './trust-store.js';
 
 export interface WorkerApplicationConfig
   extends Omit<
@@ -19,8 +20,11 @@ export interface WorkerApplicationConfig
       'workerId' | 'store' | 'evidence' | 'policy' | 'supervisor' | 'measureWorkerVolumeUsedBytes'
     > {
   readonly databasePath: string;
+  readonly expectedWorkerVolumeId: string;
+  readonly trust: WorkerTrustRuntime;
   readonly policy: WorkerPolicy;
-  readonly supervisor?: WorkerCoordinatorConfig['supervisor'];
+  readonly supervisor?: WorkerCoordinatorConfig['supervisor'] &
+    Pick<WindowsJobSupervisor, 'assertWorkerServiceIdentity'>;
   readonly readWorkerVolumeUsage?: () => Promise<VolumeUsageSample>;
 }
 
@@ -40,15 +44,30 @@ export async function createWorkerApplication(
     throw new TypeError('input root must match the verified worker policy root');
   }
   if (config.workerId.length === 0) throw new TypeError('worker ID is required');
+  if (!/^\\\\\?\\Volume\{[0-9a-f-]{36}\}\\$/i.test(config.expectedWorkerVolumeId)) {
+    throw new TypeError('expected worker volume identity is invalid');
+  }
+  const supervisor = config.supervisor ?? new WindowsJobSupervisor();
+  try {
+    supervisor.assertWorkerServiceIdentity();
+  } catch (error) {
+    config.trust.close();
+    await config.audit.close();
+    throw error;
+  }
   const store = SqliteRunStore.open(config.databasePath);
   try {
-    const supervisor = config.supervisor ?? new WindowsJobSupervisor();
+    const recoveredAudit = await config.audit.verifyAndRecover();
+    if (recoveredAudit.state !== 'healthy') {
+      throw new Error(`worker security audit recovery failed: ${recoveredAudit.reason}`);
+    }
     const readVolumeUsage =
       config.readWorkerVolumeUsage ?? (async () => supervisor.sampleVolumeUsage(config.inputRoot));
     const measureWorkerVolumeUsedBytes = async (): Promise<number> => {
       const usage = await readVolumeUsage();
       if (
         usage.quota_bytes !== config.policy.maxLimits.max_disk_bytes ||
+        usage.volume_id.toLowerCase() !== config.expectedWorkerVolumeId.toLowerCase() ||
         !Number.isSafeInteger(usage.used_bytes) ||
         usage.used_bytes < 0 ||
         !Number.isSafeInteger(usage.available_bytes) ||
@@ -85,6 +104,7 @@ export async function createWorkerApplication(
       cert: config.cert,
       ca: config.ca,
       trust: config.trust,
+      audit: config.audit,
       handlers: coordinator,
       store,
       inputRoot: config.inputRoot,
@@ -112,11 +132,13 @@ export async function createWorkerApplication(
         await server.close();
         store.close();
         config.trust.close();
+        await config.audit.close();
       },
     };
   } catch (error) {
     store.close();
     config.trust.close();
+    await config.audit.close();
     throw error;
   }
 }

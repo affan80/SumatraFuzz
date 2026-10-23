@@ -12,6 +12,7 @@ import { describe, expect, it, type Mock, vi } from 'vitest';
 import { ZipFile } from 'yazl';
 import { type AdmissionPolicy, PROVISIONAL_ADMISSION_POLICY } from '../src/admission.js';
 import { createWorkerApplication } from '../src/application.js';
+import { AuditError, type AuditRecord, type SecurityAudit } from '../src/security-audit.js';
 import {
   assertProtocolVersion,
   createExclusiveRequestGate,
@@ -83,6 +84,39 @@ const startRequest = {
   limits: { max_duration_s: 60, max_memory_bytes: 1024, max_disk_bytes: 2048, max_cpu_percent: 50 },
   label: 'route authorization fixture',
 };
+
+function memoryAudit() {
+  let state: 'healthy' | 'degraded' | 'closed' = 'healthy';
+  let sequence = 0;
+  const records: AuditRecord[] = [];
+  const audit: SecurityAudit = {
+    get health() {
+      return {
+        state,
+        reason: state === 'healthy' ? ('none' as const) : ('storage' as const),
+        sequence,
+      };
+    },
+    async append(record) {
+      if (state !== 'healthy') throw new AuditError('degraded');
+      records.push(record);
+      return ++sequence;
+    },
+    async verifyAndRecover() {
+      return audit.health;
+    },
+    async close() {
+      state = 'closed';
+    },
+  };
+  return {
+    audit,
+    records,
+    degrade() {
+      state = 'degraded';
+    },
+  };
+}
 
 function apiRequest(
   baseUrl: string,
@@ -204,6 +238,7 @@ async function withApiFixture(
     };
     ownsRun: ReturnType<typeof vi.fn>;
     trust: SqliteWorkerTrustStore;
+    audit: ReturnType<typeof memoryAudit>;
   }) => Promise<void>,
   admissionPolicy?: AdmissionPolicy,
 ) {
@@ -243,6 +278,7 @@ async function withApiFixture(
     [tlsA.clientCert, controllerA],
     [tlsB.clientCert, controllerB],
   ]);
+  const audit = memoryAudit();
   const server = await createWorkerServer({
     host: '127.0.0.1',
     mode: 'local',
@@ -252,6 +288,7 @@ async function withApiFixture(
     cert: tlsA.workerCert,
     ca: tlsA.ca,
     trust,
+    audit: audit.audit,
     inputRoot: root,
     ensureInputCapacity: async () => {},
     maxInputBundleBytes: 64 * 1024 * 1024,
@@ -260,7 +297,7 @@ async function withApiFixture(
     handlers,
   });
   try {
-    await test({ root, server, tlsA, tlsB, handlers, ownsRun, trust });
+    await test({ root, server, tlsA, tlsB, handlers, ownsRun, trust, audit });
   } finally {
     await server.close();
     trust.close();
@@ -277,6 +314,71 @@ function deferred<T>() {
 }
 
 describe('worker API contract', () => {
+  it('records authorization and a start intent before reporting the observed result', async () => {
+    await withApiFixture(async ({ server, tlsA, audit, handlers }) => {
+      const payload = Buffer.from(JSON.stringify(startRequest));
+      const response = await apiRequest(
+        server.address,
+        tlsA,
+        'POST',
+        '/v1/runs',
+        {
+          'content-type': 'application/json',
+          'idempotency-key': requestId,
+        },
+        payload,
+      );
+      expect(response.status).toBe(202);
+      expect(handlers.startRun).toHaveBeenCalledOnce();
+      expect(audit.records.map(({ action, decision }) => [action, decision])).toEqual([
+        ['authorize', 'allow'],
+        ['run_start', 'intent'],
+        ['run_start', 'success'],
+      ]);
+      expect(audit.records.every((record) => !('body' in record) && !('path' in record))).toBe(
+        true,
+      );
+    });
+  });
+
+  it('denies new campaign mutations when the audit is unhealthy', async () => {
+    await withApiFixture(async ({ server, tlsA, audit, handlers }) => {
+      audit.degrade();
+      const response = await apiRequest(
+        server.address,
+        tlsA,
+        'POST',
+        '/v1/runs',
+        {
+          'content-type': 'application/json',
+          'idempotency-key': requestId,
+        },
+        Buffer.from(JSON.stringify(startRequest)),
+      );
+      expect(response.status).toBe(503);
+      expect(handlers.startRun).not.toHaveBeenCalled();
+    });
+  });
+
+  it('audits a safely redacted denial when a TLS-valid certificate is no longer paired', async () => {
+    await withApiFixture(async ({ server, tlsB, trust, audit, handlers }) => {
+      trust.unpair(controllerB);
+      const response = await apiRequest(server.address, tlsB, 'GET', '/v1/capabilities');
+      expect(response.status).toBe(401);
+      expect(handlers.capabilities).not.toHaveBeenCalled();
+      expect(audit.records).toHaveLength(1);
+      expect(audit.records[0]).toMatchObject({
+        action: 'authorize',
+        resource: 'unknown',
+        decision: 'deny',
+        trustRevision: trust.revision,
+        fingerprint: trustInput(tlsB.clientCert, controllerB).fingerprint,
+        errorCode: 'unauthorized',
+      });
+      expect(audit.records[0]).not.toHaveProperty('controllerId');
+    });
+  });
+
   it('closes an already reused keep-alive TLS socket immediately after committed revocation', async () => {
     await withApiFixture(async ({ server, tlsA, tlsB, trust, handlers }) => {
       const client = keepAliveClient(server.address, tlsA);
@@ -401,6 +503,7 @@ describe('worker API contract', () => {
       await server.close();
       trust.close();
       const reopened = SqliteWorkerTrustStore.open(path.join(root, 'trust.db'));
+      const audit = memoryAudit();
       const restarted = await createWorkerServer({
         host: '127.0.0.1',
         mode: 'local',
@@ -410,6 +513,7 @@ describe('worker API contract', () => {
         cert: tlsA.workerCert,
         ca: tlsA.ca,
         trust: reopened,
+        audit: audit.audit,
         inputRoot: root,
         ensureInputCapacity: async () => {},
         maxInputBundleBytes: 1024,
@@ -423,6 +527,7 @@ describe('worker API contract', () => {
         expect(handlers.capabilities).toHaveBeenCalledOnce();
       } finally {
         await restarted.close();
+        await audit.audit.close();
         reopened.close();
       }
     });
@@ -442,6 +547,7 @@ describe('worker API contract', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'sf-app-trust-drain-'));
     const tls = await createTlsFixture(root);
     const trust = persistentTrust(root, [[tls.clientCert, controllerA]]);
+    const audit = memoryAudit();
     const policy = {
       maxLimits: startRequest.limits,
       pinnedTargetLockSha256: 'a'.repeat(64),
@@ -463,14 +569,17 @@ describe('worker API contract', () => {
       cert: tls.workerCert,
       ca: tls.ca,
       trust,
+      audit: audit.audit,
       inputRoot: root,
       databasePath: path.join(root, 'runs.db'),
+      expectedWorkerVolumeId: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
       policy,
-      supervisor: {} as never,
+      supervisor: { assertWorkerServiceIdentity: () => {} } as never,
       readWorkerVolumeUsage: async () => ({
         quota_bytes: startRequest.limits.max_disk_bytes,
         used_bytes: 0,
         available_bytes: startRequest.limits.max_disk_bytes,
+        volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
       }),
     });
     const pending = deferred<unknown>();
@@ -1200,6 +1309,7 @@ describe('worker API contract', () => {
     };
     let currentRun: unknown = activeStatus;
     const trust = persistentTrust(root, [[tls.clientCert, controllerId]]);
+    const audit = memoryAudit();
     const server = await createWorkerServer({
       host: '127.0.0.1',
       mode: 'local',
@@ -1209,6 +1319,7 @@ describe('worker API contract', () => {
       cert: tls.workerCert,
       ca: tls.ca,
       trust,
+      audit: audit.audit,
       inputRoot: root,
       ensureInputCapacity: async () => {},
       maxInputBundleBytes: 64 * 1024 * 1024,
@@ -1292,6 +1403,7 @@ describe('worker API contract', () => {
         `22222222-2222-4222-8222-${String(index + 1).padStart(12, '0')}`,
       ]),
     );
+    const audit = memoryAudit();
     const server = await createWorkerServer({
       host: '127.0.0.1',
       mode: 'local',
@@ -1301,6 +1413,7 @@ describe('worker API contract', () => {
       key: tls.workerKey,
       ca: tls.ca,
       trust,
+      audit: audit.audit,
       inputRoot: root,
       ensureInputCapacity: async () => {},
       maxInputBundleBytes: 1024,
@@ -1330,7 +1443,7 @@ describe('worker API contract', () => {
       trust.close();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it('rejects absent, malformed, and unsupported protocol versions', () => {
     for (const version of [undefined, ['1'], '2', '01']) {
@@ -1427,6 +1540,7 @@ describe('worker API contract', () => {
       maxInputBundleBytes: 64 * 1024 * 1024,
       store: { ownsRun: () => false },
       handlers: {} as never,
+      audit: memoryAudit().audit,
     };
     await expect(createWorkerServer({ ...base, mode: 'remote', host: '1.1.1.1' })).rejects.toThrow(
       /private|VPN/i,

@@ -38,6 +38,13 @@ export interface WorkerTrustRepository {
   revoke(fingerprint: string): TrustRecord | null;
   unpair(controllerId: string): number;
 }
+/** API readers cannot provision, rotate, revoke, or unpair controller trust. */
+export type WorkerTrustRequestSource = Pick<
+  WorkerTrustRepository,
+  'revision' | 'subscribe' | 'resolveFingerprint'
+>;
+/** Application lifecycle can close the trust store but cannot mutate its records. */
+export type WorkerTrustRuntime = WorkerTrustRequestSource & Pick<WorkerTrustRepository, 'close'>;
 
 export interface TrustStoreOpenOptions {
   /** Explicit local policy, at most 24 hours; not persisted as trust authority. */
@@ -311,6 +318,26 @@ export class SqliteWorkerTrustStore implements WorkerTrustRepository {
   provision(input: TrustProvisionInput): TrustRecord {
     validateInput(input);
     return this.mutate(() => {
+      const existing = this.db
+        .prepare('SELECT * FROM trust_certificates WHERE fingerprint = ?')
+        .get(input.fingerprint) as CertificateRow | undefined;
+      if (existing) {
+        const current = record(existing, this.revision);
+        const owner = this.db
+          .prepare('SELECT * FROM trust_controllers WHERE controller_id = ?')
+          .get(input.controllerId) as ControllerRow | undefined;
+        if (
+          current.status === 'active' &&
+          current.controllerId === input.controllerId &&
+          owner?.paired === 1 &&
+          current.notBefore === input.notBefore &&
+          current.notAfter === input.notAfter &&
+          current.permissions.length === input.permissions.length &&
+          current.permissions.every((permission, index) => permission === input.permissions[index])
+        )
+          return current;
+        throw new TrustStoreError('conflict');
+      }
       this.ensureNewFingerprint(input.fingerprint);
       const owner = this.db
         .prepare('SELECT * FROM trust_controllers WHERE controller_id = ?')

@@ -27,9 +27,11 @@
     "native:sqlite:build": "node-gyp rebuild --directory node_modules/better-sqlite3",
     "native:supervisor:build": "node-gyp rebuild --directory native/worker-supervisor",
     "native:supervisor:contract": "cmake -S native/worker-supervisor -B build/worker-supervisor && cmake --build build/worker-supervisor --config Debug && ctest --test-dir build/worker-supervisor -C Debug --output-on-failure",
+    "worker:service:stage": "node scripts/stage-worker-service.mjs",
     "test:worker-api-security": "vitest run packages/worker-security/test/certificate-policy.test.ts apps/worker-service/test/route-policy.test.ts apps/worker-service/test/admission.test.ts apps/worker-service/test/server-contract.test.ts apps/worker-service/test/run-coordinator.test.ts packages/worker-client/test/client.test.ts",
+    "test:worker-trust-security": "vitest run apps/worker-service/test/trust-store.test.ts apps/worker-service/test/pairing-provision.test.ts apps/worker-service/test/auth.test.ts apps/worker-service/test/server-contract.test.ts apps/worker-service/test/security-audit.test.ts apps/worker-service/test/audited-trust-administration.test.ts apps/worker-service/test/service-control.test.ts apps/worker-service/test/service-entry.test.ts",
     "audit:production": "npm audit --omit=dev --audit-level=moderate",
-    "test": "vitest run && node --test test/*.check.cjs",
+    "test": "vitest run --exclude '**/dist/**' && node --test test/*.check.cjs",
     "test:watch": "vitest",
     "verify": "npm run format:check && npm run lint && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
   },

@@ -2,11 +2,13 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WorkerError } from '@sumatrafuzz/worker-protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ProcessError,
   rejectSpecialWindowsPath,
+  resolveNativeSupervisorAddonPath,
   verifyAndBuildLaunch,
   verifyFileProofs,
   verifyPathWithinRoot,
@@ -17,6 +19,37 @@ import {
 const PIN = '16c59fde8b824ab54c56f23aef910a6fdd874ad0';
 const dirs: string[] = [];
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
+
+describe('native supervisor addon package path', () => {
+  it('uses the fixed install root next to the bundled Node runtime', () => {
+    const root = path.join(os.tmpdir(), 'SumatraFuzz');
+    const executablePath = path.join(root, 'runtime', 'node.exe');
+    const expected = path.join(
+      root,
+      'native',
+      'worker-supervisor',
+      'build',
+      'Release',
+      'worker_supervisor.node',
+    );
+    const resolved = resolveNativeSupervisorAddonPath(
+      executablePath,
+      import.meta.url,
+      (candidate) => candidate === expected,
+    );
+    expect(resolved).toBe(expected);
+  });
+
+  it('retains the source-workspace fallback when the installed addon is absent', () => {
+    const expected = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../native/worker-supervisor/build/Release/worker_supervisor.node',
+    );
+    expect(
+      resolveNativeSupervisorAddonPath('/runtime/node.exe', import.meta.url, () => false),
+    ).toBe(expected);
+  });
+});
 
 async function writeFileWithHash(file: string, data: string): Promise<string> {
   await mkdir(path.dirname(file), { recursive: true });
@@ -108,6 +141,16 @@ describe('verified launch specification', () => {
   it('builds a frozen structured argv without spawning', async () => {
     const { policy, request, root } = await fixture();
     const spec = await verifyAndBuildLaunch(request, policy);
+    expect(spec.evidenceDir).toBe(path.join(await realpath(policy.outputRoot), spec.runId));
+    expect(spec.argv.slice(spec.argv.indexOf('-o'), spec.argv.indexOf('-o') + 2)).toEqual([
+      '-o',
+      spec.evidenceDir,
+    ]);
+    await expect(
+      import('node:fs/promises').then(({ lstat }) => lstat(spec.evidenceDir)),
+    ).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
     const inputIndex = spec.argv.indexOf('-i');
     expect(spec.executable).toBe(await realpath(path.join(root, 'tools', 'afl-fuzz.exe')));
     expect(spec.argv.slice(inputIndex, inputIndex + 2)).toEqual([
@@ -162,7 +205,13 @@ describe('verified launch specification', () => {
         stopReason: 'requested',
       }),
       sampleJob: () => ({ cpu_percent: 0, memory_bytes: 0, process_count: 0 }),
-      sampleVolumeUsage: () => ({ quota_bytes: 1, available_bytes: 1, used_bytes: 0 }),
+      sampleVolumeUsage: () => ({
+        quota_bytes: 1,
+        available_bytes: 1,
+        used_bytes: 0,
+        volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
+      }),
+      assertWorkerServiceNetworkBinding: () => {},
       protectSecret: (value) => value,
       unprotectSecret: (value) => value,
     });
@@ -170,10 +219,96 @@ describe('verified launch specification', () => {
       quota_bytes: 1,
       available_bytes: 1,
       used_bytes: 0,
+      volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
     });
     await writeFile(harnessPath, 'changed before native launch');
     await expect(supervisor.launchSuspended(spec)).rejects.toBeInstanceOf(ProcessError);
     expect(launchCalled).toBe(false);
+  });
+
+  it('reports service identity failures without exposing native token details', () => {
+    const supervisor = new WindowsJobSupervisor({
+      assertWorkerServiceIdentity: () => {
+        throw new Error('token SID and group membership details');
+      },
+      assertWorkerServiceNetworkBinding: () => {
+        throw new Error('adapter and address details');
+      },
+      launchSuspended: () => ({ id: 'job', processId: 12 }),
+      stopJob: () => ({
+        jobId: 'job',
+        stoppedAtUtc: new Date().toISOString(),
+        remainingProcesses: 0,
+        exitCode: 0,
+        stopReason: 'requested',
+      }),
+      sampleJob: () => ({ cpu_percent: 0, memory_bytes: 0, process_count: 0 }),
+      sampleVolumeUsage: () => ({
+        quota_bytes: 1,
+        available_bytes: 1,
+        used_bytes: 0,
+        volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
+      }),
+      protectSecret: (value) => value,
+      unprotectSecret: (value) => value,
+    });
+
+    let failure: unknown;
+    try {
+      supervisor.assertWorkerServiceIdentity();
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(ProcessError);
+    expect(failure).toMatchObject({ message: 'Worker service identity verification failed' });
+    expect(failure).not.toHaveProperty('cause');
+    expect(() =>
+      supervisor.assertWorkerServiceNetworkBinding(
+        '{12345678-1234-4234-8234-123456789abc}',
+        '192.168.1.10',
+      ),
+    ).toThrow('Worker network binding verification failed');
+  });
+
+  it('validates and delegates exact adapter and address network ownership', () => {
+    let observed: readonly string[] = [];
+    const supervisor = new WindowsJobSupervisor({
+      assertWorkerServiceIdentity: () => {},
+      assertWorkerServiceNetworkBinding: (adapterGuid, address) => {
+        observed = [adapterGuid, address];
+      },
+      launchSuspended: () => ({ id: 'job', processId: 12 }),
+      stopJob: () => ({
+        jobId: 'job',
+        stoppedAtUtc: new Date().toISOString(),
+        remainingProcesses: 0,
+        exitCode: 0,
+        stopReason: 'requested',
+      }),
+      sampleJob: () => ({ cpu_percent: 0, memory_bytes: 0, process_count: 0 }),
+      sampleVolumeUsage: () => ({
+        quota_bytes: 1,
+        available_bytes: 1,
+        used_bytes: 0,
+        volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
+      }),
+      protectSecret: (value) => value,
+      unprotectSecret: (value) => value,
+    });
+    supervisor.assertWorkerServiceNetworkBinding(
+      '{12345678-1234-4234-8234-123456789abc}',
+      '192.168.1.10',
+    );
+    expect(observed).toEqual(['{12345678-1234-4234-8234-123456789abc}', '192.168.1.10']);
+    expect(() => supervisor.assertWorkerServiceNetworkBinding('bad-guid', '192.168.1.10')).toThrow(
+      'Worker network binding verification failed',
+    );
+    expect(() =>
+      supervisor.assertWorkerServiceNetworkBinding(
+        '{12345678-1234-4234-8234-123456789abc}',
+        '192.168.1.10%4',
+      ),
+    ).toThrow('Worker network binding verification failed');
   });
 
   it('refuses to initialize the Windows native supervisor on another platform', () => {

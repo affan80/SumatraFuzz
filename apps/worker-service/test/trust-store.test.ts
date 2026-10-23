@@ -77,6 +77,15 @@ describe('persistent worker trust', () => {
     expect(store.listActive()).toHaveLength(1);
   });
 
+  it('makes an exact active provisioning replay idempotent for first-run recovery', async () => {
+    const store = open(await file());
+    const provisioned = store.provision(input());
+    expect(store.provision(input())).toEqual(provisioned);
+    expect(store.revision).toBe(1);
+    expect(() => store.provision(input(1, { permissions: ['runs:stop'] }))).toThrow();
+    expect(store.revision).toBe(1);
+  });
+
   it('persists revocation tombstones and forbids replay or rebinding after unpair', async () => {
     const name = await file();
     const store = open(name);

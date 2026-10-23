@@ -86,7 +86,7 @@ jobs:
       - name: Parse all Windows PowerShell scripts before expensive builds
         shell: pwsh
         run: |
-          $paths = @(Get-ChildItem -Path scripts/windows -Filter '*.ps1' -Recurse -File)
+          $paths = @(Get-ChildItem -Path scripts/windows -Recurse -File | Where-Object { $_.Extension -in @('.ps1', '.psm1') })
           if ($paths.Count -lt 3) { throw 'Expected native Windows verification scripts not found' }
           foreach ($file in $paths) {
             $tokens = $null

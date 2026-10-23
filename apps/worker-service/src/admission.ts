@@ -38,6 +38,34 @@ export type RequestScope =
 export type RequestAdmission =
   | { readonly allowed: false; readonly status: 429 | 503 }
   | { readonly allowed: true; readonly lease: RequestLease };
+
+/** A small token bucket for unauthenticated events that must not turn into a disk-exhaustion path. */
+export function createAuditEventLimiter(
+  maxEvents: number,
+  refillIntervalMs: number,
+  now: () => number = () => performance.now(),
+): () => boolean {
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 100) {
+    throw new TypeError('invalid unauthenticated audit event limit');
+  }
+  if (!Number.isSafeInteger(refillIntervalMs) || refillIntervalMs < 1) {
+    throw new TypeError('invalid unauthenticated audit refill interval');
+  }
+  let tokens = maxEvents;
+  let updated = now();
+  return () => {
+    const current = now();
+    tokens = Math.min(
+      maxEvents,
+      tokens + (Math.max(0, current - updated) * maxEvents) / refillIntervalMs,
+    );
+    updated = Math.max(updated, current);
+    if (tokens < 1) return false;
+    tokens -= 1;
+    return true;
+  };
+}
+
 export interface AdmissionController {
   acquireSocket(disconnect: () => void): SocketLease | undefined;
   acquireRequest(

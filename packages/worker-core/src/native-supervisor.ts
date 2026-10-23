@@ -1,4 +1,7 @@
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { isIP } from 'node:net';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { VerifiedRunSpec } from './policy.js';
 import { verifyFileProofs } from './verified-launch.js';
@@ -25,6 +28,7 @@ export interface VolumeUsageSample {
   readonly quota_bytes: number;
   readonly available_bytes: number;
   readonly used_bytes: number;
+  readonly volume_id: string;
 }
 
 export interface NativeTeardownReceipt {
@@ -36,6 +40,8 @@ export interface NativeTeardownReceipt {
 }
 
 export interface NativeSupervisorBinding {
+  assertWorkerServiceIdentity(): void;
+  assertWorkerServiceNetworkBinding(adapterGuid: string, address: string): void;
   launchSuspended(spec: VerifiedRunSpec): JobHandle;
   stopJob(handle: JobHandle, graceMs: number): NativeTeardownReceipt;
   sampleJob(handle: JobHandle): ResourceSample;
@@ -49,12 +55,7 @@ function loadNativeBinding(): NativeSupervisorBinding {
     throw new ProcessError('Windows x64 Job Object supervisor is unsupported on this platform');
   }
   const require = createRequire(import.meta.url);
-  const addonPath = fileURLToPath(
-    new URL(
-      '../../../native/worker-supervisor/build/Release/worker_supervisor.node',
-      import.meta.url,
-    ),
-  );
+  const addonPath = resolveNativeSupervisorAddonPath(process.execPath, import.meta.url);
   try {
     return require(addonPath) as NativeSupervisorBinding;
   } catch (cause) {
@@ -62,8 +63,58 @@ function loadNativeBinding(): NativeSupervisorBinding {
   }
 }
 
+/** Resolve the installed addon from the fixed package layout, then fall back to source workspaces. */
+export function resolveNativeSupervisorAddonPath(
+  executablePath: string,
+  moduleUrl: string,
+  fileExists: (candidate: string) => boolean = existsSync,
+): string {
+  const installedRoot = path.resolve(path.dirname(executablePath), '..');
+  const installedPath = path.join(
+    installedRoot,
+    'native',
+    'worker-supervisor',
+    'build',
+    'Release',
+    'worker_supervisor.node',
+  );
+  const sourcePath = fileURLToPath(
+    new URL('../../../native/worker-supervisor/build/Release/worker_supervisor.node', moduleUrl),
+  );
+  return fileExists(installedPath) ? installedPath : sourcePath;
+}
+
 export class WindowsJobSupervisor {
   constructor(private readonly binding: NativeSupervisorBinding = loadNativeBinding()) {}
+
+  assertWorkerServiceIdentity(): void {
+    try {
+      this.binding.assertWorkerServiceIdentity();
+    } catch {
+      // Native token and SID details are intentionally not propagated to callers.
+      throw new ProcessError('Worker service identity verification failed');
+    }
+  }
+
+  assertWorkerServiceNetworkBinding(adapterGuid: string, address: string): void {
+    if (
+      typeof adapterGuid !== 'string' ||
+      !/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})$/i.test(
+        adapterGuid,
+      ) ||
+      typeof address !== 'string' ||
+      address.length > 64 ||
+      address.includes('%') ||
+      isIP(address) === 0
+    ) {
+      throw new ProcessError('Worker network binding verification failed');
+    }
+    try {
+      this.binding.assertWorkerServiceNetworkBinding(adapterGuid, address);
+    } catch {
+      throw new ProcessError('Worker network binding verification failed');
+    }
+  }
 
   async launchSuspended(spec: VerifiedRunSpec): Promise<JobHandle> {
     try {
@@ -108,6 +159,8 @@ export class WindowsJobSupervisor {
     try {
       const sample = this.binding.sampleVolumeUsage(path);
       if (
+        typeof sample.volume_id !== 'string' ||
+        !/^\\\\\?\\Volume\{[0-9a-f-]{36}\}\\$/i.test(sample.volume_id) ||
         !Number.isSafeInteger(sample.quota_bytes) ||
         sample.quota_bytes < 1 ||
         !Number.isSafeInteger(sample.available_bytes) ||
