@@ -137,7 +137,7 @@ Describe 'Worker service policy validation' {
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead
-    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object { try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-12' } catch { $false } }
     $rule | Should -Not -BeNullOrEmpty
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ReadData) | Should -Not -Be 0
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ExecuteFile) | Should -Be 0
@@ -152,7 +152,7 @@ Describe 'Worker service policy validation' {
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead -Directory
-    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object { try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-12' } catch { $false } }
     $rule | Should -Not -BeNullOrEmpty
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Read) | Should -Not -Be 0
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Traverse) | Should -Not -Be 0
@@ -167,13 +167,13 @@ Describe 'Worker service policy validation' {
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Read -RestrictedExecute
-    $executeRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $executeRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object { try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-12' } catch { $false } }
     ([int]$executeRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ExecuteFile) | Should -Not -Be 0
     $executeRule.InheritanceFlags | Should -Be ([Security.AccessControl.InheritanceFlags]::None)
 
     $global:sumatraCapturedRestrictedAcl = $null
     Set-WorkerProtectedAcl -Path $TestDrive -ServiceSid $sid -ServiceAccess Modify -RestrictedTraverse -Directory
-    $traverseRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $traverseRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object { try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-12' } catch { $false } }
     ([int]$traverseRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Traverse) | Should -Not -Be 0
     ([int]$traverseRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::WriteData) | Should -Be 0
     $traverseRule.InheritanceFlags | Should -Be ([Security.AccessControl.InheritanceFlags]::None)
