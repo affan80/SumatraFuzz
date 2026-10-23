@@ -673,14 +673,29 @@ test('private namespace probe reports the exact security descriptor API failure'
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',
   );
-  assert.match(probe, /bool Initialize\(unsigned\* failure_stage = nullptr, DWORD\* failure_error = nullptr\)/);
+  assert.match(
+    probe,
+    /bool Initialize\(unsigned\* failure_stage = nullptr, DWORD\* failure_error = nullptr\)/,
+  );
   assert.match(probe, /const DWORD acl_error = SetEntriesInAclW\(2, grants, nullptr, &acl\);/);
   assert.match(probe, /if \(acl_error != ERROR_SUCCESS\) return fail\(11, acl_error\);/);
-  assert.match(probe, /InitializeSecurityDescriptor\(&descriptor, SECURITY_DESCRIPTOR_REVISION\)\) return fail_last_error\(12\)/);
-  assert.match(probe, /SetSecurityDescriptorDacl\(&descriptor, TRUE, acl, FALSE\)\) return fail_last_error\(13\)/);
-  assert.match(probe, /SetSecurityDescriptorControl\(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED\)\) return fail_last_error\(14\)/);
+  assert.match(
+    probe,
+    /InitializeSecurityDescriptor\(&descriptor, SECURITY_DESCRIPTOR_REVISION\)\) return fail_last_error\(12\)/,
+  );
+  assert.match(
+    probe,
+    /SetSecurityDescriptorDacl\(&descriptor, TRUE, acl, FALSE\)\) return fail_last_error\(13\)/,
+  );
+  assert.match(
+    probe,
+    /SetSecurityDescriptorControl\(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED\)\) return fail_last_error\(14\)/,
+  );
   assert.match(probe, /ns\.Initialize\(&namespace_stage, &namespace_error\)/);
-  assert.match(probe, /WriteNamespaceFailureDiagnostic\(evidence_dir, namespace_stage, namespace_error\)/);
+  assert.match(
+    probe,
+    /WriteNamespaceFailureDiagnostic\(evidence_dir, namespace_stage, namespace_error\)/,
+  );
 });
 
 test('unconfirmed native teardown has a bounded fail-closed ownership quarantine', () => {
