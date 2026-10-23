@@ -19,6 +19,12 @@ if ($lock.acquisition.winafl_source_commit -ne 'fd85f38548b14352f4b70ad414f364ea
     $lock.acquisition.dynamorio_release -ne 'cronbuild-11.91.20735') {
   throw 'Unrecognized toolchain revision'
 }
+$patchPath = Join-Path $PSScriptRoot 'patches/winafl-private-namespace.patch'
+$expectedPatchHash = 'bd16e8457a0f7b61f602b6d03c3ef740496382f559f2852335f6be1e6c9c8d33'
+if ($lock.acquisition.winafl_patch_sha256 -cne $expectedPatchHash -or
+    (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedPatchHash) {
+  throw 'WinAFL namespace patch digest mismatch'
+}
 if ($lock.source_commit -ne '16c59fde8b824ab54c56f23aef910a6fdd874ad0' -or
     $lock.architecture -ne 'x64' -or $lock.harness_entry -ne 'fuzz_one_file' -or $lock.nargs -ne 1) {
   throw 'Pinned SumatraPDF toolchain contract mismatch'

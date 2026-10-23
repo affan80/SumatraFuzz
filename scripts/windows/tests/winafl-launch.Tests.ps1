@@ -53,3 +53,21 @@ Describe 'WinAFL campaign launcher preflight must fail closed' -Skip:(!$IsWindow
     { & $script:runner @f } | Should -Throw '*A4 instrumented run evidence missing*'
   }
 }
+
+Describe 'Pinned WinAFL namespace acquisition contract' {
+  It 'locks the reviewed patch and refuses dirty or incompatible pinned source' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $provision | Should -Match 'winafl_patch_sha256'
+    $provision | Should -Match 'apply --check'
+    $provision | Should -Match 'status --porcelain'
+    $provision | Should -Match 'expectedPatchHash'
+  }
+  It 'routes coverage and sample mappings through the authenticated namespace helper' {
+    $patch=Get-Content (Join-Path $PSScriptRoot '../patches/winafl-private-namespace.patch') -Raw
+    $patch | Should -Match 'sf_namespace_name'
+    $patch | Should -Match 'TokenRestrictedSids'
+    $patch | Should -Match 'OpenPrivateNamespaceA'
+    $patch | Should -Match 'SE_DACL_PROTECTED'
+    $patch | Should -Match '\-namespace_alias %s -run_sid %s'
+  }
+}
