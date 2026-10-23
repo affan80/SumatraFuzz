@@ -1,6 +1,7 @@
 #include <napi.h>
 
 #include "command_line.h"
+#include "private_acl.h"
 
 #include <algorithm>
 #include <array>
@@ -320,16 +321,11 @@ PrivateNamespace CreateRunPrivateNamespace(const RestrictedToken& restricted) {
   boundary.handle = CreateBoundaryDescriptorW(result.alias.c_str(), 0);
   if (!boundary.handle || !AddSIDToBoundaryDescriptor(&boundary.handle, worker_sid))
     throw std::runtime_error("private namespace boundary setup failed");
-  EXPLICIT_ACCESSW grants[2]{};
-  for (auto& grant : grants) {
-    grant.grfAccessPermissions = GENERIC_ALL;
-    grant.grfAccessMode = SET_ACCESS;
-    grant.grfInheritance = NO_INHERITANCE;
-  }
-  BuildTrusteeWithSidW(&grants[0].Trustee, worker_sid);
-  BuildTrusteeWithSidW(&grants[1].Trustee, restricted.sid);
+  const sumatrafuzz::supervisor::PrivateAclGrant grants[] = {
+      {worker_sid, GENERIC_ALL}, {restricted.sid, GENERIC_ALL}};
   LocalMemory acl;
-  if (SetEntriesInAclW(2, grants, nullptr, reinterpret_cast<PACL*>(&acl.value)) != ERROR_SUCCESS)
+  acl.value = sumatrafuzz::supervisor::CreatePrivateAccessAcl(grants, std::size(grants));
+  if (!acl.value)
     throw std::runtime_error("private namespace ACL setup failed");
   SECURITY_DESCRIPTOR descriptor{};
   if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
@@ -434,17 +430,10 @@ void SetPrivateRestrictedDefaultDacl(HANDLE source_token, HANDLE restricted_toke
   if (!GetTokenInformation(source_token, TokenUser, user, user_bytes, &returned)) {
     throw std::runtime_error("could not inspect worker token owner");
   }
-  EXPLICIT_ACCESSW grants[2]{};
-  for (auto& grant : grants) {
-    grant.grfAccessPermissions = GENERIC_ALL;
-    grant.grfAccessMode = GRANT_ACCESS;
-    grant.grfInheritance = NO_INHERITANCE;
-  }
-  BuildTrusteeWithSidW(&grants[0].Trustee, user->User.Sid);
-  BuildTrusteeWithSidW(&grants[1].Trustee, run_sid);
-  PACL private_dacl = nullptr;
-  const DWORD acl_result = SetEntriesInAclW(2, grants, nullptr, &private_dacl);
-  if (acl_result != ERROR_SUCCESS) throw std::runtime_error("could not prepare restricted child object permissions");
+  const sumatrafuzz::supervisor::PrivateAclGrant grants[] = {
+      {user->User.Sid, GENERIC_ALL}, {run_sid, GENERIC_ALL}};
+  PACL private_dacl = sumatrafuzz::supervisor::CreatePrivateAccessAcl(grants, std::size(grants));
+  if (!private_dacl) throw std::runtime_error("could not prepare restricted child object permissions");
   TOKEN_DEFAULT_DACL token_default{private_dacl};
   const BOOL set = SetTokenInformation(restricted_token, TokenDefaultDacl, &token_default,
                                        sizeof(token_default));

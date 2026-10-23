@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include "command_line.h"
+#include "private_acl.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -131,16 +132,11 @@ struct ProbeNamespace {
     user.resize(bytes);
     if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) return fail_last_error(10);
     PSID worker = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
-    EXPLICIT_ACCESSW grants[2]{};
-    for (auto& grant : grants) {
-      grant.grfAccessPermissions = EVENT_MODIFY_STATE | SYNCHRONIZE;
-      grant.grfAccessMode = SET_ACCESS;
-      grant.grfInheritance = NO_INHERITANCE;
-    }
-    BuildTrusteeWithSidW(&grants[0].Trustee, worker);
-    BuildTrusteeWithSidW(&grants[1].Trustee, run_sid);
-    const DWORD acl_error = SetEntriesInAclW(2, grants, nullptr, &acl);
-    if (acl_error != ERROR_SUCCESS) return fail(11, acl_error);
+    const sumatrafuzz::supervisor::PrivateAclGrant grants[] = {
+        {worker, EVENT_MODIFY_STATE | SYNCHRONIZE},
+        {run_sid, EVENT_MODIFY_STATE | SYNCHRONIZE}};
+    acl = sumatrafuzz::supervisor::CreatePrivateAccessAcl(grants, std::size(grants));
+    if (!acl) return fail_last_error(11);
     if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)) return fail_last_error(12);
     if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) return fail_last_error(13);
     if (!SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) return fail_last_error(14);

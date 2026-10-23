@@ -372,7 +372,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   assert.match(addon, /SID_AND_ATTRIBUTES restricting_sids/);
   assert.match(addon, /\{restricted\.sid, 0\}/);
   assert.match(addon, /CreateProcessAsUserW\(/);
-  assert.match(addon, /SetEntriesInAclW\(/);
+  assert.match(addon, /CreatePrivateAccessAcl\(/);
   assert.match(addon, /SetPrivateRestrictedDefaultDacl/);
   assert.match(addon, /WinRestrictedCodeSid/);
   assert.match(addon, /WinAuthenticatedUserSid/);
@@ -668,7 +668,7 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(probe, /--namespace-gone/);
 });
 
-test('private namespace probe reports the exact security descriptor API failure', () => {
+test('private namespace probe reports the exact private ACL construction failure', () => {
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',
@@ -677,8 +677,17 @@ test('private namespace probe reports the exact security descriptor API failure'
     probe,
     /bool Initialize\(unsigned\* failure_stage = nullptr, DWORD\* failure_error = nullptr\)/,
   );
-  assert.match(probe, /const DWORD acl_error = SetEntriesInAclW\(2, grants, nullptr, &acl\);/);
-  assert.match(probe, /if \(acl_error != ERROR_SUCCESS\) return fail\(11, acl_error\);/);
+  assert.match(probe, /CreatePrivateAccessAcl\(grants, std::size\(grants\)\)/);
+  assert.match(probe, /if \(!acl\) return fail_last_error\(11\);/);
+  const acl = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/include/private_acl.h'),
+    'utf8',
+  );
+  assert.match(acl, /InitializeAcl\(acl, static_cast<DWORD>\(acl_size\), ACL_REVISION\)/);
+  assert.match(
+    acl,
+    /AddAccessAllowedAceEx\(acl, ACL_REVISION, 0, grants\[index\]\.access, grants\[index\]\.sid\)/,
+  );
   assert.match(
     probe,
     /InitializeSecurityDescriptor\(&descriptor, SECURITY_DESCRIPTOR_REVISION\)\) return fail_last_error\(12\)/,
