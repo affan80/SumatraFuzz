@@ -134,12 +134,15 @@ export async function issueCertificate(
   );
   await writeFile(file('ext'), extensions);
   if (days === '-1') {
+    // OpenSSL config treats backslashes as escape characters, so normalize
+    // Windows paths before embedding them in the generated CA configuration.
+    const configPath = (value: string) => value.replaceAll('\\', '/');
     await writeFile(file('index'), '');
     await writeFile(file('serial'), '01\n');
     await writeFile(file('ext'), `[leaf]\n${extensions}`);
     await writeFile(
       file('conf'),
-      `[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=${file('index')}\nserial=${file('serial')}\nnew_certs_dir=${root}\ncertificate=${path.join(root, 'ca.crt')}\nprivate_key=${path.join(root, 'ca.key')}\ndefault_md=sha256\npolicy=names\n[names]\ncommonName=supplied\n`,
+      `[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=${configPath(file('index'))}\nserial=${configPath(file('serial'))}\nnew_certs_dir=${configPath(root)}\ncertificate=${configPath(path.join(root, 'ca.crt'))}\nprivate_key=${configPath(path.join(root, 'ca.key'))}\ndefault_md=sha256\npolicy=names\n[names]\ncommonName=supplied\n`,
     );
     execFileSync(
       'openssl',
