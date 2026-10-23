@@ -487,3 +487,18 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(probe, /--grandchild/);
   assert.match(probe, /--namespace-gone/);
 });
+
+test('unconfirmed native teardown has a bounded fail-closed ownership quarantine', () => {
+  const addon = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
+    'utf8',
+  );
+  assert.match(addon, /struct QuarantinedJob/);
+  assert.match(addon, /g_teardown_quarantine/);
+  assert.match(addon, /const ULONGLONG teardown_deadline = GetTickCount64\(\) \+ 30000/);
+  assert.match(addon, /if \(!root_exited \|\| !job_empty\)/);
+  assert.match(addon, /quarantine->private_namespace = std::move\(private_namespace\)/);
+  assert.match(addon, /g_teardown_quarantine = quarantine.release\(\)/);
+  assert.match(addon, /teardown_unconfirmed; handles quarantined/);
+  assert.doesNotMatch(addon, /while\s*\(!QueryInformationJobObject/);
+});

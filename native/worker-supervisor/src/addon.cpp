@@ -78,9 +78,24 @@ struct BoundaryDescriptor {
 };
 #endif
 
+#ifdef _WIN32
+// Exceptional teardown must not release a namespace whose processes may still
+// exist. These records deliberately remain owned for the supervisor lifetime.
+// Allocate the record before launch so quarantine cannot fail during unwinding.
+struct QuarantinedJob {
+  PrivateNamespace private_namespace;
+  HANDLE job = nullptr;
+  HANDLE process = nullptr;
+  QuarantinedJob* next = nullptr;
+};
+QuarantinedJob* g_teardown_quarantine = nullptr;
+#endif
+
 struct Job {
 #ifdef _WIN32
   PrivateNamespace private_namespace;
+  PrivateNamespace* launch_namespace = nullptr;  // Scope owner until assignment succeeds.
+  std::unique_ptr<QuarantinedJob> quarantine = std::make_unique<QuarantinedJob>();
   bool assigned = false;
   HANDLE job = nullptr;
   HANDLE process = nullptr;
@@ -88,21 +103,44 @@ struct Job {
   ULONGLONG previous_cpu_100ns = 0;
   ULONGLONG previous_sample_ms = 0;
   ~Job() {
-    // Keep the namespace alive until every assigned descendant has exited,
-    // including exceptions during launch and module teardown.
+    // A persistent accounting failure cannot justify either an unbounded wait
+    // or releasing the namespace while descendants may remain. Quarantine the
+    // owned resources if bounded termination cannot establish complete exit.
+    const ULONGLONG teardown_deadline = GetTickCount64() + 30000;
+    bool root_exited = !process;
     if (process) {
       TerminateProcess(process, ERROR_OPERATION_ABORTED);
       if (job && assigned) TerminateJobObject(job, ERROR_OPERATION_ABORTED);
-      WaitForSingleObject(process, INFINITE);
+      root_exited = WaitForSingleObject(process, 30000) == WAIT_OBJECT_0;
     }
+    bool job_empty = !assigned;
     if (job && assigned) {
       JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-      while (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
-                                       &accounting, sizeof(accounting), nullptr) ||
-             accounting.ActiveProcesses != 0) {
-        TerminateJobObject(job, ERROR_OPERATION_ABORTED);
+      do {
+        if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                      &accounting, sizeof(accounting), nullptr) &&
+            accounting.ActiveProcesses == 0) {
+          job_empty = true;
+          break;
+        }
+        if (GetTickCount64() >= teardown_deadline) break;
         Sleep(10);
-      }
+      } while (GetTickCount64() < teardown_deadline);
+    }
+    if (!root_exited || !job_empty) {
+      quarantine->job = job;
+      quarantine->process = process;
+      quarantine->private_namespace = std::move(private_namespace);
+      // On failed assignment, the local namespace still belongs to the launch
+      // scope. Preserve that owner too if the suspended root cannot be reaped.
+      if (launch_namespace)
+        quarantine->private_namespace = std::move(*launch_namespace);
+      quarantine->next = g_teardown_quarantine;
+      g_teardown_quarantine = quarantine.release();
+      job = nullptr;
+      process = nullptr;
+      OutputDebugStringW(L"SumatraFuzz teardown_unconfirmed; handles quarantined\n");
+      return;
     }
     if (job) CloseHandle(job);
     if (process) CloseHandle(process);
@@ -632,6 +670,7 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     std::vector<wchar_t> environment = BuildWorkerEnvironment(
         evidence_dir, tool_dir, private_namespace.alias, RunSidText(restricted.sid));
     auto job = std::make_unique<Job>();
+    job->launch_namespace = &private_namespace;
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
@@ -659,6 +698,7 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     }
     job->assigned = true;
     job->private_namespace = std::move(private_namespace);
+    job->launch_namespace = nullptr;
     if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
       throw std::runtime_error("ResumeThread failed; job was terminated");
     }
@@ -690,14 +730,18 @@ Napi::Value StopJob(const Napi::CallbackInfo& info) {
     if (grace_ms > 10000) throw std::runtime_error("grace interval exceeds ten seconds");
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
     if (grace_ms) WaitForSingleObject(job.process, grace_ms);
-    if (!QueryInformationJobObject(job.job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr)) throw std::runtime_error("could not inspect job before teardown");
+    if (!QueryInformationJobObject(job.job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr)) {
+      TerminateJobObject(job.job, ERROR_OPERATION_ABORTED);
+      throw std::runtime_error("job teardown unconfirmed; ownership retained");
+    }
     if (accounting.ActiveProcesses > 0) {
       if (!TerminateJobObject(job.job, ERROR_OPERATION_ABORTED)) throw std::runtime_error("could not terminate the complete process job");
     }
     const ULONGLONG deadline = GetTickCount64() + 30000;
     do {
       if (WaitForSingleObject(job.process, 10) == WAIT_FAILED) throw std::runtime_error("could not wait for root process teardown");
-      if (!QueryInformationJobObject(job.job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr)) throw std::runtime_error("could not verify job teardown");
+      if (!QueryInformationJobObject(job.job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr))
+        throw std::runtime_error("job teardown unconfirmed; ownership retained");
       if (accounting.ActiveProcesses == 0) break;
     } while (GetTickCount64() < deadline);
     Napi::Object receipt = Napi::Object::New(env);
