@@ -71,7 +71,9 @@ test('Windows supervisor bounds and tears down a child process tree', {
   const inputPath = path.join(inputDir, 'seed.pdf');
   const protectedReadPath = path.join(protectedDir, 'credential-sentinel');
   const protectedWritePath = path.join(protectedDir, 'must-not-exist');
-  const eventName = `Local\\SumatraFuzz-Restricted-Probe-${process.pid}`;
+  // An unqualified name is scoped to this logon session's BaseNamedObjects;
+  // avoid a `Local\\` symbolic-link lookup from the restricted token.
+  const eventName = `SumatraFuzz-Restricted-Probe-${process.pid}`;
   mkdirSync(toolDir);
   mkdirSync(evidenceDir);
   mkdirSync(inputDir);
