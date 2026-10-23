@@ -81,6 +81,13 @@ test('Windows supervisor bounds and tears down a child process tree', {
   copyFileSync(probePath, containmentProbePath);
   writeFileSync(inputPath, 'pdf input sentinel');
   writeFileSync(protectedReadPath, 'service-only trust and DPAPI sentinel');
+  const baselineEnvironment = { ...process.env };
+  delete baselineEnvironment.SUMATRAFUZZ_TEST_SECRET;
+  execFileSync(
+    containmentProbePath,
+    ['--create-event', `${eventName}-baseline`],
+    { env: baselineEnvironment, stdio: 'ignore' },
+  );
   // Simulate installer-provisioned access narrowly: the test root gets only
   // traverse, code gets execute/read, and the exact input objects get read
   // without inheritance (the input file must not get ExecuteFile).
