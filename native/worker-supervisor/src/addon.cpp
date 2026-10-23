@@ -22,6 +22,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <bcrypt.h>
@@ -31,16 +32,81 @@
 
 namespace {
 
+#ifdef _WIN32
+struct PrivateNamespace {
+  HANDLE handle = nullptr;
+  std::wstring alias;
+  PrivateNamespace() = default;
+  PrivateNamespace(const PrivateNamespace&) = delete;
+  PrivateNamespace& operator=(const PrivateNamespace&) = delete;
+  PrivateNamespace(PrivateNamespace&& other) noexcept
+      : handle(other.handle), alias(std::move(other.alias)) { other.handle = nullptr; }
+  PrivateNamespace& operator=(PrivateNamespace&& other) noexcept {
+    if (this != &other) {
+      if (handle) ClosePrivateNamespace(handle, PRIVATE_NAMESPACE_FLAG_DESTROY);
+      handle = other.handle;
+      alias = std::move(other.alias);
+      other.handle = nullptr;
+    }
+    return *this;
+  }
+  ~PrivateNamespace() {
+    if (handle) ClosePrivateNamespace(handle, PRIVATE_NAMESPACE_FLAG_DESTROY);
+  }
+};
+
+struct OwnedHandle {
+  HANDLE handle = nullptr;
+  ~OwnedHandle() { if (handle) CloseHandle(handle); }
+  OwnedHandle() = default;
+  OwnedHandle(const OwnedHandle&) = delete;
+  OwnedHandle& operator=(const OwnedHandle&) = delete;
+};
+struct LocalMemory {
+  HLOCAL value = nullptr;
+  ~LocalMemory() { if (value) LocalFree(value); }
+  LocalMemory() = default;
+  LocalMemory(const LocalMemory&) = delete;
+  LocalMemory& operator=(const LocalMemory&) = delete;
+};
+struct BoundaryDescriptor {
+  HANDLE handle = nullptr;
+  ~BoundaryDescriptor() { if (handle) DeleteBoundaryDescriptor(handle); }
+  BoundaryDescriptor() = default;
+  BoundaryDescriptor(const BoundaryDescriptor&) = delete;
+  BoundaryDescriptor& operator=(const BoundaryDescriptor&) = delete;
+};
+#endif
+
 struct Job {
 #ifdef _WIN32
+  PrivateNamespace private_namespace;
+  bool assigned = false;
   HANDLE job = nullptr;
   HANDLE process = nullptr;
   DWORD process_id = 0;
   ULONGLONG previous_cpu_100ns = 0;
   ULONGLONG previous_sample_ms = 0;
   ~Job() {
-    if (job) CloseHandle(job);  // KILL_ON_JOB_CLOSE is the final containment boundary.
+    // Keep the namespace alive until every assigned descendant has exited,
+    // including exceptions during launch and module teardown.
+    if (process) {
+      TerminateProcess(process, ERROR_OPERATION_ABORTED);
+      if (job && assigned) TerminateJobObject(job, ERROR_OPERATION_ABORTED);
+      WaitForSingleObject(process, INFINITE);
+    }
+    if (job && assigned) {
+      JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+      while (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                       &accounting, sizeof(accounting), nullptr) ||
+             accounting.ActiveProcesses != 0) {
+        TerminateJobObject(job, ERROR_OPERATION_ABORTED);
+        Sleep(10);
+      }
+    }
+    if (job) CloseHandle(job);
     if (process) CloseHandle(process);
+    // private_namespace is destroyed after this body (and Job Object teardown).
   }
 #endif
 };
@@ -109,9 +175,43 @@ std::wstring EnvironmentValue(const wchar_t* name) {
   return value;
 }
 
-std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, const std::wstring& tool_dir) {
+bool ValidNamespaceAlias(const std::wstring& alias) {
+  if (alias.size() != 41 || alias.compare(0, 5, L"SFWR-") != 0) return false;
+  for (size_t i = 5; i < alias.size(); ++i) {
+    if (i == 13 || i == 18 || i == 23 || i == 28) {
+      if (alias[i] != L'-') return false;
+    } else if (!((alias[i] >= L'0' && alias[i] <= L'9') ||
+                 (alias[i] >= L'a' && alias[i] <= L'f') ||
+                 (alias[i] >= L'A' && alias[i] <= L'F'))) return false;
+  }
+  return true;
+}
+
+bool ValidRunSid(PSID sid) {
+  const SID_IDENTIFIER_AUTHORITY authority{{0x53, 0x46, 0x57, 0x52, 0x4b, 0x31}};
+  return sid && IsValidSid(sid) && *GetSidSubAuthorityCount(sid) == 3 &&
+         std::memcmp(GetSidIdentifierAuthority(sid), &authority, sizeof(authority)) == 0;
+}
+
+std::wstring RunSidText(PSID sid) {
+  if (!ValidRunSid(sid)) throw std::runtime_error("invalid private namespace run SID");
+  LocalMemory text;
+  if (!ConvertSidToStringSidW(sid, reinterpret_cast<LPWSTR*>(&text.value)))
+    throw std::runtime_error("private namespace SID serialization failed");
+  return static_cast<const wchar_t*>(text.value);
+}
+
+std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, const std::wstring& tool_dir,
+                                          const std::wstring& namespace_alias, const std::wstring& run_sid) {
+  LocalMemory parsed_sid;
+  if (!ValidNamespaceAlias(namespace_alias) || run_sid.size() > 184 ||
+      !ConvertStringSidToSidW(run_sid.c_str(), reinterpret_cast<PSID*>(&parsed_sid.value)) ||
+      !ValidRunSid(parsed_sid.value) || RunSidText(parsed_sid.value) != run_sid)
+    throw std::runtime_error("invalid private namespace identifiers");
   const std::wstring system_root = EnvironmentValue(L"SystemRoot");
   std::map<std::wstring, std::wstring> values;
+  values.emplace(L"SUMATRAFUZZ_NAMESPACE_ALIAS", namespace_alias);
+  values.emplace(L"SUMATRAFUZZ_RUN_SID", run_sid);
   values.emplace(L"PATH", tool_dir + L";" + system_root + L"\\System32");
   values.emplace(L"SystemRoot", system_root);
   values.emplace(L"TEMP", working_dir);
@@ -159,6 +259,50 @@ PSID CreateRunRestrictedSid() {
                                   static_cast<DWORD>(run.Data4[2]) << 8 |
                                   static_cast<DWORD>(run.Data4[3]);
   return sid;
+}
+
+PrivateNamespace CreateRunPrivateNamespace(const RestrictedToken& restricted) {
+  if (!ValidRunSid(restricted.sid)) throw std::runtime_error("invalid private namespace run SID");
+  OwnedHandle current;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &current.handle))
+    throw std::runtime_error("private namespace worker token unavailable");
+  DWORD bytes = 0;
+  GetTokenInformation(current.handle, TokenUser, nullptr, 0, &bytes);
+  if (!bytes) throw std::runtime_error("private namespace worker SID unavailable");
+  std::vector<BYTE> storage(bytes);
+  if (!GetTokenInformation(current.handle, TokenUser, storage.data(), bytes, &bytes))
+    throw std::runtime_error("private namespace worker SID unavailable");
+  PSID worker_sid = reinterpret_cast<TOKEN_USER*>(storage.data())->User.Sid;
+  if (!IsValidSid(worker_sid)) throw std::runtime_error("private namespace worker SID invalid");
+  const std::string id = IdString();
+  PrivateNamespace result;
+  result.alias = L"SFWR-" + std::wstring(id.begin(), id.end());
+  if (!ValidNamespaceAlias(result.alias)) throw std::runtime_error("private namespace alias invalid");
+  BoundaryDescriptor boundary;
+  boundary.handle = CreateBoundaryDescriptorW(result.alias.c_str(), 0);
+  if (!boundary.handle || !AddSIDToBoundaryDescriptor(&boundary.handle, worker_sid))
+    throw std::runtime_error("private namespace boundary setup failed");
+  EXPLICIT_ACCESSW grants[2]{};
+  for (auto& grant : grants) {
+    grant.grfAccessPermissions = GENERIC_ALL;
+    grant.grfAccessMode = SET_ACCESS;
+    grant.grfInheritance = NO_INHERITANCE;
+  }
+  BuildTrusteeWithSidW(&grants[0].Trustee, worker_sid);
+  BuildTrusteeWithSidW(&grants[1].Trustee, restricted.sid);
+  LocalMemory acl;
+  if (SetEntriesInAclW(2, grants, nullptr, reinterpret_cast<PACL*>(&acl.value)) != ERROR_SUCCESS)
+    throw std::runtime_error("private namespace ACL setup failed");
+  SECURITY_DESCRIPTOR descriptor{};
+  if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+      !SetSecurityDescriptorDacl(&descriptor, TRUE, static_cast<PACL>(acl.value), FALSE) ||
+      !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+    throw std::runtime_error("private namespace descriptor setup failed");
+  SECURITY_ATTRIBUTES attributes{sizeof(attributes), &descriptor, FALSE};
+  // Never open/reuse a collided namespace or retry with broader access.
+  result.handle = CreatePrivateNamespaceW(&attributes, boundary.handle, result.alias.c_str());
+  if (!result.handle) throw std::runtime_error("private namespace creation failed");
+  return result;
 }
 
 void AddRestrictedSidAccess(const std::wstring& directory_path, PSID sid, DWORD permissions,
@@ -484,46 +628,47 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     }
     [[maybe_unused]] std::vector<OpenProof> opened_proofs = VerifyProofs(proofs, executable, tool_dir);
     RestrictedToken restricted = CreateEvidenceRestrictedToken(evidence_dir);
-    std::vector<wchar_t> environment = BuildWorkerEnvironment(evidence_dir, tool_dir);
+    PrivateNamespace private_namespace = CreateRunPrivateNamespace(restricted);
+    std::vector<wchar_t> environment = BuildWorkerEnvironment(
+        evidence_dir, tool_dir, private_namespace.alias, RunSidText(restricted.sid));
+    auto job = std::make_unique<Job>();
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
     HANDLE job_handle = CreateJobObjectW(nullptr, nullptr);
+    job->job = job_handle;
     if (!job_handle) throw std::runtime_error("CreateJobObjectW failed");
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION extended{};
     extended.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY;
     extended.JobMemoryLimit = static_cast<SIZE_T>(memory);
-    if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation, &extended, sizeof(extended))) { CloseHandle(job_handle); throw std::runtime_error("Job memory quota setup failed"); }
+    if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation, &extended, sizeof(extended))) { throw std::runtime_error("Job memory quota setup failed"); }
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu_limit{};
     cpu_limit.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
     cpu_limit.CpuRate = static_cast<DWORD>(cpu * 100.0);
-    if (!SetInformationJobObject(job_handle, JobObjectCpuRateControlInformation, &cpu_limit, sizeof(cpu_limit))) { CloseHandle(job_handle); throw std::runtime_error("Job CPU quota setup failed"); }
+    if (!SetInformationJobObject(job_handle, JobObjectCpuRateControlInformation, &cpu_limit, sizeof(cpu_limit))) { throw std::runtime_error("Job CPU quota setup failed"); }
     const DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
     if (!CreateProcessAsUserW(restricted.handle, executable.c_str(), command.data(), nullptr, nullptr,
                               FALSE, flags, environment.data(), working_dir.c_str(), &startup, &process)) {
-      CloseHandle(job_handle); throw std::runtime_error("CreateProcessAsUserW failed");
+      throw std::runtime_error("CreateProcessAsUserW failed");
     }
+    job->process = process.hProcess;
+    OwnedHandle thread;
+    thread.handle = process.hThread;
     if (!AssignProcessToJobObject(job_handle, process.hProcess)) {
-      TerminateProcess(process.hProcess, ERROR_ACCESS_DENIED); WaitForSingleObject(process.hProcess, 5000);
-      CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job_handle);
       throw std::runtime_error("AssignProcessToJobObject failed; suspended child was terminated");
     }
+    job->assigned = true;
+    job->private_namespace = std::move(private_namespace);
     if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
-      TerminateJobObject(job_handle, ERROR_OPERATION_ABORTED); WaitForSingleObject(process.hProcess, 5000);
-      CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job_handle);
       throw std::runtime_error("ResumeThread failed; job was terminated");
     }
-    CloseHandle(process.hThread);
-    auto job = std::make_unique<Job>();
-    job->job = job_handle;
-    job->process = process.hProcess;
     job->process_id = process.dwProcessId;
     job->previous_sample_ms = GetTickCount64();
     const std::string id = IdString();
-    g_jobs.emplace(id, std::move(job));
     Napi::Object result = Napi::Object::New(env);
     result.Set("id", id);
     result.Set("processId", process.dwProcessId);
+    g_jobs.emplace(id, std::move(job));
     return result;
   } catch (const std::exception& error) { throw NativeError(env, error.what()); }
 }

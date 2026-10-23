@@ -72,8 +72,6 @@ test('Windows supervisor bounds and tears down a child process tree', {
   const inputPath = path.join(inputDir, 'seed.pdf');
   const protectedReadPath = path.join(protectedDir, 'credential-sentinel');
   const protectedWritePath = path.join(protectedDir, 'must-not-exist');
-  // An unqualified name is scoped to this logon session's BaseNamedObjects;
-  // avoid a `Local\\` symbolic-link lookup from the restricted token.
   const eventName = `SumatraFuzz-Restricted-Probe-${process.pid}`;
   mkdirSync(toolDir);
   mkdirSync(evidenceDir);
@@ -92,10 +90,30 @@ test('Windows supervisor bounds and tears down a child process tree', {
   });
   const baselineEnvironment = { ...process.env };
   delete baselineEnvironment.SUMATRAFUZZ_TEST_SECRET;
-  execFileSync(containmentProbePath, ['--create-event', `${eventName}-baseline`], {
-    env: baselineEnvironment,
-    stdio: 'ignore',
-  });
+  for (const identifiers of [
+    {},
+    {
+      SUMATRAFUZZ_NAMESPACE_ALIAS: '../invalid',
+      SUMATRAFUZZ_RUN_SID: 'S-1-1-0',
+    },
+    {
+      SUMATRAFUZZ_NAMESPACE_ALIAS: 'SFWR-00000000-0000-0000-0000-000000000000',
+      SUMATRAFUZZ_RUN_SID: 'invalid',
+    },
+  ]) {
+    const env = { ...baselineEnvironment };
+    delete env.SUMATRAFUZZ_NAMESPACE_ALIAS;
+    delete env.SUMATRAFUZZ_RUN_SID;
+    assert.throws(
+      () =>
+        execFileSync(containmentProbePath, ['--validate-identifiers'], {
+          env: { ...env, ...identifiers },
+          stdio: 'ignore',
+        }),
+      (error) => error.status === 30,
+      'invalid identifiers must fail closed',
+    );
+  }
   // Simulate installer-provisioned access narrowly: the test root gets only
   // traverse, code gets execute/read, and the exact input objects get read
   // without inheritance (the input file must not get ExecuteFile).
@@ -107,6 +125,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
   execFileSync('icacls.exe', [inputDir, '/grant', '*S-1-5-12:(GR,GE)'], { stdio: 'ignore' });
   execFileSync('icacls.exe', [inputPath, '/grant', '*S-1-5-12:(GR)'], { stdio: 'ignore' });
   let job;
+  let siblingJob;
   try {
     job = supervisor.launchSuspended({
       executable: containmentProbePath,
@@ -134,14 +153,14 @@ test('Windows supervisor bounds and tears down a child process tree', {
       sample = supervisor.sampleJob(job);
       const evidenceNames = readdirSync(evidenceDir);
       if (
-        sample.process_count >= 2 &&
-        evidenceNames.filter((name) => name.startsWith('restricted-write-')).length >= 2 &&
-        evidenceNames.some((name) => name.startsWith('named-event-'))
+        sample.process_count >= 3 &&
+        evidenceNames.filter((name) => name.startsWith('restricted-write-')).length >= 3 &&
+        evidenceNames.filter((name) => /^named-event-\d+$/.test(name)).length >= 2
       )
         break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    if (sample.process_count < 2) {
+    if (sample.process_count < 3) {
       const receipt = supervisor.stopJob(job, 0);
       job = undefined;
       const eventDiagnostic = readdirSync(evidenceDir)
@@ -155,23 +174,23 @@ test('Windows supervisor bounds and tears down a child process tree', {
       );
     }
     assert.ok(
-      sample.process_count >= 2,
+      sample.process_count >= 3,
       'probe child must stay in the job and must not inherit secrets',
     );
     assert.ok(
-      readdirSync(evidenceDir).filter((name) => name.startsWith('restricted-write-')).length >= 2,
+      readdirSync(evidenceDir).filter((name) => name.startsWith('restricted-write-')).length >= 3,
       'restricted child process and descendant must both write evidence',
     );
     assert.ok(
-      readdirSync(evidenceDir).some((name) => name.startsWith('named-event-')),
+      readdirSync(evidenceDir).filter((name) => /^named-event-\d+$/.test(name)).length >= 2,
       'restricted descendant must open and signal the private named event',
     );
     assert.deepEqual(
       readdirSync(protectedDir),
-      [],
+      ['credential-sentinel'],
       'restricted child process and its descendant must not write outside run evidence',
     );
-    const siblingJob = supervisor.launchSuspended({
+    siblingJob = supervisor.launchSuspended({
       executable: containmentProbePath,
       argv: [
         '-D',
@@ -181,7 +200,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
         '-o',
         siblingEvidenceDir,
         '--deny-open-event',
-        eventName,
+        readFileSync(path.join(evidenceDir, 'private-event-name.txt'), 'utf8'),
       ],
       workingDir: containmentRoot,
       evidenceDir: siblingEvidenceDir,
@@ -195,6 +214,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     const siblingReceipt = supervisor.stopJob(siblingJob, 0);
+    siblingJob = undefined;
     assert.equal(
       siblingSample.process_count,
       0,
@@ -205,10 +225,65 @@ test('Windows supervisor bounds and tears down a child process tree', {
       0,
       'a separate restricted run must be denied access to this run’s named event',
     );
+    const privateName = readFileSync(path.join(evidenceDir, 'private-event-name.txt'), 'utf8');
     const receipt = supervisor.stopJob(job, 0);
     job = undefined;
     assert.equal(receipt.remainingProcesses, 0);
+    execFileSync(containmentProbePath, ['--namespace-gone', privateName.split('\\')[0]], {
+      env: baselineEnvironment,
+      stdio: 'ignore',
+    });
+    // A verified non-PE file reaches CreateProcessAsUserW only after namespace
+    // creation. Repeated failure must close every temporary namespace/job/token.
+    const invalidExecutable = path.join(toolDir, 'invalid.exe');
+    const invalidBytes = Buffer.from('intentionally not a Windows executable');
+    writeFileSync(invalidExecutable, invalidBytes);
+    execFileSync('icacls.exe', [invalidExecutable, '/grant', '*S-1-5-12:(RX)'], {
+      stdio: 'ignore',
+    });
+    const failLaunch = (index) => {
+      const failureEvidence = path.join(containmentRoot, `failure-evidence-${index}`);
+      assert.throws(
+        () =>
+          supervisor.launchSuspended({
+            executable: invalidExecutable,
+            argv: ['-D', toolDir, '-i', inputDir, '-o', failureEvidence],
+            workingDir: containmentRoot,
+            evidenceDir: failureEvidence,
+            limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
+            fileProofs: [
+              {
+                path: invalidExecutable,
+                root: toolDir,
+                sha256: createHash('sha256').update(invalidBytes).digest('hex'),
+              },
+            ],
+          }),
+        /CreateProcessAsUserW failed/,
+      );
+    };
+    const handleCount = () =>
+      Number(
+        execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `(Get-Process -Id ${process.pid}).HandleCount`,
+          ],
+          { env: baselineEnvironment, encoding: 'utf8' },
+        ).trim(),
+      );
+    failLaunch('warmup');
+    const beforeFailures = handleCount();
+    for (let index = 0; index < 5; index++) failLaunch(index);
+    assert.ok(
+      handleCount() <= beforeFailures,
+      'partial launch must not leak namespace, token, job or process handles',
+    );
   } finally {
+    if (siblingJob) supervisor.stopJob(siblingJob, 0);
     if (job) supervisor.stopJob(job, 0);
     rmSync(containmentRoot, { recursive: true, force: true });
     if (previousSecret === undefined) delete process.env.SUMATRAFUZZ_TEST_SECRET;
@@ -386,4 +461,29 @@ test('worker payload contains admin-only first-run and certificate lifecycle pro
   assert.match(provision, /ReadDelete/);
   assert.match(provision, /Set-Service -Name 'SumatraFuzzWorker' -StartupType Automatic/);
   assert.match(provision, /worker-trust-operation\.sftxn/);
+});
+
+test('supervisor owns a protected run-private namespace until job teardown', () => {
+  const addon = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
+    'utf8',
+  );
+  assert.match(addon, /struct PrivateNamespace/);
+  assert.match(addon, /CreateBoundaryDescriptorW/);
+  assert.match(addon, /AddSIDToBoundaryDescriptor/);
+  assert.match(addon, /CreatePrivateNamespaceW/);
+  assert.match(addon, /SE_DACL_PROTECTED/);
+  assert.match(addon, /ConvertSidToStringSidW/);
+  assert.match(addon, /SUMATRAFUZZ_NAMESPACE_ALIAS/);
+  assert.match(addon, /SUMATRAFUZZ_RUN_SID/);
+  assert.match(addon, /ClosePrivateNamespace\(handle, PRIVATE_NAMESPACE_FLAG_DESTROY\)/);
+  const probe = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
+    'utf8',
+  );
+  assert.match(probe, /OpenPrivateNamespaceW/);
+  assert.match(probe, /TokenRestrictedSids/);
+  assert.match(probe, /--validate-identifiers/);
+  assert.match(probe, /--grandchild/);
+  assert.match(probe, /--namespace-gone/);
 });

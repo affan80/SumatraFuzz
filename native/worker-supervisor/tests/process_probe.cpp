@@ -3,6 +3,8 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
+#include <cstring>
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -34,124 +36,104 @@ bool WriteNamedEventMarker(const std::wstring& evidence_dir) {
   return okay;
 }
 
-std::string SidText(PSID sid) {
-  if (!sid || !IsValidSid(sid)) return "invalid";
-  const auto* authority = GetSidIdentifierAuthority(sid);
-  const DWORD count = *GetSidSubAuthorityCount(sid);
-  std::ostringstream output;
-  output << "S-" << static_cast<unsigned>(SID_REVISION) << '-';
-  unsigned long long identifier = 0;
-  for (unsigned int i = 0; i < 6; ++i) identifier = (identifier << 8) | authority->Value[i];
-  output << identifier;
-  for (DWORD i = 0; i < count; ++i) output << '-' << *GetSidSubAuthority(sid, i);
-  return output.str();
-}
-
+// Probe diagnostics intentionally contain only a stable code and Win32 error.
 void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error) {
-  std::ostringstream output;
-  output << "CreateEventW_error=" << error << '\n';
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-    output << "OpenProcessToken_error=" << GetLastError() << '\n';
-  } else {
-    auto read_token_information = [&](TOKEN_INFORMATION_CLASS kind, const char* label) {
-      DWORD bytes = 0;
-      GetTokenInformation(token, kind, nullptr, 0, &bytes);
-      if (bytes == 0) {
-        output << label << "_error=" << GetLastError() << '\n';
-        return std::vector<BYTE>{};
-      }
-      std::vector<BYTE> storage(bytes);
-      if (!GetTokenInformation(token, kind, storage.data(), bytes, &bytes)) {
-        output << label << "_error=" << GetLastError() << '\n';
-        return std::vector<BYTE>{};
-      }
-      return storage;
-    };
-    const auto user_storage = read_token_information(TokenUser, "TokenUser");
-    if (!user_storage.empty()) {
-      const auto* user = reinterpret_cast<const TOKEN_USER*>(user_storage.data());
-      output << "user=" << SidText(user->User.Sid) << '\n';
-    }
-    const auto restricted_storage = read_token_information(TokenRestrictedSids, "TokenRestrictedSids");
-    if (!restricted_storage.empty()) {
-      const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricted_storage.data());
-      output << "restricted_sid_count=" << groups->GroupCount << '\n';
-      for (DWORD i = 0; i < groups->GroupCount; ++i) {
-        output << "restricted_sid=" << SidText(groups->Groups[i].Sid) << '\n';
-      }
-    }
-    const auto dacl_storage = read_token_information(TokenDefaultDacl, "TokenDefaultDacl");
-    if (!dacl_storage.empty()) {
-      const auto* token_dacl = reinterpret_cast<const TOKEN_DEFAULT_DACL*>(dacl_storage.data());
-      if (token_dacl->DefaultDacl && IsValidAcl(token_dacl->DefaultDacl)) {
-        output << "default_dacl_ace_count=" << token_dacl->DefaultDacl->AceCount << '\n';
-        for (DWORD i = 0; i < token_dacl->DefaultDacl->AceCount; ++i) {
-          void* raw_ace = nullptr;
-          if (!GetAce(token_dacl->DefaultDacl, i, &raw_ace)) continue;
-          const auto* header = static_cast<const ACE_HEADER*>(raw_ace);
-          if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
-            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
-            output << "default_allow=" << ace->Mask << ':'
-                   << SidText(const_cast<DWORD*>(&ace->SidStart)) << '\n';
-          } else if (header->AceType == ACCESS_DENIED_ACE_TYPE) {
-            const auto* ace = static_cast<const ACCESS_DENIED_ACE*>(raw_ace);
-            output << "default_deny=" << ace->Mask << ':'
-                   << SidText(const_cast<DWORD*>(&ace->SidStart)) << '\n';
-          }
-        }
-      } else {
-        output << "default_dacl=invalid\n";
-      }
-    }
-    if (!user_storage.empty() && !restricted_storage.empty()) {
-      const auto* user = reinterpret_cast<const TOKEN_USER*>(user_storage.data());
-      const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricted_storage.data());
-      if (groups->GroupCount > 0) {
-        EXPLICIT_ACCESSW grants[2]{};
-        for (auto& grant : grants) {
-          grant.grfAccessPermissions = GENERIC_ALL;
-          grant.grfAccessMode = GRANT_ACCESS;
-          grant.grfInheritance = NO_INHERITANCE;
-        }
-        BuildTrusteeWithSidW(&grants[0].Trustee, user->User.Sid);
-        BuildTrusteeWithSidW(&grants[1].Trustee, groups->Groups[0].Sid);
-        PACL explicit_dacl = nullptr;
-        const DWORD acl_error = SetEntriesInAclW(2, grants, nullptr, &explicit_dacl);
-        if (acl_error == ERROR_SUCCESS) {
-          SECURITY_DESCRIPTOR descriptor{};
-          SECURITY_ATTRIBUTES attributes{};
-          attributes.nLength = sizeof(attributes);
-          attributes.lpSecurityDescriptor = &descriptor;
-          BOOL initialized = InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
-          if (initialized) initialized = SetSecurityDescriptorDacl(&descriptor, TRUE, explicit_dacl, FALSE);
-          if (initialized) {
-            const std::wstring explicit_name = std::wstring(L"SumatraFuzz-Explicit-") +
-                                                std::to_wstring(GetCurrentProcessId());
-            HANDLE explicit_event = CreateEventW(&attributes, TRUE, FALSE, explicit_name.c_str());
-            output << "explicit_dacl_event_create=" << (explicit_event ? "success" : "failed") << '\n';
-            if (explicit_event) CloseHandle(explicit_event);
-            else output << "explicit_dacl_event_error=" << GetLastError() << '\n';
-          } else {
-            output << "explicit_dacl_setup_error=" << GetLastError() << '\n';
-          }
-        } else {
-          output << "explicit_dacl_acl_error=" << acl_error << '\n';
-        }
-        if (explicit_dacl) LocalFree(explicit_dacl);
-      }
-    }
-    CloseHandle(token);
-  }
+  const std::string contents = "private_event_failed=" + std::to_string(error) + "\n";
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
   HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
   if (report == INVALID_HANDLE_VALUE) return;
-  const std::string contents = output.str();
   DWORD written = 0;
   WriteFile(report, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr);
   CloseHandle(report);
 }
+
+bool ValidAlias(const std::wstring& alias) {
+  if (alias.size() != 41 || alias.compare(0, 5, L"SFWR-") != 0) return false;
+  for (size_t i = 5; i < alias.size(); ++i) {
+    if (i == 13 || i == 18 || i == 23 || i == 28) {
+      if (alias[i] != L'-') return false;
+    } else if (!((alias[i] >= L'0' && alias[i] <= L'9') ||
+                 (alias[i] >= L'a' && alias[i] <= L'f') ||
+                 (alias[i] >= L'A' && alias[i] <= L'F'))) return false;
+  }
+  return true;
+}
+
+bool RunSid(PSID sid) {
+  SID_IDENTIFIER_AUTHORITY authority{{0x53, 0x46, 0x57, 0x52, 0x4b, 0x31}};
+  return sid && IsValidSid(sid) && *GetSidSubAuthorityCount(sid) == 3 &&
+      std::memcmp(GetSidIdentifierAuthority(sid), &authority, sizeof(authority)) == 0;
+}
+
+struct ProbeNamespace {
+  HANDLE token = nullptr;
+  HANDLE boundary = nullptr;
+  HANDLE handle = nullptr;
+  PSID run_sid = nullptr;
+  PACL acl = nullptr;
+  std::vector<BYTE> user;
+  std::wstring alias;
+  SECURITY_DESCRIPTOR descriptor{};
+  ~ProbeNamespace() {
+    if (handle) ClosePrivateNamespace(handle, 0);
+    if (boundary) DeleteBoundaryDescriptor(boundary);
+    if (acl) LocalFree(acl);
+    if (run_sid) LocalFree(run_sid);
+    if (token) CloseHandle(token);
+  }
+  bool Initialize() {
+    wchar_t alias_text[64]{}, sid_text[185]{};
+    const DWORD alias_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_NAMESPACE_ALIAS", alias_text, 64);
+    const DWORD sid_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_RUN_SID", sid_text, 185);
+    if (!alias_size || alias_size >= 64 || !sid_size || sid_size >= 185) return false;
+    alias = alias_text;
+    if (!ValidAlias(alias) || !ConvertStringSidToSidW(sid_text, &run_sid) || !RunSid(run_sid)) return false;
+    LPWSTR canonical = nullptr;
+    if (!ConvertSidToStringSidW(run_sid, &canonical)) return false;
+    const bool exact = std::wstring(canonical) == sid_text;
+    LocalFree(canonical);
+    if (!exact || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenRestrictedSids, nullptr, 0, &bytes);
+    if (!bytes) return false;
+    std::vector<BYTE> restrictions(bytes);
+    if (!GetTokenInformation(token, TokenRestrictedSids, restrictions.data(), bytes, &bytes)) return false;
+    auto* groups = reinterpret_cast<TOKEN_GROUPS*>(restrictions.data());
+    unsigned matches = 0, run_sids = 0;
+    for (DWORD i = 0; i < groups->GroupCount; ++i) {
+      if (RunSid(groups->Groups[i].Sid)) ++run_sids;
+      if (EqualSid(groups->Groups[i].Sid, run_sid)) ++matches;
+    }
+    if (matches != 1 || run_sids != 1) return false;
+    bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    if (!bytes) return false;
+    user.resize(bytes);
+    if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) return false;
+    PSID worker = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+    EXPLICIT_ACCESSW grants[2]{};
+    for (auto& grant : grants) {
+      grant.grfAccessPermissions = EVENT_MODIFY_STATE | SYNCHRONIZE;
+      grant.grfAccessMode = SET_ACCESS;
+      grant.grfInheritance = NO_INHERITANCE;
+    }
+    BuildTrusteeWithSidW(&grants[0].Trustee, worker);
+    BuildTrusteeWithSidW(&grants[1].Trustee, run_sid);
+    return SetEntriesInAclW(2, grants, nullptr, &acl) == ERROR_SUCCESS &&
+        InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+        SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) &&
+        SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
+  }
+  bool Open(const std::wstring& target_alias) {
+    if (!ValidAlias(target_alias)) { SetLastError(ERROR_INVALID_NAME); return false; }
+    boundary = CreateBoundaryDescriptorW(target_alias.c_str(), 0);
+    if (!boundary || !AddSIDToBoundaryDescriptor(&boundary,
+        reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid)) return false;
+    handle = OpenPrivateNamespaceW(boundary, target_alias.c_str());
+    return handle != nullptr;
+  }
+};
 
 bool ProtectedReadsAndWritesDenied(const std::wstring& protected_read,
                                    const std::wstring& protected_write) {
@@ -189,8 +171,15 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   const std::wstring input_path = argv[probe_index + 2];
   const std::wstring protected_read = argv[probe_index + 3];
   const std::wstring protected_write = argv[probe_index + 4];
-  const std::wstring event_name = argv[probe_index + 5];
-  const bool child = argc > probe_index + 6 && std::wstring(argv[probe_index + 6]) == L"--child";
+  const std::wstring object_name = argv[probe_index + 5];
+  if (object_name.empty() || object_name.size() > 128 ||
+      object_name.find_first_not_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-") != std::wstring::npos) return 30;
+  ProbeNamespace ns;
+  if (!ns.Initialize()) return 30;
+  if (!ns.Open(ns.alias)) return 31;
+  const std::wstring event_name = ns.alias + L"\\" + object_name;
+  const bool grandchild = argc > probe_index + 6 && std::wstring(argv[probe_index + 6]) == L"--grandchild";
+  const bool child = grandchild || (argc > probe_index + 6 && std::wstring(argv[probe_index + 6]) == L"--child");
   if (!WriteEvidenceFile(evidence_dir) || !ReadAllowedInput(input_path) ||
       !ProtectedReadsAndWritesDenied(protected_read, protected_write)) return 21;
   if (child) {
@@ -200,18 +189,40 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     CloseHandle(event);
     if (!signaled) return 23;
     if (!WriteNamedEventMarker(evidence_dir)) return 27;
+    if (grandchild) { for (;;) Sleep(1000); }
+    const std::vector<std::wstring> descendants{
+        argv[0], L"--containment-probe", evidence_dir, input_path,
+        protected_read, protected_write, object_name, L"--grandchild"};
+    std::wstring command = sumatrafuzz::supervisor::BuildWindowsCommandLine(descendants);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(argv[0], command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &startup, &process)) return 25;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
     for (;;) Sleep(1000);
   }
 
-  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-  if (!event) {
+  SECURITY_ATTRIBUTES attributes{sizeof(attributes), &ns.descriptor, FALSE};
+  HANDLE event = CreateEventW(&attributes, TRUE, FALSE, event_name.c_str());
+  if (!event || GetLastError() == ERROR_ALREADY_EXISTS) {
     const DWORD error = GetLastError();
+    if (event) CloseHandle(event);
     WriteNamedEventFailureDiagnostic(evidence_dir, error);
     return 2400 + static_cast<int>(error);
   }
+  const std::wstring name_path = evidence_dir + L"\\private-event-name.txt";
+  HANDLE name_file = CreateFileW(name_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (name_file == INVALID_HANDLE_VALUE) { CloseHandle(event); return 28; }
+  const std::string name(event_name.begin(), event_name.end());
+  DWORD written = 0;
+  const bool saved = WriteFile(name_file, name.data(), static_cast<DWORD>(name.size()), &written, nullptr) && written == name.size();
+  CloseHandle(name_file);
+  if (!saved) { CloseHandle(event); return 28; }
   const std::vector<std::wstring> arguments{
       argv[0], L"--containment-probe", evidence_dir, input_path,
-      protected_read, protected_write, event_name, L"--child"};
+      protected_read, protected_write, object_name, L"--child"};
   std::wstring command = sumatrafuzz::supervisor::BuildWindowsCommandLine(arguments);
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
@@ -239,21 +250,39 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 int wmain(int argc, wchar_t** argv) {
   wchar_t secret[16]{};
   if (GetEnvironmentVariableW(L"SUMATRAFUZZ_TEST_SECRET", secret, static_cast<DWORD>(std::size(secret))) > 0) return 11;
+  if (argc == 3 && std::wstring(argv[1]) == L"--namespace-gone") {
+    ProbeNamespace ns;
+    if (!ValidAlias(argv[2]) || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &ns.token)) return 44;
+    DWORD bytes = 0;
+    GetTokenInformation(ns.token, TokenUser, nullptr, 0, &bytes);
+    if (!bytes) return 44;
+    ns.user.resize(bytes);
+    if (!GetTokenInformation(ns.token, TokenUser, ns.user.data(), bytes, &bytes)) return 44;
+    if (ns.Open(argv[2])) return 45;
+    // Access denied would only establish isolation, not destruction.
+    return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? 0 : 46;
+  }
+  if (argc == 2 && std::wstring(argv[1]) == L"--validate-identifiers") {
+    ProbeNamespace ns;
+    return ns.Initialize() ? 0 : 30;
+  }
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::wstring(argv[i]) == L"--deny-open-event") {
-      HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[i + 1]);
+      ProbeNamespace ns;
+      if (!ns.Initialize()) return 30;
+      const std::wstring name = argv[i + 1];
+      const size_t separator = name.find(L'\\');
+      if (separator == std::wstring::npos || !ValidAlias(name.substr(0, separator))) return 43;
+      // A private alias must be opened in this process before addressing its objects.
+      // Denial at namespace entry is sufficient; never fall back to a session name.
+      if (!ns.Open(name.substr(0, separator))) return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 42;
+      HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str());
       if (event) {
         CloseHandle(event);
         return 41;
       }
       return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 42;
     }
-  }
-  if (argc == 3 && std::wstring(argv[1]) == L"--create-event") {
-    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, argv[2]);
-    if (!event) return 2400 + static_cast<int>(GetLastError());
-    CloseHandle(event);
-    return 0;
   }
   for (int i = 1; i < argc; ++i) {
     if (std::wstring(argv[i]) == L"--containment-probe") return RunContainmentProbe(argc, argv, i);
