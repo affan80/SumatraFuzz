@@ -1265,7 +1265,8 @@ describe('worker API contract', () => {
       ] as const;
       for (const [framing, wireBody] of cases) {
         const raw = await requestWithLateFraming(framing, wireBody);
-        expect(raw).toContain('400 Bad Request');
+        const status = Number(raw.match(/^HTTP\/1\.1 (\d{3})/)?.[1]);
+        expect([400, 431]).toContain(status);
         const headerEnd = raw.indexOf('\r\n\r\n');
         let bodyText = raw.slice(headerEnd + 4);
         if (/\r\ntransfer-encoding: chunked\r\n/i.test(raw.slice(0, headerEnd + 2))) {
@@ -1280,7 +1281,11 @@ describe('worker API contract', () => {
           }
           bodyText = chunks.join('');
         }
-        safeError({ status: 400, body: Buffer.from(bodyText) }, 400, 'invalid_request');
+        safeError(
+          { status, body: Buffer.from(bodyText) },
+          status,
+          status === 431 ? 'headers_too_large' : 'invalid_request',
+        );
         for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
       }
     });

@@ -29,7 +29,7 @@ Describe 'Worker service policy validation' {
     $script:workerPathChecks | Should -Contain $database
     ($script:workerAclCalls | Where-Object Path -EQ $nested).Directory | Should -BeTrue
     ($script:workerAclCalls | Where-Object Path -EQ $database).Directory | Should -BeFalse
-    Should -Invoke Assert-WorkerHostCompatibleDacl -Times 3 -Exactly -ParameterFilter { $AllowServiceWrite }
+    Should -Invoke Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config -Times 3 -Exactly -ParameterFilter { $AllowServiceWrite }
   }
 
   It 'refuses existing runtime state with an untrusted writable ACL' {
@@ -44,8 +44,8 @@ Describe 'Worker service policy validation' {
 
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
     { Protect-WorkerRuntimeTree -Path $root -ServiceSid $sid } | Should -Throw '*untrusted principal*'
-    Should -Invoke Set-WorkerProtectedAcl -Times 1 -Exactly -ParameterFilter { $Path -eq $root }
-    Should -Invoke Assert-WorkerHostCompatibleDacl -Times 1 -Exactly -ParameterFilter { $Path -eq $database }
+    Should -Invoke Set-WorkerProtectedAcl -ModuleName worker-service-config -Times 1 -Exactly -ParameterFilter { $Path -eq $root }
+    Should -Invoke Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config -Times 1 -Exactly -ParameterFilter { $Path -eq $database }
   }
 
   It 'rejects an unsafe install-tree descendant owner before repairing the root DACL' {
@@ -63,7 +63,7 @@ Describe 'Worker service policy validation' {
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     { Set-WorkerProtectedTree -Path $root -ServiceSid $sid } | Should -Throw '*owner is not a trusted*'
-    Should -Invoke Set-WorkerProtectedAcl -Times 0 -Exactly
+    Should -Invoke Set-WorkerProtectedAcl -ModuleName worker-service-config -Times 0 -Exactly
     $script:installTreeChecks.Count | Should -Be 3
     ($script:installTreeChecks | Where-Object { -not $_.TrustedOwner }).Count | Should -Be 0
   }
@@ -81,7 +81,7 @@ Describe 'Worker service policy validation' {
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     { Set-WorkerProtectedTree -Path $root -ServiceSid $sid } | Should -Throw '*writable principal*'
-    Should -Invoke Set-WorkerProtectedAcl -Times 0 -Exactly
+    Should -Invoke Set-WorkerProtectedAcl -ModuleName worker-service-config -Times 0 -Exactly
   }
 
   It 'accepts a freshly protected Program Files code tree and hardens only after complete validation' {
@@ -132,12 +132,12 @@ Describe 'Worker service policy validation' {
   It 'does not grant the Restricted Code SID execute rights on input PDFs' {
     $path = Join-Path $TestDrive 'input-seed.pdf'
     [IO.File]::WriteAllBytes($path, [byte[]]@(1, 2, 3))
-    $script:capturedRestrictedAcl = $null
-    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
+    $global:sumatraCapturedRestrictedAcl = $null
+    Mock Set-Acl -ModuleName worker-service-config { $global:sumatraCapturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead
-    $rule = $script:capturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
     $rule | Should -Not -BeNullOrEmpty
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ReadData) | Should -Not -Be 0
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ExecuteFile) | Should -Be 0
@@ -147,12 +147,12 @@ Describe 'Worker service policy validation' {
   It 'grants input directories traversal explicitly without inheriting execute onto inputs' {
     $path = Join-Path $TestDrive 'inputs'
     [void](New-Item -ItemType Directory -Path $path)
-    $script:capturedRestrictedAcl = $null
-    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
+    $global:sumatraCapturedRestrictedAcl = $null
+    Mock Set-Acl -ModuleName worker-service-config { $global:sumatraCapturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead -Directory
-    $rule = $script:capturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $rule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
     $rule | Should -Not -BeNullOrEmpty
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Read) | Should -Not -Be 0
     ([int]$rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Traverse) | Should -Not -Be 0
@@ -162,18 +162,18 @@ Describe 'Worker service policy validation' {
   It 'grants execute only to installed code and traversal only to the output root' {
     $path = Join-Path $TestDrive 'worker.exe'
     [IO.File]::WriteAllBytes($path, [byte[]]@(1, 2, 3))
-    $script:capturedRestrictedAcl = $null
-    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
+    $global:sumatraCapturedRestrictedAcl = $null
+    Mock Set-Acl -ModuleName worker-service-config { $global:sumatraCapturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Read -RestrictedExecute
-    $executeRule = $script:capturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $executeRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
     ([int]$executeRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::ExecuteFile) | Should -Not -Be 0
     $executeRule.InheritanceFlags | Should -Be ([Security.AccessControl.InheritanceFlags]::None)
 
-    $script:capturedRestrictedAcl = $null
+    $global:sumatraCapturedRestrictedAcl = $null
     Set-WorkerProtectedAcl -Path $TestDrive -ServiceSid $sid -ServiceAccess Modify -RestrictedTraverse -Directory
-    $traverseRule = $script:capturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
+    $traverseRule = $global:sumatraCapturedRestrictedAcl.Access | Where-Object IdentityReference -EQ ([Security.Principal.SecurityIdentifier]::new('S-1-5-12'))
     ([int]$traverseRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Traverse) | Should -Not -Be 0
     ([int]$traverseRule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::WriteData) | Should -Be 0
     $traverseRule.InheritanceFlags | Should -Be ([Security.AccessControl.InheritanceFlags]::None)
@@ -230,7 +230,7 @@ Describe 'Worker service policy validation' {
     Mock Get-NetAdapter -ModuleName worker-service-config { [pscustomobject]@{ InterfaceGuid = '{22222222-2222-2222-2222-222222222222}'; InterfaceIndex = 7; Name = 'VPN'; Status = 'Up' } }
     Mock Get-NetIPAddress -ModuleName worker-service-config { [pscustomobject]@{ IPAddress = '10.0.0.2'; InterfaceIndex = 7 } }
     { Assert-WorkerBindConfiguration -Mode Remote -Address '10.0.0.2' -Port 8443 -AdapterGuid '11111111-1111-1111-1111-111111111111' -PeerCidrs @('10.0.0.0/8') } | Should -Throw
-    Should -Invoke Get-NetAdapter -Times 1 -Exactly
+    Should -Invoke Get-NetAdapter -ModuleName worker-service-config -Times 1 -Exactly
   }
 
   It 'fails closed when the quota record is missing, unenforced, or mismatched' {
@@ -302,8 +302,8 @@ Describe 'Worker service installer transaction' {
     Mock Get-WorkerServiceCim -ModuleName worker-service-config { [pscustomobject]@{ Name = 'SumatraFuzzWorker'; State = 'Stopped'; PathName = 'C:\unowned.exe'; StartName = 'LocalSystem' } }
     Mock Invoke-WorkerSc -ModuleName worker-service-config {}
     { Install-SumatrafuzzWorkerService -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedDataVolumeId 'volume{11111111-1111-1111-1111-111111111111}' -WorkerDiskLimitBytes 536870912 } | Should -Throw
-    Should -Invoke Invoke-WorkerSc -Times 0 -Exactly
-    Should -Invoke Resolve-WorkerSid -Times 0 -Exactly
+    Should -Invoke Invoke-WorkerSc -ModuleName worker-service-config -Times 0 -Exactly
+    Should -Invoke Resolve-WorkerSid -ModuleName worker-service-config -Times 0 -Exactly
   }
 
   It 'retains worker data and credentials by default on uninstall' {
@@ -320,8 +320,8 @@ Describe 'Worker service installer transaction' {
     Mock Write-WorkerInstallMarker -ModuleName worker-service-config {}
     Mock Remove-Item -ModuleName worker-service-config {}
     Uninstall-SumatrafuzzWorkerService
-    Should -Invoke Remove-Item -Times 0 -Exactly
-    Should -Invoke Write-WorkerInstallMarker -Times 1 -Exactly
+    Should -Invoke Remove-Item -ModuleName worker-service-config -Times 0 -Exactly
+    Should -Invoke Write-WorkerInstallMarker -ModuleName worker-service-config -Times 1 -Exactly
     $marker.state | Should -Be 'Uninstalled'
   }
 }
