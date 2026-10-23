@@ -19,6 +19,15 @@ if(WIN32)
   set_target_properties(sumatrafuzz_worker_service_host PROPERTIES OUTPUT_NAME "SumatraFuzzWorkerHost")
 endif()
 if(MSVC)
+  # The supervisor sanitizes the child PATH to tool files plus System32, and
+  # SCM starts the host without a user PATH. Keep both executables independent
+  # of build-agent Visual C++ runtime directories.
+  set_property(TARGET process_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  if(WIN32)
+    set_property(TARGET sumatrafuzz_worker_service_host PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
+endif()
+if(MSVC)
   foreach(target command_line_tests service_host_contract_tests)
     target_compile_options(${target} PRIVATE /W4 /WX /permissive-)
   endforeach()
