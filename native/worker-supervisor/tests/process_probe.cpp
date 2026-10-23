@@ -20,6 +20,18 @@ bool WriteEvidenceFile(const std::wstring& evidence_dir) {
   return okay;
 }
 
+bool WriteNamedEventMarker(const std::wstring& evidence_dir) {
+  const std::wstring path = evidence_dir + L"\\named-event-" + std::to_wstring(GetCurrentProcessId());
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  const char data[] = "named event signaled";
+  DWORD written = 0;
+  const bool okay = WriteFile(file, data, sizeof(data), &written, nullptr) && written == sizeof(data);
+  CloseHandle(file);
+  return okay;
+}
+
 bool ProtectedReadsAndWritesDenied(const std::wstring& protected_read,
                                    const std::wstring& protected_write) {
   HANDLE read_file = CreateFileW(protected_read.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -66,6 +78,7 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     const bool signaled = SetEvent(event) != FALSE;
     CloseHandle(event);
     if (!signaled) return 23;
+    if (!WriteNamedEventMarker(evidence_dir)) return 27;
     for (;;) Sleep(1000);
   }
 

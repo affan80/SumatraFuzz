@@ -115,7 +115,13 @@ test('Windows supervisor bounds and tears down a child process tree', {
     let sample;
     for (let i = 0; i < 100; i++) {
       sample = supervisor.sampleJob(job);
-      if (sample.process_count >= 2) break;
+      const evidenceNames = readdirSync(evidenceDir);
+      if (
+        sample.process_count >= 2 &&
+        evidenceNames.filter((name) => name.startsWith('restricted-write-')).length >= 2 &&
+        evidenceNames.some((name) => name.startsWith('named-event-'))
+      )
+        break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     if (sample.process_count < 2) {
@@ -131,7 +137,11 @@ test('Windows supervisor bounds and tears down a child process tree', {
     );
     assert.ok(
       readdirSync(evidenceDir).filter((name) => name.startsWith('restricted-write-')).length >= 2,
-      'restricted child process and descendant must write evidence and open a private named event',
+      'restricted child process and descendant must both write evidence',
+    );
+    assert.ok(
+      readdirSync(evidenceDir).some((name) => name.startsWith('named-event-')),
+      'restricted descendant must open and signal the private named event',
     );
     assert.deepEqual(
       readdirSync(protectedDir),
