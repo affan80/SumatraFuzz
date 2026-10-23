@@ -793,11 +793,11 @@ int RunWindowsService() {
   return 0;
 }
 
-#if defined(SUMATRAFUZZ_SERVICE_HOST_STANDALONE)
-int wmain() { return RunWindowsService(); }
-#endif
-
 }  // namespace sumatrafuzz::service_host
+
+#if defined(SUMATRAFUZZ_SERVICE_HOST_STANDALONE)
+int wmain() { return sumatrafuzz::service_host::RunWindowsService(); }
+#endif
 
 #else
 
