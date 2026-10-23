@@ -77,11 +77,11 @@ jobs:
       - name: Install Pester 5
         shell: pwsh
         run: |
-          Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
       - name: Validate Windows toolchain code
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0
+          Import-Module Pester -RequiredVersion 5.7.1
           Invoke-Pester -Path scripts/windows/tests -CI
       - name: Parse all Windows PowerShell scripts before expensive builds
         shell: pwsh

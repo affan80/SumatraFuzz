@@ -12,12 +12,12 @@ Describe 'Worker service policy validation' {
     [IO.File]::WriteAllBytes($database, [byte[]]@(1, 2, 3))
     $script:workerAclCalls = [System.Collections.Generic.List[object]]::new()
     $script:workerPathChecks = [System.Collections.Generic.List[string]]::new()
-    Mock Set-WorkerProtectedAcl {
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config {
       $script:workerAclCalls.Add([pscustomobject]@{
           Path = $Path; ServiceAccess = $ServiceAccess; Directory = [bool]$Directory
         })
     }
-    Mock Assert-WorkerHostCompatibleDacl { $script:workerPathChecks.Add($Path) }
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config { $script:workerPathChecks.Add($Path) }
 
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
     Protect-WorkerRuntimeTree -Path $root -ServiceSid $sid
@@ -37,8 +37,8 @@ Describe 'Worker service policy validation' {
     [void](New-Item -ItemType Directory -Path $root -Force)
     $database = Join-Path $root 'trust.sqlite'
     [IO.File]::WriteAllBytes($database, [byte[]]@(1, 2, 3))
-    Mock Set-WorkerProtectedAcl {}
-    Mock Assert-WorkerHostCompatibleDacl {
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config {}
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {
       if ($Path -eq $database) { throw 'An untrusted principal can modify a protected worker path' }
     }
 
@@ -54,8 +54,8 @@ Describe 'Worker service policy validation' {
     [void](New-Item -ItemType Directory -Path $nested -Force)
     [IO.File]::WriteAllBytes((Join-Path $nested 'node.exe'), [byte[]]@(1))
     $unsafeFile = Join-Path $nested 'node.exe'
-    Mock Set-WorkerProtectedAcl {}
-    Mock Assert-WorkerHostCompatibleDacl {
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config {}
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {
       $script:installTreeChecks.Add([pscustomobject]@{ Path = $Path; TrustedOwner = [bool]$RequireTrustedOwner })
       if ($Path -eq $unsafeFile) { throw 'Worker runtime path owner is not a trusted service or administrator identity' }
     }
@@ -74,8 +74,8 @@ Describe 'Worker service policy validation' {
     [void](New-Item -ItemType Directory -Path $nested -Force)
     $unsafeFile = Join-Path $nested 'node.exe'
     [IO.File]::WriteAllBytes($unsafeFile, [byte[]]@(1))
-    Mock Set-WorkerProtectedAcl {}
-    Mock Assert-WorkerHostCompatibleDacl {
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config {}
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {
       if ($Path -eq $unsafeFile) { throw 'Native host rejects writable principal on protected path' }
     }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
@@ -91,8 +91,8 @@ Describe 'Worker service policy validation' {
     [IO.File]::WriteAllBytes((Join-Path $nested 'SumatraFuzzWorkerHost.exe'), [byte[]]@(1))
     $script:installTreeChecks = [System.Collections.Generic.List[object]]::new()
     $script:installTreeAclCalls = [System.Collections.Generic.List[object]]::new()
-    Mock Assert-WorkerHostCompatibleDacl { $script:installTreeChecks.Add([pscustomobject]@{ Path = $Path; TrustedOwner = [bool]$RequireTrustedOwner }) }
-    Mock Set-WorkerProtectedAcl { $script:installTreeAclCalls.Add([pscustomobject]@{ Path = $Path; Directory = [bool]$Directory; RestrictedExecute = [bool]$RestrictedExecute }) }
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config { $script:installTreeChecks.Add([pscustomobject]@{ Path = $Path; TrustedOwner = [bool]$RequireTrustedOwner }) }
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config { $script:installTreeAclCalls.Add([pscustomobject]@{ Path = $Path; Directory = [bool]$Directory; RestrictedExecute = [bool]$RestrictedExecute }) }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     { Set-WorkerProtectedTree -Path $root -ServiceSid $sid -RestrictedExecute } | Should -Not -Throw
@@ -108,12 +108,12 @@ Describe 'Worker service policy validation' {
     [void](New-Item -ItemType Directory -Path (Join-Path $root 'bundle') -Force)
     [IO.File]::WriteAllBytes((Join-Path $root 'bundle\seed.pdf'), [byte[]]@(1, 2, 3))
     $script:restrictedAclCalls = [System.Collections.Generic.List[object]]::new()
-    Mock Set-WorkerProtectedAcl {
+    Mock Set-WorkerProtectedAcl -ModuleName worker-service-config {
       $script:restrictedAclCalls.Add([pscustomobject]@{
           Path = $Path; RestrictedRead = [bool]$RestrictedRead; RestrictedExecute = [bool]$RestrictedExecute; RestrictedTraverse = [bool]$RestrictedTraverse; Directory = [bool]$Directory
         })
     }
-    Mock Assert-WorkerHostCompatibleDacl {}
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {}
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Protect-WorkerRuntimeTree -Path $root -ServiceSid $sid -RestrictedRead
@@ -133,7 +133,7 @@ Describe 'Worker service policy validation' {
     $path = Join-Path $TestDrive 'input-seed.pdf'
     [IO.File]::WriteAllBytes($path, [byte[]]@(1, 2, 3))
     $script:capturedRestrictedAcl = $null
-    Mock Set-Acl { $script:capturedRestrictedAcl = $AclObject }
+    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead
@@ -148,7 +148,7 @@ Describe 'Worker service policy validation' {
     $path = Join-Path $TestDrive 'inputs'
     [void](New-Item -ItemType Directory -Path $path)
     $script:capturedRestrictedAcl = $null
-    Mock Set-Acl { $script:capturedRestrictedAcl = $AclObject }
+    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Modify -RestrictedRead -Directory
@@ -163,7 +163,7 @@ Describe 'Worker service policy validation' {
     $path = Join-Path $TestDrive 'worker.exe'
     [IO.File]::WriteAllBytes($path, [byte[]]@(1, 2, 3))
     $script:capturedRestrictedAcl = $null
-    Mock Set-Acl { $script:capturedRestrictedAcl = $AclObject }
+    Mock Set-Acl -ModuleName worker-service-config { $script:capturedRestrictedAcl = $AclObject }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     Set-WorkerProtectedAcl -Path $path -ServiceSid $sid -ServiceAccess Read -RestrictedExecute
@@ -181,7 +181,7 @@ Describe 'Worker service policy validation' {
 
   It 'rejects runtime descendants owned by an untrusted identity even without writable allow ACEs' {
     $owner = [Security.Principal.SecurityIdentifier]::new('S-1-5-21-111-222-333-1001')
-    Mock Get-Acl { [pscustomobject]@{ Owner = $owner; Access = @() } }
+    Mock Get-Acl -ModuleName worker-service-config { [pscustomobject]@{ Owner = $owner; Access = @() } }
     $sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
 
     { Assert-WorkerHostCompatibleDacl -Path 'C:\runtime\trust.sqlite' -ServiceSid $sid -AllowServiceWrite -RequireTrustedOwner } |
@@ -189,17 +189,17 @@ Describe 'Worker service policy validation' {
   }
 
   It 'fails closed for a non-Windows operating system' {
-    Mock Get-WorkerPlatformFacts { [pscustomobject]@{ IsWindows = $false; Architecture = 'X64'; Elevated = $true } }
+    Mock Get-WorkerPlatformFacts -ModuleName worker-service-config { [pscustomobject]@{ IsWindows = $false; Architecture = 'X64'; Elevated = $true } }
     { Assert-WorkerPlatform } | Should -Throw
   }
 
   It 'fails closed for a non-x64 architecture' {
-    Mock Get-WorkerPlatformFacts { [pscustomobject]@{ IsWindows = $true; Architecture = 'Arm64'; Elevated = $true } }
+    Mock Get-WorkerPlatformFacts -ModuleName worker-service-config { [pscustomobject]@{ IsWindows = $true; Architecture = 'Arm64'; Elevated = $true } }
     { Assert-WorkerPlatform } | Should -Throw
   }
 
   It 'requires elevation for provisioning' {
-    Mock Get-WorkerPlatformFacts { [pscustomobject]@{ IsWindows = $true; Architecture = 'X64'; Elevated = $false } }
+    Mock Get-WorkerPlatformFacts -ModuleName worker-service-config { [pscustomobject]@{ IsWindows = $true; Architecture = 'X64'; Elevated = $false } }
     { Assert-WorkerPlatform -RequireElevation } | Should -Throw '*elevation*'
   }
 
@@ -220,21 +220,21 @@ Describe 'Worker service policy validation' {
   }
 
   It 'accepts a private remote endpoint only when adapter, assigned address and profile match' {
-    Mock Get-NetAdapter { [pscustomobject]@{ InterfaceGuid = '{11111111-1111-1111-1111-111111111111}'; InterfaceIndex = 7; Name = 'VPN'; Status = 'Up' } }
-    Mock Get-NetIPAddress { [pscustomobject]@{ IPAddress = '10.0.0.2'; InterfaceIndex = 7 } }
-    Mock Get-NetConnectionProfile { [pscustomobject]@{ NetworkCategory = 'Private' } }
+    Mock Get-NetAdapter -ModuleName worker-service-config { [pscustomobject]@{ InterfaceGuid = '{11111111-1111-1111-1111-111111111111}'; InterfaceIndex = 7; Name = 'VPN'; Status = 'Up' } }
+    Mock Get-NetIPAddress -ModuleName worker-service-config { [pscustomobject]@{ IPAddress = '10.0.0.2'; InterfaceIndex = 7 } }
+    Mock Get-NetConnectionProfile -ModuleName worker-service-config { [pscustomobject]@{ NetworkCategory = 'Private' } }
     { Assert-WorkerBindConfiguration -Mode Remote -Address '10.0.0.2' -Port 8443 -AdapterGuid '11111111-1111-1111-1111-111111111111' -PeerCidrs @('10.0.0.0/8') } | Should -Not -Throw
   }
 
   It 'rejects adapter identity or address drift' {
-    Mock Get-NetAdapter { [pscustomobject]@{ InterfaceGuid = '{22222222-2222-2222-2222-222222222222}'; InterfaceIndex = 7; Name = 'VPN'; Status = 'Up' } }
-    Mock Get-NetIPAddress { [pscustomobject]@{ IPAddress = '10.0.0.2'; InterfaceIndex = 7 } }
+    Mock Get-NetAdapter -ModuleName worker-service-config { [pscustomobject]@{ InterfaceGuid = '{22222222-2222-2222-2222-222222222222}'; InterfaceIndex = 7; Name = 'VPN'; Status = 'Up' } }
+    Mock Get-NetIPAddress -ModuleName worker-service-config { [pscustomobject]@{ IPAddress = '10.0.0.2'; InterfaceIndex = 7 } }
     { Assert-WorkerBindConfiguration -Mode Remote -Address '10.0.0.2' -Port 8443 -AdapterGuid '11111111-1111-1111-1111-111111111111' -PeerCidrs @('10.0.0.0/8') } | Should -Throw
     Should -Invoke Get-NetAdapter -Times 1 -Exactly
   }
 
   It 'fails closed when the quota record is missing, unenforced, or mismatched' {
-    Mock Get-CimInstance { @() }
+    Mock Get-CimInstance -ModuleName worker-service-config { @() }
     { Assert-WorkerQuota -VolumeId 'volume{11111111-1111-1111-1111-111111111111}' -LimitBytes 536870912 } | Should -Throw
   }
 
@@ -245,10 +245,10 @@ Describe 'Worker service policy validation' {
 
   It 'rolls back only its quota changes when quota enforcement fails' {
     $global:workerFsutilCalls = 0
-    Mock Get-Volume { [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = @('D:\') } }
-    Mock Get-WorkerQuotaSetting { [pscustomobject]@{ State = 0 } }
-    Mock Get-WorkerServiceQuotaRecord { $null }
-    Mock Invoke-WorkerFsutil {
+    Mock Get-Volume -ModuleName worker-service-config { [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = @('D:\') } }
+    Mock Get-WorkerQuotaSetting -ModuleName worker-service-config { [pscustomobject]@{ State = 0 } }
+    Mock Get-WorkerServiceQuotaRecord -ModuleName worker-service-config { $null }
+    Mock Invoke-WorkerFsutil -ModuleName worker-service-config {
       $global:workerFsutilCalls++
       if ($global:workerFsutilCalls -eq 2) { throw 'simulated quota modify failure' }
     }
@@ -258,7 +258,7 @@ Describe 'Worker service policy validation' {
   }
 
   It 'rejects data volumes that are not the requested NTFS volume' {
-    Mock Get-Volume { [pscustomobject]@{ UniqueId = 'volume{22222222-2222-2222-2222-222222222222}'; FileSystem = 'NTFS'; Path = @('D:\') } }
+    Mock Get-Volume -ModuleName worker-service-config { [pscustomobject]@{ UniqueId = 'volume{22222222-2222-2222-2222-222222222222}'; FileSystem = 'NTFS'; Path = @('D:\') } }
     { Assert-WorkerDataVolume -DataRoot 'D:\ProgramData\SumatraFuzz\Worker' -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedVolumeId 'volume{11111111-1111-1111-1111-111111111111}' } | Should -Throw
   }
 
@@ -269,7 +269,7 @@ Describe 'Worker service policy validation' {
     [void](New-Item -ItemType Directory -Path $installRoot -Force)
     $expected = [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = @($dataRoot) }
     $system = [pscustomobject]@{ UniqueId = 'volume{22222222-2222-2222-2222-222222222222}'; FileSystem = 'NTFS'; Path = @((Split-Path -Qualifier $installRoot) + '\') }
-    Mock Get-Volume {
+    Mock Get-Volume -ModuleName worker-service-config {
       if ($FilePath) { return $system }
       return @($expected)
     }
@@ -292,15 +292,15 @@ Describe 'Worker service installer transaction' {
   It 'refuses an unowned preexisting service without changing it' {
     $installRoot = Join-Path $TestDrive 'Program Files\SumatraFuzz'
     [void](New-Item -ItemType Directory -Path $installRoot -Force)
-    Mock Assert-WorkerPlatform {}
-    Mock Resolve-WorkerInstallLayout { [pscustomobject]@{ Root = $installRoot; Host = (Join-Path $installRoot 'service\SumatraFuzzWorkerHost.exe'); Node = (Join-Path $installRoot 'runtime\node.exe'); Entry = (Join-Path $installRoot 'apps\worker-service\dist\src\service-entry.js'); SigningKey = (Join-Path $installRoot 'config\organization-signing-public-key.pem') } }
-    Mock Assert-WorkerBindConfiguration {}
-    Mock Assert-WorkerHostCompatibleDacl {}
-    Mock Resolve-WorkerSid { throw 'Service SID must not be resolved before SCM creates the service' }
-    Mock Assert-WorkerDataVolume { [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = 'D:\' } }
-    Mock Get-WorkerInstallMarker { $null }
-    Mock Get-WorkerServiceCim { [pscustomobject]@{ Name = 'SumatraFuzzWorker'; State = 'Stopped'; PathName = 'C:\unowned.exe'; StartName = 'LocalSystem' } }
-    Mock Invoke-WorkerSc {}
+    Mock Assert-WorkerPlatform -ModuleName worker-service-config {}
+    Mock Resolve-WorkerInstallLayout -ModuleName worker-service-config { [pscustomobject]@{ Root = $installRoot; Host = (Join-Path $installRoot 'service\SumatraFuzzWorkerHost.exe'); Node = (Join-Path $installRoot 'runtime\node.exe'); Entry = (Join-Path $installRoot 'apps\worker-service\dist\src\service-entry.js'); SigningKey = (Join-Path $installRoot 'config\organization-signing-public-key.pem') } }
+    Mock Assert-WorkerBindConfiguration -ModuleName worker-service-config {}
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {}
+    Mock Resolve-WorkerSid -ModuleName worker-service-config { throw 'Service SID must not be resolved before SCM creates the service' }
+    Mock Assert-WorkerDataVolume -ModuleName worker-service-config { [pscustomobject]@{ UniqueId = 'volume{11111111-1111-1111-1111-111111111111}'; FileSystem = 'NTFS'; Path = 'D:\' } }
+    Mock Get-WorkerInstallMarker -ModuleName worker-service-config { $null }
+    Mock Get-WorkerServiceCim -ModuleName worker-service-config { [pscustomobject]@{ Name = 'SumatraFuzzWorker'; State = 'Stopped'; PathName = 'C:\unowned.exe'; StartName = 'LocalSystem' } }
+    Mock Invoke-WorkerSc -ModuleName worker-service-config {}
     { Install-SumatrafuzzWorkerService -InstallRoot 'C:\Program Files\SumatraFuzz' -ExpectedDataVolumeId 'volume{11111111-1111-1111-1111-111111111111}' -WorkerDiskLimitBytes 536870912 } | Should -Throw
     Should -Invoke Invoke-WorkerSc -Times 0 -Exactly
     Should -Invoke Resolve-WorkerSid -Times 0 -Exactly
@@ -313,12 +313,12 @@ Describe 'Worker service installer transaction' {
       data_root = Join-Path $env:SystemRoot 'ProgramData\SumatraFuzz\Worker'
       volume_id = 'volume{11111111-1111-1111-1111-111111111111}'
     }
-    Mock Assert-WorkerPlatform {}
-    Mock Get-WorkerInstallMarker { $marker }
-    Mock Get-WorkerServiceCim { $null }
-    Mock Get-NetFirewallRule { @() }
-    Mock Write-WorkerInstallMarker {}
-    Mock Remove-Item {}
+    Mock Assert-WorkerPlatform -ModuleName worker-service-config {}
+    Mock Get-WorkerInstallMarker -ModuleName worker-service-config { $marker }
+    Mock Get-WorkerServiceCim -ModuleName worker-service-config { $null }
+    Mock Get-NetFirewallRule -ModuleName worker-service-config { @() }
+    Mock Write-WorkerInstallMarker -ModuleName worker-service-config {}
+    Mock Remove-Item -ModuleName worker-service-config {}
     Uninstall-SumatrafuzzWorkerService
     Should -Invoke Remove-Item -Times 0 -Exactly
     Should -Invoke Write-WorkerInstallMarker -Times 1 -Exactly

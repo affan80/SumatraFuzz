@@ -37,6 +37,8 @@ jobs:
       - name: Build Windows Job Object supervisor from locked source
         if: runner.os == 'Windows'
         run: npm run native:supervisor:build
+      - name: Build workspace package entrypoints for security integration tests
+        run: npm run typecheck
       - name: Test native supervisor argument contract
         run: npm run native:supervisor:contract
       - name: Test worker API security boundaries

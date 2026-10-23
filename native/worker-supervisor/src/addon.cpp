@@ -299,7 +299,11 @@ RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) 
     CloseHandle(current);
     throw std::runtime_error("could not initialize restricted-code SID");
   }
-  PSID restricting_sids[] = {restricted.sid, restricted_code_buffer, everyone_buffer.data()};
+  const SID_AND_ATTRIBUTES restricting_sids[] = {
+      {restricted.sid, 0},
+      {restricted_code_buffer, 0},
+      {everyone_buffer.data(), 0},
+  };
   const BOOL created = CreateRestrictedToken(current, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr,
                                               3, restricting_sids, &restricted.handle);
   if (created) {
