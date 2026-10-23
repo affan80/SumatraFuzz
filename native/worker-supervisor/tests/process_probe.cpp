@@ -2,6 +2,7 @@
 #include "command_line.h"
 
 #include <windows.h>
+#include <aclapi.h>
 #include <iterator>
 #include <sstream>
 #include <string>
