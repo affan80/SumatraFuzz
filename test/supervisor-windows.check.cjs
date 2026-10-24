@@ -399,6 +399,16 @@ test('native resource contract reports every early-return branch', () => {
   assert.match(contract, /ResourceContractFailure\(stage, __LINE__, GetLastError\(\)\)/);
   assert.doesNotMatch(contract, /return false;/);
   assert.match(probe, /resource-contract: stage=%s line=%d win32=%lu/);
+  assert.match(contract, /CanonicalResourceContractRoot\(supplied_root\)/);
+  assert.doesNotMatch(contract, /auto root_handle/);
+  assert.match(contract, /parent-pin-control/);
+  const joined = contract.indexOf('mutation.join();');
+  const failure = contract.indexOf('if (!mutation_denied)');
+  const caseFixture = contract.indexOf('checkpoint("create-case-sensitive-directory")');
+  assert.ok(
+    joined < failure && failure < caseFixture,
+    'mutation failure must retain its own stage',
+  );
 });
 
 test('Windows run resources bind proof identities, reject mutations and roll back setup', {
