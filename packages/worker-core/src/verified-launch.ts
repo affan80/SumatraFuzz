@@ -31,6 +31,7 @@ interface TargetLock {
     afl_fuzz: LockedTool;
     winafl_client: LockedTool;
   };
+  runtime_dependencies?: LockedTool[];
 }
 
 interface A4Manifest {
@@ -67,6 +68,21 @@ function parseTargetLock(value: unknown): TargetLock {
       !isSha256(tool.sha256)
     ) {
       return fail(WorkerError.UnverifiedToolchain);
+    }
+  }
+  if (record.runtime_dependencies !== undefined) {
+    if (!Array.isArray(record.runtime_dependencies) || record.runtime_dependencies.length > 32) {
+      return fail(WorkerError.UnverifiedToolchain);
+    }
+    for (const dependency of record.runtime_dependencies) {
+      if (
+        !dependency ||
+        typeof dependency.path !== 'string' ||
+        !path.isAbsolute(dependency.path) ||
+        !isSha256(dependency.sha256)
+      ) {
+        return fail(WorkerError.UnverifiedToolchain);
+      }
     }
   }
   return record as TargetLock;
@@ -261,6 +277,11 @@ export async function verifyAndBuildLaunch(
     policy.allowedToolRoot,
     lock.tools.winafl_client.sha256,
   );
+  const runtimeProofs = await Promise.all(
+    (lock.runtime_dependencies ?? []).map((dependency) =>
+      verifyFile(dependency.path, policy.allowedToolRoot, dependency.sha256),
+    ),
+  );
   const input = await verifyPathWithinRoot(
     path.join(policy.allowedInputRoot, request.input_bundle_id),
     policy.allowedInputRoot,
@@ -328,6 +349,7 @@ export async function verifyAndBuildLaunch(
       aflProof,
       drrunProof,
       clientProof,
+      ...runtimeProofs,
     ]),
   });
 }

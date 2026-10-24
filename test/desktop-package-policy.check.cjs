@@ -53,6 +53,9 @@ test('desktop package policy accepts only the worker runtime and required app as
     'dist/resources/worker-bundle-signing-key.pem',
     'node_modules/@sumatrafuzz/worker-client/package.json',
     'node_modules/@sumatrafuzz/worker-client/dist/src/index.js',
+    'node_modules/@sumatrafuzz/worker-security/package.json',
+    'node_modules/@sumatrafuzz/worker-security/dist/src/index.js',
+    'node_modules/@sumatrafuzz/worker-security/dist/src/certificate-policy.js',
     'node_modules/@sumatrafuzz/worker-protocol/package.json',
     'node_modules/@sumatrafuzz/worker-protocol/dist/index.js',
     'node_modules/ajv/package.json',
@@ -76,4 +79,15 @@ test('desktop package policy converts normalized ASAR paths to Windows separator
     toArchivePath?.('node_modules/@sinclair/typebox/package.json', '\\'),
     'node_modules\\@sinclair\\typebox\\package.json',
   );
+});
+
+test('desktop package policy excludes worker-security fixtures and build-only files', async () => {
+  const { findForbiddenPackageEntries } = await import('../scripts/check-desktop-package.mjs');
+  for (const entry of [
+    'node_modules/@sumatrafuzz/worker-security/dist/test/tls-fixture.js',
+    'node_modules/@sumatrafuzz/worker-security/src/certificate-policy.ts',
+    'node_modules/@sumatrafuzz/worker-security/dist/src/index.d.ts',
+    'node_modules/@sumatrafuzz/worker-security/dist/src/index.js.map',
+  ])
+    assert.equal(findForbiddenPackageEntries([entry]).length, 1, entry);
 });

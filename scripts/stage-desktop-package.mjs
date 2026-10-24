@@ -8,6 +8,11 @@ const stageRoot = path.join(appRoot, '.package-stage');
 const workspacePackages = [
   ['@sumatrafuzz/worker-client', 'packages/worker-client', ['package.json', 'dist']],
   ['@sumatrafuzz/worker-protocol', 'packages/worker-protocol', ['package.json', 'dist']],
+  [
+    '@sumatrafuzz/worker-security',
+    'packages/worker-security',
+    ['package.json', 'dist/src/index.js', 'dist/src/certificate-policy.js'],
+  ],
 ];
 const runtimeDependencies = [
   ['ajv', ['package.json', 'dist']],

@@ -7,5 +7,5 @@
     "tsBuildInfoFile": "../../.cache/tsbuild/worker-client.tsbuildinfo"
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "references": [{ "path": "../worker-protocol" }]
+  "references": [{ "path": "../worker-protocol" }, { "path": "../worker-security" }]
 }

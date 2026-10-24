@@ -1,0 +1,119 @@
+# Task 2 implementation report
+
+Base: `df21ec2b67a9a1d30205c628271000e1c082ad40`.
+Scope: run-owned AppContainer identity and safe per-object ACL foundations only. No push, launch/token replacement, namespace identity change, service acceptance, or issue closure.
+
+## Changes
+
+- Added `native/worker-supervisor/include/run_resources.h`, a shared Windows-only production header used by the addon and native probe. This small file-scope deviation was authorized so the runtime probe exercises the production implementation rather than a duplicate test implementation.
+- Added move-only `AppContainerProfile` and `CreateRunAppContainerProfile()`. Profile names contain a freshly generated GUID and are bounded to 39 characters. Creation uses zero capabilities; any failure, including `ERROR_ALREADY_EXISTS`, throws with a sanitized operation and preserved Win32 error code when available. Failed creation frees any returned SID without deleting/reusing an existing profile. Successful profiles use `FreeSid` after deletion.
+- Added typed `GrantRunResourceAccess(path, sid, access, policy)` and RAII grant ownership. The policy is an exact object allowlist, with protected-root exclusions taking precedence. It must be populated by the future native launch builder from held verified proof handles, selected input enumeration, and newly created run evidence/scratch objects. This helper is not exposed to JavaScript. It accepts full package SIDs only, never broad well-known identities or arbitrary access masks.
+- Tool files get read/execute; input files get read without execute/write; input directories also get traversal; evidence/scratch objects get read/write/delete plus directory traversal/delete-child as appropriate, without ACL/owner mutation rights. All package ACEs are non-inheriting and object-specific. The helper intentionally does not authorize a directory tree implicitly.
+- ACL changes use held handles, reject reparse points on every ancestor and final object, reject hardlinked objects and noncanonical path aliases, reject alternate streams/dot components/invalid local paths, and pin ancestor/object handles against replacement. Canonical drive-root keys are valid for exclusions; granting a volume root is always rejected. No tool-root ACL widening or recursive ACL update is added.
+- Cleanup reads the current ACL and removes only this run's package allow ACE, preserving unrelated ACEs present at cleanup. Preexisting ordinary allow/deny ACEs for the same package fail closed. Removal is explicit/retryable and RAII-managed. Cleanup failure retains preallocated identity/handle records in supervisor-lifetime quarantine, emits a generic diagnostic, and does not claim success.
+- Added `RunResources` to `Job` and `QuarantinedJob`. The owner is destroyed after the existing process-tree drain and namespace teardown; an unconfirmed drain transfers it into the existing job quarantine. No profile/grants are created by the legacy launch path yet. `userenv.lib` is linked for the addon.
+- Added a Windows-only native contract mode and Node invocation covering package SID uniqueness, allowed masks, input directory traversal, broad-SID rejection, excluded and sibling object rejection, drive-root normalization/exclusion/no-grant, hardlink and junction rejection, partial setup ACL/profile rollback, ownership movement, normal cleanup, preserving another package's ACE, and successful recreation of deleted profile names. Static checks reject broad grants in the new helper.
+
+## TDD and local verification
+
+- Initial red: `node --test test/supervisor-windows.check.cjs` failed with the new assertion `production run resource owner must exist` before the production header existed.
+- Additional red: the canonical drive-root/SID-failure-cleanup contract failed before implementing those branches.
+- Final local `npm run native:supervisor:contract`: 2/2 CTest contracts pass. This host is macOS; Windows-only C++ branches are not compiled/executed by this result.
+- Final local `node --test test/supervisor-windows.check.cjs`: 15 pass, 4 Windows-specific skips, no failures.
+- Final local `npm test`: 37 Vitest files pass; 378 tests pass and 1 skips. Node checks: 39 pass, 5 skip, no failures.
+- `git diff --check`: passes.
+- Self-review checked handle transfers, move/unwind ownership, failure SID release, rollback ordering, canonical path and exclusion boundaries, inherited ACE avoidance, and preservation of unrelated grants. Unrelated campaign-insights changes and the Task 1 report changes were preserved and excluded from staging.
+
+## Task boundary and acceptance gaps
+
+The Task 2 step-1 wording asks for actual token membership and cleanup after stop/partial launch. Those assertions require Task 3's token and launcher integration. This task tests the zero-capability profile and resource owner contracts, including partial setup/unwind, while leaving the legacy launcher and its existing acceptance tests intact. It does not prove AppContainer child token membership or stop/failed-launch integration. Task 3 must move a populated owner into `Job` before creating any child, and propagate explicit `Close()` failures to the caller rather than reporting successful cleanup.
+
+All grants are per-object and non-inheriting. Task 3 must bind the allowlist to the verified launch, enumerate the selected input objects, and prove that the child can create and subsequently access nested evidence/scratch objects using its scoped/default DACLs. This helper alone does not prove nested WinAFL output compatibility and must not be broadened to arbitrary parent directories to make it work.
+
+The new Windows resource contract has not been compiled or executed on this macOS host. It runs via `node --test test/supervisor-windows.check.cjs` on Windows and remains an exact-head Windows acceptance requirement. No claim of runtime profile, reparse, cleanup, or permission behavior is made from static checks.
+
+Prior Windows run `40089250286` demonstrated the separate standard-user feasibility probe through ACL update, AppContainer child launch, write/denial probes, and profile deletion. The overall Windows check still fails in the unchanged restricted-token launcher with `0xC0000135 STATUS_DLL_NOT_FOUND`; this task neither fixes nor weakens/bypasses that check. There is no exact-head Windows run for this commit yet.
+
+Task 5 still must prove actual `NT SERVICE\\SumatraFuzzWorker` profile lifecycle and show all AppContainer profile/temp writes are charged to the worker's NTFS quota, including cleanup/restart behavior. The standard-user feasibility probe and the new helper contract do not establish service identity or quota charging. Issue #91 remains open pending the remaining plan, exact-head Windows acceptance, installed-service evidence, and human review.
+
+## Fix loop round 1 — review of 950b3d8
+
+Findings received:
+
+1. Important/P1: ancestor and final handles requested only metadata/security rights; those opens do not participate in Windows sharing checks, so the claimed rename/replacement/retarget pin was unsound.
+2. Important: lowercased path matching could authorize distinct `input.pdf` and `INPUT.pdf` objects in a case-sensitive NTFS directory.
+
+Changes in this round:
+
+- `OpenRunResource` now requests `FILE_READ_DATA` (`FILE_LIST_DIRECTORY` for directories), retains `FILE_SHARE_READ` only, and therefore participates in the data/delete sharing checks described in [MS-FSA §2.1.5.1.2.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819). Existing writable handles cause acquisition to fail closed. This corrects the metadata-only pin error for data/delete operations; it is not evidence that all metadata mutations are prevented.
+- Every `RunResourceRule` now requires a borrowed held proof handle. Before any ACL mutation the helper compares the opened object's `FileIdInfo` volume serial and 128-bit file ID with that handle. Missing/invalid proof or identity mismatch fails closed. A folded path match cannot authorize another case-distinct object or a replacement at the same path. The launch builder in Task 3 must supply held handles from `VerifyProofs`/selected-input enumeration/new output creation and keep them open through grant acquisition.
+- `EvidenceModify` is restricted to directory objects. Writable-file sharing would permit data/retarget writes to the pinned file itself; existing file grants now fail closed. The directory mask no longer includes `FILE_WRITE_ATTRIBUTES`, so the package is not explicitly authorized for metadata-only root retargeting. Child creation/write compatibility remains a native test and Task 3 acceptance requirement. These restrictions supersede the original report's broader evidence-object Modify description.
+- Extended the shared production-helper Windows fixture with stale-proof replacement rejection, a required case-sensitive NTFS fixture containing `input.pdf` and `INPUT.pdf`, correct-file grant success, existing target/ancestor writer rejection, writable-file rejection, and a separate thread attempting target rename, ancestor rename, existing-file replacement, GENERIC_WRITE open, FILE_WRITE_ATTRIBUTES-only junction retarget, and hardlink creation for pinned input and tool files. It also requires an ordinary child file write to succeed in the pinned evidence directory.
+- The Node Windows test now emits the native diagnostic results with `t.diagnostic` and asserts the native exit status. Logs name each attempted mutation, its denial flag, and metadata/hardlink error codes. Fixture setup failure is a failure; case sensitivity or mutation checks are not skipped or weakened.
+
+Covering tests and commands on this macOS host:
+
+- `test/supervisor-windows.check.cjs`: static test `run resource ACL foundation constrains grants, proof identity and rollback`; runtime test `Windows run resources bind proof identities, reject mutations and roll back setup`.
+- `native/worker-supervisor/tests/process_probe.cpp`: `--run-resource-contract`, using production `run_resources.h` directly.
+- Red observed before the production fix: `node --test test/supervisor-windows.check.cjs` failed on `/access \\| FILE_READ_ATTRIBUTES \\| FILE_READ_DATA/` because sharing-participating access was absent. Native Windows red/green could not be observed here.
+- `npm run native:supervisor:contract`: `100% tests passed, 0 tests failed out of 2`. Windows-only branches are not compiled/executed by this macOS result.
+- `node --test test/supervisor-windows.check.cjs`: `tests 19; pass 15; fail 0; skipped 4`.
+- `npm test`: 37 Vitest files passed; `378 passed | 1 skipped (379)`; Node checks `tests 44; pass 39; fail 0; skipped 5`.
+- `git diff --check`: no output, exit 0.
+
+Finding status and remaining blocker:
+
+- Case-fold authorization finding: addressed in code by mandatory held object identity comparison. Windows fixture compilation/execution remains required.
+- Path stability finding: data/delete sharing participation is corrected, but **the broader metadata-retarget/hardlink stability claim remains open**. [MS-FSA FSCTL_SET_REPARSE_POINT](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165) permits `FILE_WRITE_ATTRIBUTES` alone, and [Microsoft's RedirectionGuard writeup](https://www.microsoft.com/en-us/msrc/blog/2025/06/redirectionguard-mitigating-unsafe-junction-traversal-in-windows) describes attribute-authorized hardlinks/reparse operations. Attribute-only opens can bypass data/delete sharing checks. No source comment or report should represent an initial `nNumberOfLinks` check as race protection. The new Windows test fails if metadata-only retarget or either concurrent hardlink creation succeeds; that outcome is a design blocker requiring a stronger protected storage/identity boundary, not a reason to relax the test.
+- **Observed hosted Windows denials for this round: none.** No Windows run has been performed for this head. All mutation outcomes are pending, and this round must not be called fully resolved from macOS/static results. No speculative oplock implementation, broad ancestor ACL changes, launcher integration, or bypass was introduced.
+- Task 3 must propagate explicit `RunResources::Close()` errors and prove nested evidence/scratch creation under the actual child token. Task 5 must still prove installed-service identity, quota charging of profile/temp storage, and cleanup/restart behavior. The existing `0xC0000135 STATUS_DLL_NOT_FOUND` legacy-launcher failure remains visible and unchanged.
+
+## Fix loop round 2 — CI diagnostics and formatter
+
+Reviewed exact-head [CI run 40091325372](https://github.com/affan80/SumatraFuzz/actions/runs/40091325372) for `97a9aad096769614a536370d924e2ec265990821`.
+
+- [Windows job, step 11](https://github.com/affan80/SumatraFuzz/actions/runs/40091325372/job/120864430978#step:11:1), `Test Windows supervisor and AppContainer as a standard user`: the unchanged legacy restricted child failed its entry-point assertion with decimal exit `3221225781` (`0xC0000135 STATUS_DLL_NOT_FOUND`). The new resource test separately failed `83 !== 0` at `test/supervisor-windows.check.cjs:390`, elapsed 23.7131 ms. No `resource-pin:` or `resource-identity:` diagnostic was present. The Windows addon/probe compiled in this run; runtime acceptance failed. Prior uncertainty about Windows compilation is superseded by this observed build, not by a claim of runtime success.
+- [Linux job, step 13](https://github.com/affan80/SumatraFuzz/actions/runs/40091325372/job/120864430790#step:13:1), `Verify application workspace, desktop build, tests and dependency audits`: `npm run verify` stopped at `format:check`; Biome reported `test/supervisor-windows.check.cjs format`, `Found 1 error`, exit 1. Formatter differences were the newly expanded reads/assertions/spawn options.
+
+Root-cause status: the formatter failure is reproduced and fixed. The native probe's many silent `return false` branches made the prior status 83 nondiagnostic. Empty stderr cannot identify which operation failed or establish any mutation success/denial. This round fixes that observability defect; the actual failing Windows operation is still pending a rerun and is not guessed from duration or exit status.
+
+Changes:
+
+- Added a raw Win32 stderr entry marker and named checkpoints across canonicalization, fixture creation, profile creation, excluded roots, proof binding, replacement, broad-SID checks, hardlinks/junctions, writer conflicts, partial cleanup, ACL masks, concurrent mutation, case-sensitive fixtures, independent grants, and final cleanup.
+- Every early false return in `RunResourceContract` now reports `resource-contract: stage=<name> line=<source line> win32=<code> detail=FAIL`. Exceptions include their current stage and safe message; `std::system_error` preserves its numeric error code. Final success emits a `PASS` marker. Runtime diagnostic output uses the same direct `WriteFile` stderr path as the already visible feasibility probe, avoiding reliance on CRT buffering.
+- The Node wrapper logs exit status, signal, stdout/stderr sizes, and both nonempty streams before asserting success. Added a static regression rejecting silent false exits in the resource contract.
+- Ran Biome formatting on `test/supervisor-windows.check.cjs` only. No security check, native rejection, legacy assertion, timeout, or mutation expectation was removed, skipped, or weakened. No production ACL/profile/launch behavior was changed in this diagnostics round.
+
+Covering tests, commands, and observed local output:
+
+- New static test `native resource contract reports every early-return branch` in `test/supervisor-windows.check.cjs`: red first because the new failure diagnostic call was absent; green after instrumentation. The Windows runtime test remains `Windows run resources bind proof identities, reject mutations and roll back setup`, invoking `native/worker-supervisor/tests/process_probe.cpp --run-resource-contract`.
+- `npx biome check test/supervisor-windows.check.cjs` before formatting: `Found 1 error`; after `npx biome format --write test/supervisor-windows.check.cjs`: `Formatted 1 file ... Fixed 1 file`; final check: `Checked 1 file ... No fixes applied`.
+- `npm run native:supervisor:contract`: `100% tests passed, 0 tests failed out of 2` on macOS. This does not compile/execute the new Windows-only diagnostic code locally.
+- `node --test test/supervisor-windows.check.cjs`: `tests 20; pass 16; fail 0; skipped 4`.
+- `npm run verify`: exit 0. Format/lint each checked 139 files with no fixes; TypeScript and desktop build succeeded; Vitest `37 passed` files and `378 passed | 1 skipped (379)` tests; Node `tests 45; pass 40; fail 0; skipped 5`; both production and full audits reported `found 0 vulnerabilities`.
+- `git diff --check`: no output, exit 0.
+
+Remaining acceptance limitations: there are no observed metadata-only retarget or concurrent hardlink denial results for this round. Metadata stability remains unproven until the Windows resource contract passes. If either metadata mutation succeeds, a stronger boundary is required; the initial link-count check and READ_DATA sharing pins must not be represented as complete race protection. The new diagnostic stage must determine the next fix. Task 3 cleanup-error propagation and nested output creation, Task 5 installed-service/quota evidence, exact-head checks, security review, and required human review remain required before any merge. The legacy loader failure is retained without bypass. This implementer does not push or merge.
+
+## Fix loop round 3 — stale-proof fixture lifetime and diagnostic accuracy
+
+Exact-head [run 40092101693](https://github.com/affan80/SumatraFuzz/actions/runs/40092101693), head `7493e3afc79e785fe20ebe92a93e0753ba863ae1`, [Windows step 11](https://github.com/affan80/SumatraFuzz/actions/runs/40092101693/job/120866716566#step:11:1), reached `resource-contract: stage=replace-after-proof line=175 win32=32 detail=FAIL`. The blocked operation was the fixture's `MoveFileExW(replaced, former)`, not an observed package-ID rejection or metadata mutation result. The unchanged legacy restricted child still failed with `0xC0000135`. Linux and the installer job passed in this run.
+
+Diagnosis and fix:
+
+- The fixture's initial `root_handle` was obtained using production `OpenRunResource`, which adds `FILE_READ_DATA` with `FILE_SHARE_READ` only. It remained alive through the entire test. Before the stale-proof rename it was the sole persistent sharing-participating handle to that fixture namespace; `rule()` handles use metadata-only `FILE_READ_ATTRIBUTES` and share read/write/delete, and failed grant attempts unwind their temporary pins. The test had accidentally retained its own parent pin while asking a setup mutation to succeed.
+- Canonicalization now occurs inside `CanonicalResourceContractRoot`. Its temporary root pin is destroyed before the helper returns the canonical string; it does not survive into fixture mutation. No production pin/share flags were changed.
+- Added a Windows positive control that intentionally holds the same parent pin and requires the rename to fail specifically with `ERROR_SHARING_VIOLATION` (32), logs that exact code, releases the pin, and then requires the identical rename to succeed with the metadata proof still held. A new replacement is then created at the authorized path and must still be rejected with `ERROR_FILE_INVALID`, with no package ACE added. This both discriminates the parent pin from the proof handle and preserves the stale-object-identity test. The diagnosis is based on handle-lifetime analysis plus the observed Windows failure; native confirmation of the revised control/rename sequence awaits the next Windows run.
+- Fixed diagnostic accuracy: AppContainer create/delete HRESULTs are captured and reported as full hexadecimal HRESULT plus mapped Win32 code; `Close()`/`Remove()` DWORDs are captured individually and reported directly. Logical assertion failures use `ERROR_INVALID_DATA`, not a stale thread last-error value. Canonicalization distinguishes an actual zero-result Win32 error from buffer/prefix validation errors.
+- Concurrent-mutation aggregate failure is now reported immediately after `mutation.join()` while stage remains `concurrent-mutations`, before the case-sensitive fixture changes it. All individual mutation flags and numeric errors remain logged. No mutation expectation or legacy test was weakened.
+
+Covering tests and local evidence:
+
+- `test/supervisor-windows.check.cjs`: the static `native resource contract reports every early-return branch` regression now requires scoped canonicalization, the parent-pin control, correct mutation-stage ordering, and captured non-BOOL diagnostics. It failed first on the missing `CanonicalResourceContractRoot(supplied_root)` call, then passed after the fixture changes. The Windows runtime test still executes the shared production helper via `native/worker-supervisor/tests/process_probe.cpp --run-resource-contract`.
+- `npx biome check test/supervisor-windows.check.cjs`: `Checked 1 file ... No fixes applied`.
+- `npm run native:supervisor:contract`: `100% tests passed, 0 tests failed out of 2` on macOS. Windows-only branches are not locally compiled/executed by this result.
+- `node --test test/supervisor-windows.check.cjs`: `tests 20; pass 16; fail 0; skipped 4`.
+- `npm run verify`: exit 0; format/lint checked 139 files; TypeScript/desktop build passed; Vitest 37 files passed, `378 passed | 1 skipped (379)`; Node `tests 45; pass 40; fail 0; skipped 5`; production/full dependency audits both `found 0 vulnerabilities`.
+- `git diff --check`: no output, exit 0.
+
+No Windows rerun is claimed from this macOS implementer. The controller must push the committed diagnostics/fixture fix and run exact-head Windows acceptance to confirm the parent-pin control, successful post-release replacement, identity rejection, and later metadata mutation results. Metadata-only hardlink/reparse stability remains unproven; if either succeeds, a stronger boundary is required. The unchanged legacy loader failure, Task 3 integration/cleanup/nested-output requirements, and Task 5 installed-service/quota evidence remain blockers. No push, merge, check bypass, or unsupported success claim is made by this implementer.

@@ -53,3 +53,58 @@ Describe 'WinAFL campaign launcher preflight must fail closed' -Skip:(!$IsWindow
     { & $script:runner @f } | Should -Throw '*A4 instrumented run evidence missing*'
   }
 }
+
+Describe 'Pinned WinAFL namespace acquisition contract' {
+  It 'locks the reviewed patch and refuses dirty or incompatible pinned source' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $provision | Should -Match 'winafl_patch_sha256'
+    $provision | Should -Match 'apply --check'
+    $provision | Should -Match 'status --porcelain'
+    $provision | Should -Match 'expectedPatchHash'
+  }
+  It 'routes coverage and sample mappings through the authenticated namespace helper' {
+    $patch=Get-Content (Join-Path $PSScriptRoot '../patches/winafl-private-namespace.patch') -Raw
+    $patch | Should -Match 'sf_namespace_name'
+    $patch | Should -Match 'TokenRestrictedSids'
+    $patch | Should -Match 'OpenPrivateNamespaceA'
+    $patch | Should -Match 'SE_DACL_PROTECTED'
+    $patch | Should -Match '\-namespace_alias %s -run_sid %s'
+  }
+
+  It 'launches the fuzzer through the native supervisor that owns the run namespace' {
+    $runner=Get-Content $script:runner -Raw
+    $supervised=Get-Content (Join-Path $PSScriptRoot '../supervised-winafl.ts') -Raw
+    $native=Get-Content (Join-Path $PSScriptRoot '../../../native/worker-supervisor/src/addon.cpp') -Raw
+    $runner | Should -Match 'supervised-winafl\.ts'
+    $runner | Should -Match 'launch-spec\.json'
+    $runner | Should -Not -Match '&\s+\$afl\s'
+    $supervised | Should -Match 'launchSuspended\(spec\)'
+    $supervised | Should -Match 'stopJob\(job, 0\)'
+    $native | Should -Match 'SUMATRAFUZZ_NAMESPACE_ALIAS'
+    $native | Should -Match 'SUMATRAFUZZ_RUN_SID'
+  }
+
+  It 'pins and stages only the verified Microsoft runtime DLLs WinAFL imports' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $runner=Get-Content $script:runner -Raw
+    $service=Get-Content (Join-Path $PSScriptRoot '../worker-service-acceptance.ps1') -Raw
+    $provision | Should -Match 'dumpbin.*dependents'
+    $provision | Should -Match 'CMAKE_C_COMPILER:\(\?:FILEPATH\|STRING\)='
+    $provision | Should -Match 'compilerDirectory.*dumpbin.exe'
+    $provision | Should -Not -Match 'Get-Command dumpbin.exe'
+    $provision | Should -Match 'VCToolsRedistDir'
+    $provision | Should -Match 'Get-AuthenticodeSignature'
+    $provision | Should -Match 'runtime_dependencies'
+    $runner | Should -Match 'runtime_dependencies'
+    $service | Should -Match 'targetLock\.runtime_dependencies'
+  }
+
+  It 'resolves the MSVC toolset version above the compiler bin directory' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $provision | Should -Match '\$level -lt 4'
+    $compilerPath='C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe'
+    $toolsetDirectory=$compilerPath
+    for ($level=0; $level -lt 4; $level++) { $toolsetDirectory=Split-Path $toolsetDirectory -Parent }
+    (Split-Path -Leaf $toolsetDirectory) | Should -Be '14.44.35207'
+  }
+}

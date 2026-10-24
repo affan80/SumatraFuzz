@@ -14,7 +14,7 @@ files:
   - '!**/*.cts'
   - '!**/{test,tests,__tests__,fixtures,corpus,corpora,runs}/**/*'
 asar: true
-electronVersion: 44.9.0
+electronVersion: 44.9.3
 npmRebuild: false
 nodeGypRebuild: false
 artifactName: ${productName}-${version}-${arch}-setup.${ext}

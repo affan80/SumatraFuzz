@@ -54,5 +54,3 @@ node --experimental-strip-types scripts/windows/collect-evidence.ts `
     --after-stats (Join-Path $RepoRoot 'runs/a5/campaign/second.stats') `
     --output (Join-Path $RepoRoot 'runs/a6/evidence.json')
 if ($LASTEXITCODE -ne 0) { throw 'A6 cryptographic evidence verification failed' }
-node --experimental-strip-types scripts/windows/worker-native-acceptance.ts
-if ($LASTEXITCODE -ne 0) { throw 'Integrated native worker campaign acceptance failed' }

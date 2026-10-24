@@ -5,7 +5,11 @@ export type {
   ResourceSample,
   VolumeUsageSample,
 } from './native-supervisor.js';
-export { ProcessError, WindowsJobSupervisor } from './native-supervisor.js';
+export {
+  ProcessError,
+  resolveNativeSupervisorAddonPath,
+  WindowsJobSupervisor,
+} from './native-supervisor.js';
 export {
   rejectSpecialWindowsPath,
   toOrdinaryWindowsPath,

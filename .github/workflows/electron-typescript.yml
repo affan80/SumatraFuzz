@@ -37,14 +37,46 @@ jobs:
       - name: Build Windows Job Object supervisor from locked source
         if: runner.os == 'Windows'
         run: npm run native:supervisor:build
+      - name: Build workspace package entrypoints for security integration tests
+        run: npm run typecheck
       - name: Test native supervisor argument contract
         run: npm run native:supervisor:contract
-      - name: Test Windows supervisor as a standard user
+      - name: Test worker API security boundaries
+        run: npm run test:worker-api-security
+      - name: Test worker trust, pairing and audit boundaries
+        run: npm run test:worker-trust-security
+      - name: Test Windows supervisor and AppContainer as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
         run: pwsh -File scripts/windows/ci-supervisor-check.ps1 -RepoRoot (Get-Location).Path
+      - name: Test Windows service installer policy
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
+          Invoke-Pester -Path scripts/windows/tests/worker-service-install.Tests.ps1 -CI
       - name: Verify application workspace, desktop build, tests and dependency audits
         run: npm run verify
+      - name: Build Windows SCM host and stage the worker-service payload
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S native/worker-supervisor -B build/worker-supervisor
+          cmake --build build/worker-supervisor --config Release --target sumatrafuzz_worker_service_host
+          $nodeRuntime = (Get-Command node).Source
+          node scripts/stage-worker-service.mjs `
+            --node $nodeRuntime `
+            --host (Resolve-Path build/worker-supervisor/Release/SumatraFuzzWorkerHost.exe).Path `
+            --public-key apps/desktop/resources/worker-bundle-signing-key.pem `
+            --output release/worker-service/SumatraFuzz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'Windows'
+        with:
+          name: sumatrafuzz-windows-x64-worker-service
+          path: release/worker-service/SumatraFuzz
+          if-no-files-found: error
+          retention-days: 14
   desktop-installer:
     name: Electron Windows x64 NSIS installer
     runs-on: windows-2022

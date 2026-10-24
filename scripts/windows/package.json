@@ -1,4 +1,9 @@
 {
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "worker-service:install": "pwsh -NoProfile -File install-worker-service.ps1",
+    "worker-service:provision": "pwsh -NoProfile -File provision-worker-service.ps1",
+    "worker-service:uninstall": "pwsh -NoProfile -File uninstall-worker-service.ps1"
+  }
 }
