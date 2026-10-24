@@ -115,13 +115,14 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
 void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error,
                                       DWORD unnamed_error, DWORD local_error,
                                       DWORD explicit_local_error, DWORD dacl_check_error,
-                                      BOOL dacl_granted) {
+                                      BOOL dacl_granted, DWORD default_private_error) {
   const std::string contents = "private_event_failed=" + std::to_string(error) +
       ",unnamed_event_error=" + std::to_string(unnamed_error) +
       ",local_named_event_error=" + std::to_string(local_error) +
       ",explicit_local_event_error=" + std::to_string(explicit_local_error) +
       ",explicit_dacl_access_error=" + std::to_string(dacl_check_error) +
-      ",explicit_dacl_granted=" + std::to_string(dacl_granted ? 1 : 0) + "\n";
+      ",explicit_dacl_granted=" + std::to_string(dacl_granted ? 1 : 0) +
+      ",default_private_event_error=" + std::to_string(default_private_error) + "\n";
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
   HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -419,8 +420,16 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     BOOL dacl_granted = FALSE;
     const DWORD dacl_check_error = CheckExplicitEventDacl(
         &event_descriptor, event_rights, &dacl_granted);
+    // Compare with an otherwise identical event using the token's default
+    // descriptor. This is a diagnostic only; acceptance still requires the
+    // explicit worker-and-run DACL above. A default event that also fails
+    // isolates the denial to private-namespace object creation/access.
+    const std::wstring default_private_name = ns.alias + L"\\Default-" +
+        std::to_wstring(GetCurrentProcessId());
+    const DWORD default_private_error = ProbeEventCreation(default_private_name);
     WriteNamedEventFailureDiagnostic(evidence_dir, error, unnamed_error, local_error,
-                                     explicit_local_error, dacl_check_error, dacl_granted);
+                                     explicit_local_error, dacl_check_error, dacl_granted,
+                                     default_private_error);
     LocalFree(event_acl);
     LocalFree(event_sacl);
     LocalFree(run_sid);

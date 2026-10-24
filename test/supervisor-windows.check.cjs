@@ -830,6 +830,8 @@ test('private namespace probe uses the WinAFL shim per-run object DACL', () => {
   assert.match(probe, /SetSecurityDescriptorGroup\(\s*&check_descriptor/);
   assert.match(probe, /explicit_dacl_access_error=/);
   assert.match(probe, /explicit_dacl_granted=/);
+  assert.match(probe, /ProbeEventCreation\(default_private_name\)/);
+  assert.match(probe, /default_private_event_error=/);
   const addon = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
     'utf8',
