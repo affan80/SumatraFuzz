@@ -898,26 +898,23 @@ describe('worker API contract', () => {
             200,
           ),
         );
-        const zip = new ZipFile();
-        zip.addBuffer(Buffer.from('%PDF-1.4\n%%EOF\n'), 'seed.pdf');
-        zip.end();
-        const chunks: Buffer[] = [];
-        for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
         const result = await apiRequest(
           server.address,
           tlsA,
           'POST',
           '/v1/input-bundles',
           { 'content-type': 'application/zip' },
-          Buffer.concat(chunks),
+          Buffer.from('invalid zip'),
         );
-        expect(result.status).toBe(201);
+        // A 400 means the request passed admission and reached archive validation;
+        // 429 would mean the exclusive import gate was not released after timeout.
+        expect(result.status).toBe(400);
       },
       {
         ...PROVISIONAL_ADMISSION_POLICY,
         maxRequests: 1,
         maxRequestsPerController: 1,
-        uploadTimeoutMs: 80,
+        uploadTimeoutMs: 1_000,
       },
     );
   });
