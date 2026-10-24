@@ -48,8 +48,8 @@ DWORD ProbeEventCreation(const std::wstring& name, SECURITY_ATTRIBUTES* attribut
   return event ? (error == ERROR_ALREADY_EXISTS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS) : error;
 }
 
-DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_access,
-                             BOOL* access_granted) {
+DWORD CheckObjectDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_access,
+                      GENERIC_MAPPING mapping, BOOL* access_granted) {
   *access_granted = FALSE;
   HANDLE process_token = nullptr;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &process_token))
@@ -86,25 +86,40 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
     CloseHandle(impersonation_token);
     return error;
   }
-  SECURITY_DESCRIPTOR check_descriptor = *descriptor;
-  if (!SetSecurityDescriptorOwner(
-          &check_descriptor, reinterpret_cast<TOKEN_OWNER*>(owner_storage.data())->Owner, FALSE) ||
-      !SetSecurityDescriptorGroup(
-          &check_descriptor,
-          reinterpret_cast<TOKEN_PRIMARY_GROUP*>(group_storage.data())->PrimaryGroup, FALSE)) {
+  PSID descriptor_owner = nullptr;
+  PSID descriptor_group = nullptr;
+  BOOL owner_defaulted = FALSE;
+  BOOL group_defaulted = FALSE;
+  SECURITY_DESCRIPTOR check_descriptor{};
+  PSECURITY_DESCRIPTOR descriptor_for_check = descriptor;
+  if (!GetSecurityDescriptorOwner(descriptor, &descriptor_owner, &owner_defaulted) ||
+      !GetSecurityDescriptorGroup(descriptor, &descriptor_group, &group_defaulted)) {
     const DWORD error = GetLastError();
     CloseHandle(impersonation_token);
     return error;
   }
-  GENERIC_MAPPING event_mapping{READ_CONTROL | SYNCHRONIZE,
-                                READ_CONTROL | EVENT_MODIFY_STATE,
-                                READ_CONTROL | SYNCHRONIZE, EVENT_ALL_ACCESS};
+  if (!descriptor_owner || !descriptor_group) {
+    // The event probe uses an absolute descriptor with omitted owner/group.
+    // The namespace descriptor from GetSecurityInfo is self-relative and
+    // already carries both, so it must be passed through without shallow copy.
+    check_descriptor = *descriptor;
+    if (!SetSecurityDescriptorOwner(
+            &check_descriptor, reinterpret_cast<TOKEN_OWNER*>(owner_storage.data())->Owner, FALSE) ||
+        !SetSecurityDescriptorGroup(
+            &check_descriptor,
+            reinterpret_cast<TOKEN_PRIMARY_GROUP*>(group_storage.data())->PrimaryGroup, FALSE)) {
+      const DWORD error = GetLastError();
+      CloseHandle(impersonation_token);
+      return error;
+    }
+    descriptor_for_check = &check_descriptor;
+  }
   PRIVILEGE_SET privileges{};
   DWORD privilege_bytes = sizeof(privileges);
   DWORD granted_access = 0;
   BOOL granted = FALSE;
-  const BOOL checked = AccessCheck(&check_descriptor, impersonation_token, desired_access,
-                                   &event_mapping, &privileges, &privilege_bytes,
+  const BOOL checked = AccessCheck(descriptor_for_check, impersonation_token, desired_access,
+                                   &mapping, &privileges, &privilege_bytes,
                                    &granted_access, &granted);
   const DWORD error = checked ? ERROR_SUCCESS : GetLastError();
   CloseHandle(impersonation_token);
@@ -112,17 +127,57 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
   return error;
 }
 
+DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_access,
+                             BOOL* access_granted) {
+  const GENERIC_MAPPING mapping{READ_CONTROL | SYNCHRONIZE,
+                                READ_CONTROL | EVENT_MODIFY_STATE,
+                                READ_CONTROL | SYNCHRONIZE, EVENT_ALL_ACCESS};
+  return CheckObjectDacl(descriptor, desired_access, mapping, access_granted);
+}
+
+DWORD CheckPrivateNamespaceDacl(HANDLE namespace_handle, BOOL* traverse_granted,
+                                BOOL* create_object_granted) {
+  *traverse_granted = FALSE;
+  *create_object_granted = FALSE;
+  PACL dacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD read_error = GetSecurityInfo(namespace_handle, SE_KERNEL_OBJECT,
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+  if (read_error != ERROR_SUCCESS) return read_error;
+  // Object-directory rights are not exported by the user-mode SDK headers.
+  // Use their documented values and map GENERIC_ALL to DIRECTORY_ALL_ACCESS.
+  constexpr DWORD kDirectoryTraverse = 0x0002;
+  constexpr DWORD kDirectoryCreateObject = 0x0004;
+  constexpr DWORD kDirectoryAllAccess = 0x000F000F;
+  const GENERIC_MAPPING mapping{READ_CONTROL | 0x0003, READ_CONTROL | 0x000C,
+                                READ_CONTROL | kDirectoryTraverse, kDirectoryAllAccess};
+  const DWORD traverse_error = CheckObjectDacl(
+      static_cast<SECURITY_DESCRIPTOR*>(descriptor), kDirectoryTraverse, mapping,
+      traverse_granted);
+  const DWORD create_error = CheckObjectDacl(
+      static_cast<SECURITY_DESCRIPTOR*>(descriptor), kDirectoryCreateObject, mapping,
+      create_object_granted);
+  LocalFree(descriptor);
+  if (traverse_error != ERROR_SUCCESS) return traverse_error;
+  return create_error;
+}
+
 void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error,
                                       DWORD unnamed_error, DWORD local_error,
                                       DWORD explicit_local_error, DWORD dacl_check_error,
-                                      BOOL dacl_granted, DWORD default_private_error) {
+                                      BOOL dacl_granted, DWORD default_private_error,
+                                      DWORD namespace_acl_error, BOOL namespace_traverse_granted,
+                                      BOOL namespace_create_granted) {
   const std::string contents = "private_event_failed=" + std::to_string(error) +
       ",unnamed_event_error=" + std::to_string(unnamed_error) +
       ",local_named_event_error=" + std::to_string(local_error) +
       ",explicit_local_event_error=" + std::to_string(explicit_local_error) +
       ",explicit_dacl_access_error=" + std::to_string(dacl_check_error) +
       ",explicit_dacl_granted=" + std::to_string(dacl_granted ? 1 : 0) +
-      ",default_private_event_error=" + std::to_string(default_private_error) + "\n";
+      ",default_private_event_error=" + std::to_string(default_private_error) +
+      ",namespace_acl_access_error=" + std::to_string(namespace_acl_error) +
+      ",namespace_traverse_granted=" + std::to_string(namespace_traverse_granted ? 1 : 0) +
+      ",namespace_create_granted=" + std::to_string(namespace_create_granted ? 1 : 0) + "\n";
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
   HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -427,9 +482,14 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     const std::wstring default_private_name = ns.alias + L"\\Default-" +
         std::to_wstring(GetCurrentProcessId());
     const DWORD default_private_error = ProbeEventCreation(default_private_name);
+    BOOL namespace_traverse_granted = FALSE;
+    BOOL namespace_create_granted = FALSE;
+    const DWORD namespace_acl_error = CheckPrivateNamespaceDacl(
+        ns.handle, &namespace_traverse_granted, &namespace_create_granted);
     WriteNamedEventFailureDiagnostic(evidence_dir, error, unnamed_error, local_error,
                                      explicit_local_error, dacl_check_error, dacl_granted,
-                                     default_private_error);
+                                     default_private_error, namespace_acl_error,
+                                     namespace_traverse_granted, namespace_create_granted);
     LocalFree(event_acl);
     LocalFree(event_sacl);
     LocalFree(run_sid);

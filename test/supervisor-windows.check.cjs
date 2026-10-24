@@ -825,13 +825,17 @@ test('private namespace probe uses the WinAFL shim per-run object DACL', () => {
     probe,
     /OpenProcessToken\(GetCurrentProcess\(\), TOKEN_QUERY \| TOKEN_DUPLICATE, &process_token\)/,
   );
-  assert.match(probe, /AccessCheck\(&check_descriptor, impersonation_token, desired_access/);
+  assert.match(probe, /AccessCheck\(descriptor_for_check, impersonation_token, desired_access/);
   assert.match(probe, /SetSecurityDescriptorOwner\(\s*&check_descriptor/);
   assert.match(probe, /SetSecurityDescriptorGroup\(\s*&check_descriptor/);
   assert.match(probe, /explicit_dacl_access_error=/);
   assert.match(probe, /explicit_dacl_granted=/);
   assert.match(probe, /ProbeEventCreation\(default_private_name\)/);
   assert.match(probe, /default_private_event_error=/);
+  assert.match(probe, /CheckPrivateNamespaceDacl\(/);
+  assert.match(probe, /namespace_acl_access_error=/);
+  assert.match(probe, /namespace_traverse_granted=/);
+  assert.match(probe, /namespace_create_granted=/);
   const addon = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
     'utf8',
