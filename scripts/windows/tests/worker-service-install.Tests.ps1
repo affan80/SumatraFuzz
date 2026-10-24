@@ -51,6 +51,14 @@ Describe 'Worker service policy validation' {
     $source | Should -Match 'if \(\$directory -eq ''outputs''\) \{ Set-WorkerOutputLowIntegrity -Path \$path \}'
     $source | Should -Match "'/setintegritylevel' '\(OI\)\(CI\)L' '/T' '/C'"
     $source | Should -Match 'no-write-up label to worker outputs'
+
+    $path = Join-Path $TestDrive 'low-integrity-output'
+    [void](New-Item -ItemType Directory -Path $path)
+    Set-WorkerOutputLowIntegrity -Path $path
+    $integritySddl = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm(
+      [Security.AccessControl.AccessControlSections]::Audit
+    )
+    $integritySddl | Should -Match '\(ML;OICI;NW;;;LW\)'
   }
 
   It 'locks the runtime root and validates every existing descendant before service startup' {
