@@ -448,6 +448,8 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
     'utf8',
   );
   assert.match(probe, /AddIntegrityLabelToBoundaryDescriptor\(boundary, sid\)/);
+  assert.match(probe, /AddMandatoryAce\(event_sacl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP/);
+  assert.match(probe, /SetSecurityDescriptorSacl\(&event_descriptor, TRUE, event_sacl, FALSE\)/);
   assert.match(probe, /ProtectedReadsAndWritesDenied/);
   assert.match(probe, /ReadAllowedInput/);
   assert.match(probe, /CreateEventExW\(/);
