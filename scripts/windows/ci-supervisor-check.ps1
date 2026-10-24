@@ -41,15 +41,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant supervisor user temporary storage access' }
     $null = New-Item -ItemType Directory -Path $protected -Force
     Set-Content -LiteralPath $credentialSentinel -Value 'service-only trust and DPAPI sentinel' -NoNewline
-    & icacls $protected /inheritance:r
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect supervisor credential fixture directory' }
-    & icacls $credentialSentinel /inheritance:r
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect supervisor credential fixture file' }
     $standardUser = "$env:COMPUTERNAME\$account"
     & icacls $protected /grant:r "${standardUser}:(RX)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant standard-user access to inspect the protected fixture' }
     & icacls $credentialSentinel /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot restrict supervisor credential fixture to SYSTEM and administrators' }
+    & icacls $protected /inheritance:r
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect supervisor credential fixture directory' }
+    & icacls $credentialSentinel /inheritance:r
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect supervisor credential fixture file' }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = (Get-Command pwsh -ErrorAction Stop).Source
     $info.WorkingDirectory = $RepoRoot
