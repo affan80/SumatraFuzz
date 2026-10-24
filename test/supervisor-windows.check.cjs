@@ -427,6 +427,11 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   assert.match(addon, /\{restricted\.sid, 0\}/);
   assert.match(addon, /CreateProcessAsUserW\(/);
   assert.match(addon, /CreatePrivateAccessAcl\(/);
+  assert.match(addon, /CreateLowIntegrityMandatorySacl\(\)/);
+  assert.match(
+    addon,
+    /SetSecurityDescriptorSacl\(&descriptor, TRUE, static_cast<PACL>\(integrity_sacl\.value\), FALSE\)/,
+  );
   assert.match(addon, /AddIntegrityLabelToBoundaryDescriptor\(&boundary\.handle, low_label_sid\)/);
   assert.match(addon, /SetPrivateRestrictedDefaultDacl/);
   assert.match(addon, /WinRestrictedCodeSid/);
@@ -448,8 +453,13 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
     'utf8',
   );
   assert.match(probe, /AddIntegrityLabelToBoundaryDescriptor\(boundary, sid\)/);
-  assert.match(probe, /AddMandatoryAce\(event_sacl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP/);
+  assert.match(probe, /CreateLowIntegrityMandatorySacl\(\)/);
   assert.match(probe, /SetSecurityDescriptorSacl\(&event_descriptor, TRUE, event_sacl, FALSE\)/);
+  const acl = readFileSync(
+    path.join(__dirname, '..', 'native', 'worker-supervisor', 'include', 'private_acl.h'),
+    'utf8',
+  );
+  assert.match(acl, /AddMandatoryAce\(acl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP/);
   assert.match(probe, /ProtectedReadsAndWritesDenied/);
   assert.match(probe, /ReadAllowedInput/);
   assert.match(probe, /CreateEventExW\(/);

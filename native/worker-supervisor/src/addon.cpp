@@ -345,8 +345,12 @@ PrivateNamespace CreateRunPrivateNamespace(const RestrictedToken& restricted) {
   if (!acl.value)
     throw std::runtime_error("private namespace ACL setup failed");
   SECURITY_DESCRIPTOR descriptor{};
+  LocalMemory integrity_sacl;
+  integrity_sacl.value = sumatrafuzz::supervisor::CreateLowIntegrityMandatorySacl();
   if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, static_cast<PACL>(acl.value), FALSE) ||
+      !integrity_sacl.value ||
+      !SetSecurityDescriptorSacl(&descriptor, TRUE, static_cast<PACL>(integrity_sacl.value), FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
     throw std::runtime_error("private namespace descriptor setup failed");
   SECURITY_ATTRIBUTES attributes{sizeof(attributes), &descriptor, FALSE};

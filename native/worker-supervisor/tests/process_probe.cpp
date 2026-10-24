@@ -385,17 +385,7 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
       {token_user->User.Sid, event_rights}, {run_sid, event_rights}};
   PACL event_acl = sumatrafuzz::supervisor::CreatePrivateAccessAcl(event_grants,
                                                                     std::size(event_grants));
-  DWORD low_label_bytes = 0;
-  CreateWellKnownSid(WinLowLabelSid, nullptr, nullptr, &low_label_bytes);
-  std::vector<BYTE> low_label_storage(low_label_bytes);
-  PSID low_label_sid = low_label_storage.data();
-  const bool low_label_ready = low_label_bytes != 0 &&
-      CreateWellKnownSid(WinLowLabelSid, nullptr, low_label_sid, &low_label_bytes);
-  const DWORD event_sacl_bytes = low_label_ready
-      ? static_cast<DWORD>(sizeof(ACL) + sizeof(SYSTEM_MANDATORY_LABEL_ACE) - sizeof(DWORD) +
-                           GetLengthSid(low_label_sid))
-      : 0;
-  PACL event_sacl = event_sacl_bytes ? static_cast<PACL>(LocalAlloc(LPTR, event_sacl_bytes)) : nullptr;
+  PACL event_sacl = sumatrafuzz::supervisor::CreateLowIntegrityMandatorySacl();
   SECURITY_DESCRIPTOR event_descriptor{};
   // Explicit descriptors without an integrity label default to medium; mark
   // this run-private IPC object low so the low worker can create and signal it.
@@ -403,9 +393,6 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
       event_sacl &&
       InitializeSecurityDescriptor(&event_descriptor, SECURITY_DESCRIPTOR_REVISION) &&
       SetSecurityDescriptorDacl(&event_descriptor, TRUE, event_acl, FALSE) &&
-      InitializeAcl(event_sacl, event_sacl_bytes, ACL_REVISION) &&
-      AddMandatoryAce(event_sacl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
-                      low_label_sid) &&
       SetSecurityDescriptorSacl(&event_descriptor, TRUE, event_sacl, FALSE) &&
       SetSecurityDescriptorControl(&event_descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
   if (!event_acl_ready) {

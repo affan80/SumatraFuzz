@@ -54,6 +54,26 @@ inline PACL CreatePrivateAccessAcl(const PrivateAclGrant* grants, size_t count) 
   return acl;
 }
 
+// Return a standalone SACL that marks a securable object low integrity while
+// retaining the default no-write-up policy for callers below that level.
+inline PACL CreateLowIntegrityMandatorySacl() {
+  alignas(DWORD) BYTE sid_storage[SECURITY_MAX_SID_SIZE]{};
+  DWORD sid_bytes = sizeof(sid_storage);
+  if (!CreateWellKnownSid(WinLowLabelSid, nullptr, sid_storage, &sid_bytes)) return nullptr;
+  const DWORD acl_bytes = static_cast<DWORD>(sizeof(ACL) +
+      sizeof(SYSTEM_MANDATORY_LABEL_ACE) - sizeof(DWORD) + GetLengthSid(sid_storage));
+  PACL acl = static_cast<PACL>(LocalAlloc(LPTR, acl_bytes));
+  if (!acl) return nullptr;
+  if (!InitializeAcl(acl, acl_bytes, ACL_REVISION) ||
+      !AddMandatoryAce(acl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, sid_storage)) {
+    const DWORD error = GetLastError();
+    LocalFree(acl);
+    SetLastError(error);
+    return nullptr;
+  }
+  return acl;
+}
+
 }  // namespace sumatrafuzz::supervisor
 
 #endif  // _WIN32
