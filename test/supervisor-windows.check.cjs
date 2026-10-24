@@ -700,7 +700,7 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(probe, /--namespace-gone/);
 });
 
-test('private namespace probe uses the restricted token default DACL', () => {
+test('private namespace probe uses the WinAFL shim per-run object DACL', () => {
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',
@@ -710,7 +710,9 @@ test('private namespace probe uses the restricted token default DACL', () => {
     /bool Initialize\(unsigned\* failure_stage = nullptr, DWORD\* failure_error = nullptr\)/,
   );
   assert.match(probe, /TokenRestrictedSids/);
-  assert.match(probe, /CreateEventExW\(nullptr, event_name\.c_str\(\)/);
+  assert.match(probe, /CreateEventExW\(&event_attributes, event_name\.c_str\(\)/);
+  assert.match(probe, /PrivateAclGrant event_grants/);
+  assert.match(probe, /SetSecurityDescriptorControl\(&event_descriptor, SE_DACL_PROTECTED/);
   assert.match(probe, /ProbeEventCreation\(L""\)/);
   assert.match(probe, /local_named_event_error=/);
   const addon = readFileSync(

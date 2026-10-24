@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include "command_line.h"
+#include "private_acl.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -287,12 +288,40 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     for (;;) Sleep(1000);
   }
 
-  // The supervisor sets the restricted token's default DACL to the worker and
-  // this run SID; use that DACL for this named object in the private namespace.
+  // Match the WinAFL shim: named objects receive an explicit protected DACL
+  // granting access only to the worker identity and this run's random SID.
+  wchar_t run_sid_text[185]{};
+  const DWORD run_sid_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_RUN_SID", run_sid_text,
+                                                       static_cast<DWORD>(std::size(run_sid_text)));
+  PSID run_sid = nullptr;
+  if (!run_sid_size || run_sid_size >= std::size(run_sid_text) ||
+      !ConvertStringSidToSidW(run_sid_text, &run_sid) || !RunSid(run_sid)) {
+    if (run_sid) LocalFree(run_sid);
+    return 29;
+  }
+  auto* token_user = reinterpret_cast<TOKEN_USER*>(ns.user.data());
+  const ACCESS_MASK event_rights = EVENT_MODIFY_STATE | SYNCHRONIZE;
+  const sumatrafuzz::supervisor::PrivateAclGrant event_grants[] = {
+      {token_user->User.Sid, event_rights}, {run_sid, event_rights}};
+  PACL event_acl = sumatrafuzz::supervisor::CreatePrivateAccessAcl(event_grants,
+                                                                    std::size(event_grants));
+  SECURITY_DESCRIPTOR event_descriptor{};
+  const bool event_acl_ready = event_acl &&
+      InitializeSecurityDescriptor(&event_descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+      SetSecurityDescriptorDacl(&event_descriptor, TRUE, event_acl, FALSE) &&
+      SetSecurityDescriptorControl(&event_descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
+  if (!event_acl_ready) {
+    if (event_acl) LocalFree(event_acl);
+    LocalFree(run_sid);
+    return 29;
+  }
+  SECURITY_ATTRIBUTES event_attributes{sizeof(event_attributes), &event_descriptor, FALSE};
   SetLastError(ERROR_SUCCESS);
-  HANDLE event = CreateEventExW(nullptr, event_name.c_str(), CREATE_EVENT_MANUAL_RESET,
-                                EVENT_MODIFY_STATE | SYNCHRONIZE);
+  HANDLE event = CreateEventExW(&event_attributes, event_name.c_str(), CREATE_EVENT_MANUAL_RESET,
+                                event_rights);
   const DWORD event_error = GetLastError();
+  LocalFree(event_acl);
+  LocalFree(run_sid);
   if (!event || event_error == ERROR_ALREADY_EXISTS) {
     const DWORD error = event_error;
     if (event) CloseHandle(event);
