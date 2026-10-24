@@ -46,6 +46,13 @@ Describe 'Worker service policy validation' {
     $source | Should -Match '\$useLive\s*=\s*\[bool\]\$Live\s*-or'
   }
 
+  It 'marks only the worker output tree low-integrity for restricted campaign writers' {
+    $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../worker-service-config.psm1'))
+    $source | Should -Match 'if \(\$directory -eq ''outputs''\) \{ Set-WorkerOutputLowIntegrity -Path \$path \}'
+    $source | Should -Match "'/setintegritylevel' '\(OI\)\(CI\)L' '/T' '/C'"
+    $source | Should -Match 'no-write-up label to worker outputs'
+  }
+
   It 'locks the runtime root and validates every existing descendant before service startup' {
     $root = Join-Path $TestDrive 'runtime-state'
     $nested = Join-Path $root 'security'

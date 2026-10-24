@@ -37,6 +37,8 @@ try {
     $user = New-LocalUser -Name $account -Password $password -AccountNeverExpires -PasswordNeverExpires
     Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')) -Member $user
     $null = New-Item -ItemType Directory -Path $temp -Force
+    & icacls $temp /setintegritylevel '(OI)(CI)L'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot provision low-integrity output fixture' }
     & icacls $RepoRoot /grant "${account}:(OI)(CI)RX"
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant supervisor user read access' }
     & icacls $temp /grant "${account}:(OI)(CI)M"
@@ -64,6 +66,8 @@ try {
       if ($LASTEXITCODE -ne 0) { throw 'Cannot protect the broad-ACL write probe fixture' }
       & icacls $fixture /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
       if ($LASTEXITCODE -ne 0) { throw 'Cannot grant administrator cleanup access to the write probe fixture' }
+      & icacls $fixture /setintegritylevel 'M'
+      if ($LASTEXITCODE -ne 0) { throw 'Cannot set the broad-ACL write probe to medium integrity' }
     }
     & icacls $worldWriteSentinel /grant '*S-1-1-0:(M)'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the World-writable probe fixture' }

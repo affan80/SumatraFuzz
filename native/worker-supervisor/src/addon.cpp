@@ -384,9 +384,13 @@ void AddRestrictedSidAccess(const std::wstring& directory_path, PSID sid, DWORD 
   const DWORD set_acl = SetSecurityInfo(directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
                                        nullptr, nullptr, updated_dacl, nullptr);
   LocalFree(updated_dacl);
+  if (set_acl != ERROR_SUCCESS) {
+    LocalFree(descriptor);
+    CloseHandle(directory);
+    throw std::runtime_error("could not protect restricted directory permissions");
+  }
   LocalFree(descriptor);
   CloseHandle(directory);
-  if (set_acl != ERROR_SUCCESS) throw std::runtime_error("could not protect restricted directory permissions");
 }
 
 constexpr DWORD kRestrictedEvidenceWrite = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES |
@@ -447,6 +451,25 @@ void SetPrivateRestrictedDefaultDacl(HANDLE source_token, HANDLE restricted_toke
   if (!set) throw std::runtime_error("could not restrict child-created kernel objects");
 }
 
+void SetLowIntegrity(HANDLE token) {
+  DWORD sid_size = 0;
+  CreateWellKnownSid(WinLowLabelSid, nullptr, nullptr, &sid_size);
+  std::vector<BYTE> storage(sizeof(TOKEN_MANDATORY_LABEL) + sid_size);
+  if (sid_size == 0) throw std::runtime_error("could not size low-integrity SID");
+  PSID sid = storage.data() + sizeof(TOKEN_MANDATORY_LABEL);
+  if (!CreateWellKnownSid(WinLowLabelSid, nullptr, sid, &sid_size))
+    throw std::runtime_error("could not initialize low-integrity SID");
+  auto* label = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(storage.data());
+  label->Label.Sid = sid;
+  label->Label.Attributes = SE_GROUP_INTEGRITY;
+  if (!SetTokenInformation(token, TokenIntegrityLevel, label,
+                           static_cast<DWORD>(storage.size())))
+    throw std::runtime_error("could not lower restricted worker integrity level");
+  TOKEN_MANDATORY_POLICY policy{TOKEN_MANDATORY_POLICY_NO_WRITE_UP};
+  if (!SetTokenInformation(token, TokenMandatoryPolicy, &policy, sizeof(policy)))
+    throw std::runtime_error("could not enforce no-write-up integrity policy");
+}
+
 RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) {
   RestrictedToken restricted;
   restricted.sid = CreateRunRestrictedSid();
@@ -470,14 +493,35 @@ RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) 
     CloseHandle(current);
     throw std::runtime_error("could not initialize restricted-code SID");
   }
+  DWORD world_sid_size = 0;
+  DWORD authenticated_sid_size = 0;
+  CreateWellKnownSid(WinWorldSid, nullptr, nullptr, &world_sid_size);
+  CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, nullptr, &authenticated_sid_size);
+  std::vector<BYTE> world_sid_storage(world_sid_size);
+  std::vector<BYTE> authenticated_sid_storage(authenticated_sid_size);
+  PSID world_sid = world_sid_storage.data();
+  PSID authenticated_sid = authenticated_sid_storage.data();
+  if (world_sid_size == 0 || authenticated_sid_size == 0 ||
+      !CreateWellKnownSid(WinWorldSid, nullptr, world_sid, &world_sid_size) ||
+      !CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, authenticated_sid, &authenticated_sid_size)) {
+    CloseHandle(current);
+    throw std::runtime_error("could not initialize runtime access SIDs");
+  }
   SID_AND_ATTRIBUTES restricting_sids[] = {
       {restricted.sid, 0},
       {restricted_code_buffer, 0},
+      // Windows runtime images and APIs grant read/execute access through
+      // these SIDs. Low integrity and NO_WRITE_UP prevent that access from
+      // authorizing writes to medium-integrity objects.
+      {world_sid, 0},
+      {authenticated_sid, 0},
   };
   const BOOL created = CreateRestrictedToken(current, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr,
-                                              2, restricting_sids, &restricted.handle);
+                                              static_cast<DWORD>(std::size(restricting_sids)), restricting_sids,
+                                              &restricted.handle);
   if (created) {
     try {
+      SetLowIntegrity(restricted.handle);
       SetPrivateRestrictedDefaultDacl(current, restricted.handle, restricted.sid);
     } catch (...) {
       CloseHandle(current);

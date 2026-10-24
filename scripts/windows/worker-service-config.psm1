@@ -519,6 +519,19 @@ function Protect-WorkerRuntimeTree {
   }
 }
 
+function Set-WorkerOutputLowIntegrity {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if (-not $root.PSIsContainer -or ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'Worker output root must be an ordinary directory before applying its integrity label'
+  }
+  $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
+  & $icacls $Path '/setintegritylevel' '(OI)(CI)L' '/T' '/C'
+  if ($LASTEXITCODE -ne 0) { throw 'Could not apply low-integrity no-write-up label to worker outputs' }
+}
+
 function Assert-WorkerNoReparseTree {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Path, [switch]$AllowWorkerDataVolumeRoot)
@@ -811,6 +824,7 @@ function Install-SumatrafuzzWorkerService {
       # since adopting writable state would trust content a local user could
       # have changed before this installation.
       Protect-WorkerRuntimeTree -Path $path -ServiceSid $serviceSid -RestrictedRead:([bool]($directory -eq 'inputs')) -RestrictedTraverse:([bool]($directory -eq 'outputs'))
+      if ($directory -eq 'outputs') { Set-WorkerOutputLowIntegrity -Path $path }
     }
     foreach ($file in @($marker.config_path, $marker.credentials_path)) {
       if (-not (Test-Path -LiteralPath $file)) { [IO.File]::WriteAllBytes($file, [byte[]]@()) }
@@ -921,4 +935,4 @@ function Uninstall-SumatrafuzzWorkerService {
   Write-WorkerInstallMarker $marker
 }
 
-Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Assert-WorkerProtectedInstallAncestors, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataMountPoint, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService
+Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Assert-WorkerProtectedInstallAncestors, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataMountPoint, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Set-WorkerOutputLowIntegrity, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService
