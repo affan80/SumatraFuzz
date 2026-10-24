@@ -52,7 +52,8 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
                              BOOL* access_granted) {
   *access_granted = FALSE;
   HANDLE process_token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token)) return GetLastError();
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &process_token))
+    return GetLastError();
   HANDLE impersonation_token = nullptr;
   if (!DuplicateTokenEx(process_token, TOKEN_QUERY, nullptr, SecurityImpersonation,
                         TokenImpersonation, &impersonation_token)) {
