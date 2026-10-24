@@ -4,6 +4,7 @@ const { createHash } = require('node:crypto');
 const {
   appendFileSync,
   copyFileSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readdirSync,
@@ -123,6 +124,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
     ['SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE', 'Authenticated Users'],
   ]) {
     const probePath = process.env[variable];
+    const startupMarker = path.join(evidenceDir, `${description.replaceAll(' ', '-')}-startup`);
     assert.ok(
       probePath && path.isAbsolute(probePath),
       `${description} write probe must be provisioned`,
@@ -130,7 +132,18 @@ test('Windows supervisor bounds and tears down a child process tree', {
     appendFileSync(probePath, '\nstandard-user-write');
     const deniedJob = supervisor.launchSuspended({
       executable: containmentProbePath,
-      argv: ['-D', toolDir, '-i', inputDir, '-o', evidenceDir, '--expect-write-denied', probePath],
+      argv: [
+        '-D',
+        toolDir,
+        '-i',
+        inputDir,
+        '-o',
+        evidenceDir,
+        '--startup-marker',
+        startupMarker,
+        '--expect-write-denied',
+        probePath,
+      ],
       workingDir: containmentRoot,
       evidenceDir,
       limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
@@ -143,6 +156,11 @@ test('Windows supervisor bounds and tears down a child process tree', {
         if (deniedSample.root_exited) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
+      assert.equal(
+        existsSync(startupMarker),
+        true,
+        `restricted child must reach its probe entry point for ${description}`,
+      );
       assert.equal(
         deniedSample.root_exit_code,
         0,

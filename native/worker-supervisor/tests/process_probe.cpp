@@ -446,6 +446,14 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::wstring(argv[i]) == L"--startup-marker") {
+      HANDLE marker = CreateFileW(argv[i + 1], GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (marker == INVALID_HANDLE_VALUE) return 51;
+      CloseHandle(marker);
+    }
+  }
   wchar_t secret[16]{};
   if (GetEnvironmentVariableW(L"SUMATRAFUZZ_TEST_SECRET", secret, static_cast<DWORD>(std::size(secret))) > 0) return 11;
   for (int i = 1; i + 1 < argc; ++i) {
