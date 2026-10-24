@@ -86,6 +86,64 @@ if ($LASTEXITCODE -ne 0) { throw 'WinAFL build failed' }
 $aflCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'afl-fuzz.exe' -Recurse -File)
 $dllCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'winafl.dll' -Recurse -File)
 if ($aflCandidates.Count -ne 1 -or $dllCandidates.Count -ne 1) { throw 'WinAFL x64 artifacts missing/ambiguous' }
+$dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe is required to inspect WinAFL runtime imports' }
+$compiler = Get-Command cl.exe -ErrorAction SilentlyContinue
+if (-not $compiler) { throw 'Visual Studio cl.exe is required to identify the WinAFL runtime family' }
+$compilerVersionDirectory = $compiler.Source
+for ($level = 0; $level -lt 4; $level++) { $compilerVersionDirectory = Split-Path $compilerVersionDirectory -Parent }
+$compilerToolsetVersion = Split-Path -Leaf $compilerVersionDirectory
+$compilerRuntimeFamily = ($compilerToolsetVersion -split '\.')[0..1] -join '.'
+$redistRoots = @()
+if ($env:VCToolsRedistDir -and (Test-Path -LiteralPath $env:VCToolsRedistDir -PathType Container)) {
+  $redistRoots += $env:VCToolsRedistDir
+} else {
+  $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+  if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+  $installations = @(& $vswhere -latest -products '*' -property installationPath)
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the installed Visual Studio runtime' }
+  foreach ($installation in $installations) {
+    $candidate = Join-Path $installation 'VC/Redist/MSVC'
+    if (Test-Path -LiteralPath $candidate -PathType Container) { $redistRoots += $candidate }
+  }
+  }
+}
+$runtimeDependencies = @{}
+foreach ($binary in @($aflCandidates[0].FullName, $dllCandidates[0].FullName)) {
+  $imports = @(& $dumpbin.Source /nologo /dependents $binary)
+  if ($LASTEXITCODE -ne 0) { throw "Cannot inspect WinAFL imports: $(Split-Path $binary -Leaf)" }
+  $importNames = @($imports | ForEach-Object { "$($_)".Trim() } |
+    Where-Object { $_ -match '^[A-Za-z0-9_.+-]+\.dll$' } | Select-Object -Unique)
+  foreach ($name in $importNames) {
+    if ($name -match '^(?i:api-ms-win-|ext-ms-win-)') { continue }
+    $systemDll = Join-Path (Join-Path $env:SystemRoot 'System32') $name
+    $localDll = Join-Path (Split-Path $binary -Parent) $name
+    $dynamoDll = Join-Path (Split-Path $drrun -Parent) $name
+    if ((Test-Path -LiteralPath $systemDll -PathType Leaf) -or
+        (Test-Path -LiteralPath $localDll -PathType Leaf) -or
+        (Test-Path -LiteralPath $dynamoDll -PathType Leaf)) { continue }
+    $candidates = @()
+    foreach ($root in $redistRoots) {
+      $candidates += @(Get-ChildItem -LiteralPath $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+          $_.FullName -match '[\\/]x64[\\/]Microsoft\.VC[0-9]+\.CRT[\\/]' -and
+          $_.FullName -match "[\\/]MSVC[\\/]$([regex]::Escape($compilerRuntimeFamily))\."
+        })
+    }
+    $candidates = @($candidates | Sort-Object -Property FullName -Unique)
+    if ($candidates.Count -ne 1) { throw "Missing or ambiguous Microsoft x64 runtime import: $name" }
+    $signature = Get-AuthenticodeSignature -LiteralPath $candidates[0].FullName
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+      throw "WinAFL runtime import is not signed by Microsoft: $name"
+    }
+    $destination = Join-Path (Split-Path $aflCandidates[0].FullName -Parent) $name
+    Copy-Item -LiteralPath $candidates[0].FullName -Destination $destination -Force
+    $runtimeDependencies[$name.ToLowerInvariant()] = [ordered]@{
+      path = [IO.Path]::GetFullPath($destination)
+      sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+  }
+}
 $lockDir = Join-Path $Workspace 'locks'
 $null = New-Item -ItemType Directory -Path $lockDir -Force
 & (Join-Path $PSScriptRoot 'verify-toolchain.ps1') -SumatraSource $SumatraSource `
@@ -95,6 +153,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Real WinAFL toolchain validation failed' }
 $lockPath = Join-Path $lockDir 'target-lock.json'
 if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { throw 'target-lock.json missing' }
 $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lock | Add-Member -NotePropertyName runtime_dependencies -NotePropertyValue @($runtimeDependencies.Values) -Force
 $lock | Add-Member -NotePropertyName acquisition -NotePropertyValue ([ordered]@{
   dynamorio_release = 'cronbuild-11.91.20735'
   dynamorio_archive_url = $drUrl

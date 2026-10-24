@@ -84,10 +84,30 @@ function Build-InstalledPolicy {
   $winaflSource = [IO.Path]::GetFullPath([string]$targetLock.tools.winafl_client.path)
   Copy-Item -LiteralPath $aflSource -Destination (Join-Path $winaflRoot 'afl-fuzz.exe') -Force
   Copy-Item -LiteralPath $winaflSource -Destination (Join-Path $winaflRoot 'winafl.dll') -Force
+  $nativeToolsRoot = [IO.Path]::GetFullPath((Join-Path $RepoRoot 'external/native-tools')).TrimEnd('\') + '\'
+  $runtimeDependencies = @()
+  $runtimeEntries = @()
+  if ($targetLock.ContainsKey('runtime_dependencies')) { $runtimeEntries = @($targetLock.runtime_dependencies) }
+  foreach ($dependency in $runtimeEntries) {
+    $source = [IO.Path]::GetFullPath([string]$dependency.path)
+    if (-not $source.StartsWith($nativeToolsRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $source -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$dependency.sha256) {
+      throw 'Pinned Microsoft runtime dependency is missing, outside the tool root, or changed'
+    }
+    $destination = Join-Path $winaflRoot (Split-Path $source -Leaf)
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$dependency.sha256) {
+      throw 'Copied Microsoft runtime dependency failed hash verification'
+    }
+    $dependency.path = $destination
+    $runtimeDependencies += $dependency
+  }
 
   $targetLock.tools.drrun.path = Join-Path $drrunDestination ([IO.Path]::GetFileName($drrunSource))
   $targetLock.tools.afl_fuzz.path = Join-Path $winaflRoot 'afl-fuzz.exe'
   $targetLock.tools.winafl_client.path = Join-Path $winaflRoot 'winafl.dll'
+  $targetLock.runtime_dependencies = $runtimeDependencies
   $installedLockPath = Join-Path $configRoot 'target-lock.json'
   $lockJson = ConvertTo-Json -InputObject $targetLock -Depth 12
   [IO.File]::WriteAllText($installedLockPath, $lockJson + "`n", [Text.UTF8Encoding]::new($false))

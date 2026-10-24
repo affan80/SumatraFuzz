@@ -83,4 +83,15 @@ Describe 'Pinned WinAFL namespace acquisition contract' {
     $native | Should -Match 'SUMATRAFUZZ_NAMESPACE_ALIAS'
     $native | Should -Match 'SUMATRAFUZZ_RUN_SID'
   }
+
+  It 'pins and stages only the verified Microsoft runtime DLLs WinAFL imports' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $runner=Get-Content $script:runner -Raw
+    $service=Get-Content (Join-Path $PSScriptRoot '../worker-service-acceptance.ps1') -Raw
+    $provision | Should -Match 'dumpbin.*dependents'
+    $provision | Should -Match 'Get-AuthenticodeSignature'
+    $provision | Should -Match 'runtime_dependencies'
+    $runner | Should -Match 'runtime_dependencies'
+    $service | Should -Match 'targetLock\.runtime_dependencies'
+  }
 }

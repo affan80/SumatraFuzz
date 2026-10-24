@@ -163,6 +163,36 @@ describe('verified launch specification', () => {
     expect(spec.runId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  it('pins runtime DLL imports as native launch file proofs', async () => {
+    const { policy, request, root } = await fixture();
+    const runtimePath = path.join(root, 'tools', 'vcruntime140.dll');
+    const runtimeHash = await writeFileWithHash(runtimePath, 'fixture runtime');
+    const { readFile } = await import('node:fs/promises');
+    const lock = JSON.parse(await readFile(policy.targetLockPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    lock.runtime_dependencies = [{ path: runtimePath, sha256: runtimeHash }];
+    const lockBytes = JSON.stringify(lock);
+    const lockHash = digest(lockBytes);
+    await writeFile(policy.targetLockPath, lockBytes);
+    const a4 = JSON.parse(await readFile(policy.a4ManifestPath, 'utf8')) as Record<string, unknown>;
+    a4.toolchain_lock_sha256 = lockHash;
+    const a4Bytes = JSON.stringify(a4);
+    const a4Hash = digest(a4Bytes);
+    await writeFile(policy.a4ManifestPath, a4Bytes);
+
+    const spec = await verifyAndBuildLaunch(
+      { ...request, target_lock_sha256: lockHash },
+      { ...policy, pinnedTargetLockSha256: lockHash, pinnedA4ManifestSha256: a4Hash },
+    );
+    expect(spec.fileProofs).toContainEqual({
+      path: await realpath(runtimePath),
+      root: await realpath(path.join(root, 'tools')),
+      sha256: runtimeHash,
+    });
+  });
+
   it('rejects a request that substitutes the administrator-pinned target lock digest', async () => {
     const { policy, request } = await fixture();
     await expect(

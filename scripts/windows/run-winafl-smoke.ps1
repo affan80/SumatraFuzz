@@ -45,6 +45,23 @@ foreach ($name in @('drrun','winafl_client','afl_fuzz')) {
     throw "Tool binary hash mismatch: $name"
   }
 }
+$runtimeProofs=@()
+$runtimeEntries=@()
+if ($lock.PSObject.Properties.Name -contains 'runtime_dependencies') {
+  $runtimeEntries=@($lock.runtime_dependencies)
+}
+foreach ($dependency in $runtimeEntries) {
+  $path=[string]$dependency.path
+  $expected=[string]$dependency.sha256
+  if (-not [IO.Path]::IsPathFullyQualified($path) -or $expected -notmatch '^[0-9a-f]{64}$' -or
+      -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw 'Pinned WinAFL runtime dependency is missing or malformed'
+  }
+  if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) {
+    throw 'Pinned WinAFL runtime dependency hash mismatch'
+  }
+  $runtimeProofs += @{path=$path;root=(Split-Path $path -Parent);sha256=$expected}
+}
 $observed=@($a4.confirmed_modules)
 if ($observed.Count -lt 1 -or $observed.Count -gt 8 -or @($observed | Select-Object -Unique).Count -ne $observed.Count) {
   throw 'Expected unique coverage modules observed in real A4 logs'
@@ -83,6 +100,7 @@ $proofs=@(
   @{path=(Join-Path (Split-Path $HarnessExe -Parent) 'PdfFilter.dll');root=(Split-Path $HarnessExe -Parent);sha256=[string]$a4.pdf_filter_sha256},
   @{path=(Join-Path (Split-Path $HarnessExe -Parent) 'libmupdf.dll');root=(Split-Path $HarnessExe -Parent);sha256=[string]$a4.mupdf_sha256}
 )
+$proofs += $runtimeProofs
 $launchSpec=[ordered]@{
   runId=[guid]::NewGuid().ToString('N')
   executable=$afl

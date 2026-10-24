@@ -675,6 +675,20 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(campaign, /supervised-winafl\.ts/);
   assert.match(campaign, /launch-spec\.json/);
   assert.doesNotMatch(campaign, /&\s+\$afl\s/);
+  assert.match(campaign, /runtime_dependencies/);
+  const provision = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/provision-winafl.ps1'),
+    'utf8',
+  );
+  assert.match(provision, /\/dependents/);
+  assert.match(provision, /Get-AuthenticodeSignature/);
+  assert.match(provision, /runtime_dependencies/);
+  const serviceAcceptance = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/worker-service-acceptance.ps1'),
+    'utf8',
+  );
+  assert.match(serviceAcceptance, /targetLock\.runtime_dependencies/);
+  assert.match(serviceAcceptance, /Pinned Microsoft runtime dependency/);
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',
