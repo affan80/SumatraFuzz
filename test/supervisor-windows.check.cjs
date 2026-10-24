@@ -397,17 +397,47 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(nativeProbe, /AppContainerProfilePath=/);
   assert.match(nativeProbe, /AppContainerTempPath=/);
   assert.match(nativeProbe, /bool DeleteProbeProfiles\(/);
-  assert.match(nativeProbe, /ReportAppContainerFailure\(L"delete_primary_profile"/);
-  assert.match(nativeProbe, /ReportAppContainerFailure\(L"delete_secondary_profile"/);
-  assert.match(nativeProbe, /step=%ls hresult=.*win32=/);
-  assert.match(nativeProbe, /ReportAppContainerFailure\(L"launch_appcontainer"/);
-  assert.match(nativeProbe, /ReportAppContainerFailure\(L"get_profile_folder"/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\("delete_primary_profile"/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\("delete_secondary_profile"/);
+  assert.match(nativeProbe, /step=%s hresult=.*win32=/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\("launch_appcontainer"/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\("get_profile_folder"/);
+  assert.match(nativeProbe, /void WriteAppContainerDiagnostic\(/);
+  assert.match(nativeProbe, /WriteFile\(error, message, length, &written, nullptr\)/);
+  assert.match(nativeProbe, /bool WriteAppContainerPath\(/);
+  assert.doesNotMatch(nativeProbe, /fwprintf\(stdout/);
+  for (const checkpoint of [
+    'AC:CREATE_PRIMARY_BEGIN',
+    'AC:CREATE_PRIMARY_RETURNED',
+    'AC:SID_STRING_BEGIN',
+    'AC:FOLDER_QUERY_BEGIN',
+    'AC:FOLDER_QUERY_RETURNED',
+    'AC:ACL_QUERY_BEGIN',
+    'AC:ACL_BUILD_BEGIN',
+    'AC:ACL_SET_OK',
+    'AC:ACL_FREE_BEGIN',
+    'AC:CHILD_LAUNCH_BEGIN',
+    'AC:CHILD_LAUNCH_RETURNED',
+    'AC:CHILD_LAUNCHED',
+    'AC:CHILD_EXIT_OBSERVED',
+    'AC:PROFILE_PATH_FREE_BEGIN',
+    'AC:PROFILE_PATH_FREE_DONE',
+    'AC:PRIMARY_SID_FREE_BEGIN',
+    'AC:PRIMARY_SID_FREE_DONE',
+    'AC:DELETE_PRIMARY_BEGIN',
+    'AC:DELETE_PRIMARY_RETURNED',
+  ]) {
+    assert.ok(
+      nativeProbe.includes(checkpoint),
+      `missing low-level cleanup checkpoint ${checkpoint}`,
+    );
+  }
   assert.match(
     nativeProbe,
     /DeleteProbeProfiles\(profile, second_profile,\s*first_created, second_created\)/,
   );
   assert.match(nativeProbe, /cleanup_succeeded = DeleteProbeProfiles/);
-  assert.match(nativeProbe, /probe exception left profile cleanup incomplete/);
+  assert.match(nativeProbe, /AC:EXCEPTION_CLEANUP_INCOMPLETE/);
   assert.match(
     appContainerScript,
     /Remove-Item -LiteralPath \$output -Recurse -Force -ErrorAction Stop/,

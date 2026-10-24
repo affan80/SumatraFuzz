@@ -70,3 +70,17 @@ Local checks:
 - `git diff --check`: passed.
 
 This macOS workspace cannot compile or run the Windows APIs. The latest hosted execution reached the probe but failed before the SID-string correction; a clean exact-head Windows run is still required to confirm the corrected API query and probe cleanup.
+
+## Fix round: diagnose hosted heap corruption at native boundaries
+
+The exact-head Windows run for `5a1e119152672f89e7cf680e24d990331b0a4ace` reached the AppContainer probe and exited with `-1073740940` (`0xC0000374`, heap corruption); no buffered stage diagnostics were visible. Replaced CRT wide-stream diagnostics and path output with direct `WriteFile` output. Added stable before/after checkpoint IDs around profile creation, SID string conversion, folder-path query, ACL query/build/set/free, child launch and exit, returned path/SID frees, and each profile deletion. Failure lines include only stage IDs and HRESULT/Win32 codes, never paths. Added static checks for low-level writes and checkpoint coverage.
+
+Review of the ownership calls against Microsoft documentation confirms the intended matching allocators: `FreeSid` for the profile SIDs, `LocalFree` for the SID string, and `CoTaskMemFree` for the folder path. The existing hosted log contains no stage checkpoints, so it does not identify which call caused the heap corruption. This change makes the next exact-head Windows run diagnostic; it does not claim the native runtime issue is resolved.
+
+Local checks:
+
+- `npm run format:check`: passed; Biome checked 139 files.
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
+- `git diff --check`: passed.
+
+Microsoft API references: [CreateAppContainerProfile](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile) documents `FreeSid` for its returned SID; [GetAppContainerFolderPath](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getappcontainerfolderpath) documents a SID string and `CoTaskMemFree` for the returned path; [ConvertSidToStringSid](https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw) documents `LocalFree` for its returned string.

@@ -15,10 +15,36 @@
 
 namespace {
 
-void ReportAppContainerFailure(const wchar_t* step, HRESULT result, DWORD win32_error) {
-  std::fwprintf(stderr, L"AppContainer probe failed: step=%ls hresult=0x%08lx win32=%lu\n",
-                step, static_cast<unsigned long>(result),
-                static_cast<unsigned long>(win32_error));
+void WriteAppContainerDiagnostic(const char* message, DWORD length) {
+  HANDLE error = GetStdHandle(STD_ERROR_HANDLE);
+  if (error == nullptr || error == INVALID_HANDLE_VALUE || length == 0) return;
+  DWORD written = 0;
+  WriteFile(error, message, length, &written, nullptr);
+}
+
+void AppContainerCheckpoint(const char* stage) {
+  WriteAppContainerDiagnostic(stage, static_cast<DWORD>(std::strlen(stage)));
+}
+
+void ReportAppContainerFailure(const char* step, HRESULT result, DWORD win32_error) {
+  char message[160]{};
+  const int length = std::snprintf(message, sizeof(message),
+      "AppContainer probe failed: step=%s hresult=0x%08lX win32=%lu\n", step,
+      static_cast<unsigned long>(result), static_cast<unsigned long>(win32_error));
+  if (length > 0 && static_cast<size_t>(length) < sizeof(message))
+    WriteAppContainerDiagnostic(message, static_cast<DWORD>(length));
+}
+
+bool WriteAppContainerPath(const char* label, PCWSTR path) {
+  char message[4096]{};
+  const int label_length = std::snprintf(message, sizeof(message), "%s", label);
+  if (label_length <= 0 || static_cast<size_t>(label_length) >= sizeof(message)) return false;
+  const int path_length = WideCharToMultiByte(CP_UTF8, 0, path, -1,
+      message + label_length, static_cast<int>(sizeof(message) - label_length - 1), nullptr, nullptr);
+  if (path_length <= 1 || static_cast<size_t>(label_length + path_length) >= sizeof(message)) return false;
+  message[label_length + path_length - 1] = '\n';
+  WriteAppContainerDiagnostic(message, static_cast<DWORD>(label_length + path_length));
+  return true;
 }
 
 bool WriteEvidenceFile(const std::wstring& evidence_dir) {
@@ -83,10 +109,12 @@ bool AppContainerChild(const std::wstring& output, const std::wstring& world,
 }
 
 bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
+  AppContainerCheckpoint("AC:ACL_QUERY_BEGIN\n");
   PACL existing_dacl = nullptr;
   const DWORD query = GetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr, nullptr);
   if (query != ERROR_SUCCESS) { SetLastError(query); return false; }
+  AppContainerCheckpoint("AC:ACL_QUERY_OK\n");
   EXPLICIT_ACCESSW access{};
   access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
   access.grfAccessMode = GRANT_ACCESS;
@@ -95,30 +123,58 @@ bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   access.Trustee.TrusteeType = TRUSTEE_IS_USER;
   access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
   PACL dacl = nullptr;
+  AppContainerCheckpoint("AC:ACL_BUILD_BEGIN\n");
   const DWORD acl_result = SetEntriesInAclW(1, &access, existing_dacl, &dacl);
+  AppContainerCheckpoint("AC:ACL_BUILD_RETURNED\n");
+  if (existing_dacl) AppContainerCheckpoint("AC:ACL_EXISTING_FREE_BEGIN\n");
   if (existing_dacl) LocalFree(existing_dacl);
+  if (existing_dacl) AppContainerCheckpoint("AC:ACL_EXISTING_FREE_DONE\n");
   if (acl_result != ERROR_SUCCESS) { SetLastError(acl_result); return false; }
+  AppContainerCheckpoint("AC:ACL_BUILD_OK\n");
+  AppContainerCheckpoint("AC:ACL_SET_BEGIN\n");
   const DWORD result = SetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+  AppContainerCheckpoint("AC:ACL_SET_RETURNED\n");
+  AppContainerCheckpoint("AC:ACL_FREE_BEGIN\n");
   LocalFree(dacl);
+  AppContainerCheckpoint("AC:ACL_FREE_DONE\n");
   if (result != ERROR_SUCCESS) SetLastError(result);
+  if (result == ERROR_SUCCESS) AppContainerCheckpoint("AC:ACL_SET_OK\n");
   return result == ERROR_SUCCESS;
+}
+
+void ReleaseProbeMemory(PWSTR profile_path, PSID sid, PSID second_sid) {
+  AppContainerCheckpoint("AC:RESOURCE_FREE_BEGIN\n");
+  if (profile_path) AppContainerCheckpoint("AC:PROFILE_PATH_FREE_BEGIN\n");
+  if (profile_path) CoTaskMemFree(profile_path);
+  if (profile_path) AppContainerCheckpoint("AC:PROFILE_PATH_FREE_DONE\n");
+  if (sid) AppContainerCheckpoint("AC:PRIMARY_SID_FREE_BEGIN\n");
+  if (sid) FreeSid(sid);
+  if (sid) AppContainerCheckpoint("AC:PRIMARY_SID_FREE_DONE\n");
+  if (second_sid) AppContainerCheckpoint("AC:SECONDARY_SID_FREE_BEGIN\n");
+  if (second_sid) FreeSid(second_sid);
+  if (second_sid) AppContainerCheckpoint("AC:SECONDARY_SID_FREE_DONE\n");
+  AppContainerCheckpoint("AC:RESOURCE_FREE_DONE\n");
 }
 
 bool DeleteProbeProfiles(const std::wstring& profile, const std::wstring& second_profile,
                          bool first_created, bool second_created) {
   bool okay = true;
   if (first_created) {
+    AppContainerCheckpoint("AC:DELETE_PRIMARY_BEGIN\n");
     const HRESULT result = DeleteAppContainerProfile(profile.c_str());
+    AppContainerCheckpoint("AC:DELETE_PRIMARY_RETURNED\n");
     if (FAILED(result)) {
-      ReportAppContainerFailure(L"delete_primary_profile", result, ERROR_SUCCESS);
+      ReportAppContainerFailure("delete_primary_profile", result, ERROR_SUCCESS);
       okay = false;
     }
   }
   if (second_created) {
+    AppContainerCheckpoint("AC:DELETE_SECONDARY_BEGIN\n");
     const HRESULT result = DeleteAppContainerProfile(second_profile.c_str());
+    AppContainerCheckpoint("AC:DELETE_SECONDARY_RETURNED\n");
     if (FAILED(result)) {
-      ReportAppContainerFailure(L"delete_secondary_profile", result, ERROR_SUCCESS);
+      ReportAppContainerFailure("delete_secondary_profile", result, ERROR_SUCCESS);
       okay = false;
     }
   }
@@ -138,61 +194,79 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
   bool okay = false;
   PWSTR profile_path = nullptr;
   try {
+    AppContainerCheckpoint("AC:CREATE_PRIMARY_BEGIN\n");
     HRESULT result = CreateAppContainerProfile(profile.c_str(), L"SumatraFuzz API Probe",
                                                 L"Ephemeral feasibility probe", nullptr, 0, &sid);
+    AppContainerCheckpoint("AC:CREATE_PRIMARY_RETURNED\n");
     if (FAILED(result) || !sid) {
-      ReportAppContainerFailure(L"create_profile", result, ERROR_SUCCESS);
+      ReportAppContainerFailure("create_profile", result, ERROR_SUCCESS);
       goto cleanup;
     }
     first_created = true;
     {
       LPWSTR sid_string = nullptr;
+      AppContainerCheckpoint("AC:SID_STRING_BEGIN\n");
       if (!ConvertSidToStringSidW(sid, &sid_string)) {
-        ReportAppContainerFailure(L"convert_profile_sid", S_OK, GetLastError());
+        ReportAppContainerFailure("convert_profile_sid", S_OK, GetLastError());
         goto cleanup;
       }
+      AppContainerCheckpoint("AC:SID_STRING_RETURNED\n");
+      AppContainerCheckpoint("AC:FOLDER_QUERY_BEGIN\n");
       result = GetAppContainerFolderPath(sid_string, &profile_path);
+      AppContainerCheckpoint("AC:FOLDER_QUERY_RETURNED\n");
+      AppContainerCheckpoint("AC:SID_STRING_FREE_BEGIN\n");
       LocalFree(sid_string);
+      AppContainerCheckpoint("AC:SID_STRING_FREE_DONE\n");
     }
     if (FAILED(result) || !profile_path || GetFullPathNameW(profile_path, 0, nullptr, nullptr) == 0) {
-      ReportAppContainerFailure(L"get_profile_folder", result,
+      ReportAppContainerFailure("get_profile_folder", result,
                                 FAILED(result) ? ERROR_SUCCESS : GetLastError());
       goto cleanup;
     }
-    std::fwprintf(stdout, L"AppContainerProfilePath=%ls\n", profile_path);
-    std::fwprintf(stdout, L"AppContainerTempPath=%ls\n", output.c_str());
+    if (!WriteAppContainerPath("AppContainerProfilePath=", profile_path)) {
+      ReportAppContainerFailure("write_profile_path", S_OK, GetLastError());
+      goto cleanup;
+    }
+    if (!WriteAppContainerPath("AppContainerTempPath=", output.c_str())) {
+      ReportAppContainerFailure("write_temp_path", S_OK, GetLastError());
+      goto cleanup;
+    }
+    AppContainerCheckpoint("AC:CREATE_SECONDARY_BEGIN\n");
     result = CreateAppContainerProfile(second_profile.c_str(), L"SumatraFuzz API Probe",
                                         L"Ephemeral feasibility probe", nullptr, 0, &second_sid);
+    AppContainerCheckpoint("AC:CREATE_SECONDARY_RETURNED\n");
     if (FAILED(result) || !second_sid) {
-      ReportAppContainerFailure(L"create_unique_profile", result, ERROR_SUCCESS);
+      ReportAppContainerFailure("create_unique_profile", result, ERROR_SUCCESS);
       goto cleanup;
     }
     if (EqualSid(sid, second_sid)) {
-      ReportAppContainerFailure(L"verify_unique_package_sid", HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+      ReportAppContainerFailure("verify_unique_package_sid", HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
                                 ERROR_INVALID_DATA);
       goto cleanup;
     }
     second_created = true;
+    AppContainerCheckpoint("AC:ACL_CALL_BEGIN\n");
     if (!GrantAppContainerDirectoryAccess(output, sid)) {
-      ReportAppContainerFailure(L"grant_output_acl", S_OK, GetLastError());
+      ReportAppContainerFailure("grant_output_acl", S_OK, GetLastError());
       goto cleanup;
     }
+    AppContainerCheckpoint("AC:ACL_CALL_DONE\n");
     {
       const std::wstring appcontainer_executable = output + L"\\appcontainer-probe.exe";
       if (!CopyFileW(executable.c_str(), appcontainer_executable.c_str(), TRUE)) {
-        ReportAppContainerFailure(L"copy_probe_executable", S_OK, GetLastError());
+        ReportAppContainerFailure("copy_probe_executable", S_OK, GetLastError());
         goto cleanup;
       }
       SIZE_T bytes = 0;
       InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
       if (bytes == 0) {
-        ReportAppContainerFailure(L"size_process_attributes", S_OK, GetLastError());
+        ReportAppContainerFailure("size_process_attributes", S_OK, GetLastError());
         goto cleanup;
       }
       std::vector<BYTE> attributes(bytes);
       auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
       if (!InitializeProcThreadAttributeList(list, 1, 0, &bytes)) {
-        ReportAppContainerFailure(L"initialize_process_attributes", S_OK, GetLastError());
+        ReportAppContainerFailure("initialize_process_attributes", S_OK, GetLastError());
         goto cleanup;
       }
       SECURITY_CAPABILITIES security{};
@@ -204,7 +278,7 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
       if (!updated) {
         const DWORD error = GetLastError();
         DeleteProcThreadAttributeList(list);
-        ReportAppContainerFailure(L"set_security_capabilities", S_OK, error);
+        ReportAppContainerFailure("set_security_capabilities", S_OK, error);
         goto cleanup;
       }
       STARTUPINFOEXW startup{};
@@ -214,14 +288,17 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
       std::wstring command = L"\"" + appcontainer_executable + L"\" --appcontainer-child \"" + output +
           L"\" \"" + world + L"\" \"" + authenticated + L"\" \"" + world_low +
           L"\" \"" + authenticated_low + L"\"";
+      AppContainerCheckpoint("AC:CHILD_LAUNCH_BEGIN\n");
       const BOOL launched = CreateProcessW(appcontainer_executable.c_str(), command.data(), nullptr, nullptr,
           FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, output.c_str(),
           &startup.StartupInfo, &process);
+      AppContainerCheckpoint("AC:CHILD_LAUNCH_RETURNED\n");
       DeleteProcThreadAttributeList(list);
       if (!launched) {
-        ReportAppContainerFailure(L"launch_appcontainer", S_OK, GetLastError());
+        ReportAppContainerFailure("launch_appcontainer", S_OK, GetLastError());
         goto cleanup;
       }
+      AppContainerCheckpoint("AC:CHILD_LAUNCHED\n");
       DWORD wait = WaitForSingleObject(process.hProcess, 30000);
       if (wait == WAIT_TIMEOUT) {
         TerminateProcess(process.hProcess, ERROR_TIMEOUT);
@@ -229,30 +306,27 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
       }
       DWORD exit_code = 0xffffffff;
       if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exit_code);
-      else ReportAppContainerFailure(L"wait_for_appcontainer", S_OK, GetLastError());
+      else ReportAppContainerFailure("wait_for_appcontainer", S_OK, GetLastError());
+      AppContainerCheckpoint("AC:CHILD_EXIT_OBSERVED\n");
       CloseHandle(process.hThread);
       CloseHandle(process.hProcess);
       okay = wait == WAIT_OBJECT_0 && exit_code == 0;
       if (wait == WAIT_OBJECT_0 && exit_code != 0)
-        ReportAppContainerFailure(L"verify_appcontainer_child", HRESULT_FROM_WIN32(exit_code), exit_code);
+        ReportAppContainerFailure("verify_appcontainer_child", HRESULT_FROM_WIN32(exit_code), exit_code);
     }
   cleanup:
-    if (profile_path) CoTaskMemFree(profile_path);
-    if (sid) FreeSid(sid);
-    if (second_sid) FreeSid(second_sid);
+    ReleaseProbeMemory(profile_path, sid, second_sid);
     const bool profiles_deleted = DeleteProbeProfiles(profile, second_profile,
                                                        first_created, second_created);
     okay = profiles_deleted && okay;
     return okay;
   } catch (...) {
-    ReportAppContainerFailure(L"handle_probe_exception", E_FAIL, ERROR_SUCCESS);
-    if (profile_path) CoTaskMemFree(profile_path);
-    if (sid) FreeSid(sid);
-    if (second_sid) FreeSid(second_sid);
+    ReportAppContainerFailure("handle_probe_exception", E_FAIL, ERROR_SUCCESS);
+    ReleaseProbeMemory(profile_path, sid, second_sid);
     const bool cleanup_succeeded = DeleteProbeProfiles(profile, second_profile,
                                                         first_created, second_created);
     if (!cleanup_succeeded)
-      std::fwprintf(stderr, L"AppContainer probe exception left profile cleanup incomplete\n");
+      AppContainerCheckpoint("AC:EXCEPTION_CLEANUP_INCOMPLETE\n");
     return false;
   }
 }
