@@ -251,6 +251,7 @@ std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, con
   std::map<std::wstring, std::wstring> values;
   values.emplace(L"SUMATRAFUZZ_NAMESPACE_ALIAS", namespace_alias);
   values.emplace(L"SUMATRAFUZZ_RUN_SID", run_sid);
+  values.emplace(L"AFL_NO_UI", L"1");
   values.emplace(L"PATH", tool_dir + L";" + system_root + L"\\System32");
   values.emplace(L"SystemRoot", system_root);
   values.emplace(L"TEMP", working_dir);
@@ -775,6 +776,11 @@ Napi::Value SampleJob(const Napi::CallbackInfo& info) {
     sample.Set("cpu_percent", cpu_percent);
     sample.Set("memory_bytes", static_cast<double>(memory.PeakJobMemoryUsed));
     sample.Set("process_count", accounting.ActiveProcesses);
+    DWORD root_exit_code = 0;
+    const bool root_exited = WaitForSingleObject(job.process, 0) == WAIT_OBJECT_0 &&
+                             GetExitCodeProcess(job.process, &root_exit_code);
+    sample.Set("root_exited", root_exited);
+    sample.Set("root_exit_code", root_exited ? Napi::Number::New(env, static_cast<double>(root_exit_code)) : env.Null());
     return sample;
   } catch (const std::exception& error) { throw NativeError(env, error.what()); }
 }

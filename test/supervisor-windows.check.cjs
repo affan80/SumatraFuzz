@@ -657,7 +657,23 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(addon, /ConvertSidToStringSidW/);
   assert.match(addon, /SUMATRAFUZZ_NAMESPACE_ALIAS/);
   assert.match(addon, /SUMATRAFUZZ_RUN_SID/);
+  assert.match(addon, /AFL_NO_UI/);
+  assert.match(addon, /sample\.Set\("root_exited", root_exited\)/);
+  assert.match(addon, /sample\.Set\("root_exit_code"/);
   assert.match(addon, /ClosePrivateNamespace\(handle, PRIVATE_NAMESPACE_FLAG_DESTROY\)/);
+  const launcher = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/supervised-winafl.ts'),
+    'utf8',
+  );
+  assert.match(launcher, /launchSuspended\(spec\)/);
+  assert.match(launcher, /stopJob\(job, 0\)/);
+  const campaign = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/run-winafl-smoke.ps1'),
+    'utf8',
+  );
+  assert.match(campaign, /supervised-winafl\.ts/);
+  assert.match(campaign, /launch-spec\.json/);
+  assert.doesNotMatch(campaign, /&\s+\$afl\s/);
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',

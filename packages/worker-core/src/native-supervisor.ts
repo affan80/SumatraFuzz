@@ -22,6 +22,8 @@ export interface ResourceSample {
   readonly cpu_percent: number;
   readonly memory_bytes: number;
   readonly process_count: number;
+  readonly root_exited?: boolean;
+  readonly root_exit_code?: number | null;
 }
 
 export interface VolumeUsageSample {
@@ -145,7 +147,11 @@ export class WindowsJobSupervisor {
         !Number.isSafeInteger(sample.memory_bytes) ||
         sample.memory_bytes < 0 ||
         !Number.isSafeInteger(sample.process_count) ||
-        sample.process_count < 0
+        sample.process_count < 0 ||
+        (sample.root_exited !== undefined && typeof sample.root_exited !== 'boolean') ||
+        (sample.root_exit_code !== undefined &&
+          sample.root_exit_code !== null &&
+          (!Number.isSafeInteger(sample.root_exit_code) || sample.root_exit_code < 0))
       ) {
         throw new Error('native supervisor returned an invalid resource sample');
       }

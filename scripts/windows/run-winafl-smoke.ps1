@@ -75,44 +75,35 @@ $aflArguments=@('-i',$InputDir,'-o',$OutputDir,'-D',$drBin,'-w',$client,
 foreach ($name in $observed) { $aflArguments+=@('-coverage_module',[string]$name) }
 $aflArguments+=@('-target_module',[IO.Path]::GetFileName($HarnessExe),'-target_method','fuzz_one_file',
          '-fuzz_iterations',[string]$FuzzIterations,'-nargs','1','--',$HarnessExe,'@@')
-$info=[Diagnostics.ProcessStartInfo]::new()
-$info.FileName=$afl
-$info.UseShellExecute=$false
-$info.CreateNoWindow=$true
-$info.WorkingDirectory=[IO.Path]::GetFullPath($parent)
-foreach ($arg in $aflArguments) { [void]$info.ArgumentList.Add([string]$arg) }
-$info.Environment['AFL_NO_UI']='1'
-$begin=[DateTime]::UtcNow
-$proc=[Diagnostics.Process]::new()
-$proc.StartInfo=$info
-if (-not $proc.Start()) { throw 'Real WinAFL process did not start' }
-$stopReason='unknown'
+$proofs=@(
+  @{path=$afl;root=(Split-Path $afl -Parent);sha256=[string]$lock.tools.afl_fuzz.sha256},
+  @{path=[string]$lock.tools.drrun.path;root=$drBin;sha256=[string]$lock.tools.drrun.sha256},
+  @{path=$client;root=(Split-Path $client -Parent);sha256=[string]$lock.tools.winafl_client.sha256},
+  @{path=$HarnessExe;root=(Split-Path $HarnessExe -Parent);sha256=[string]$a4.harness_sha256},
+  @{path=(Join-Path (Split-Path $HarnessExe -Parent) 'PdfFilter.dll');root=(Split-Path $HarnessExe -Parent);sha256=[string]$a4.pdf_filter_sha256},
+  @{path=(Join-Path (Split-Path $HarnessExe -Parent) 'libmupdf.dll');root=(Split-Path $HarnessExe -Parent);sha256=[string]$a4.mupdf_sha256}
+)
+$launchSpec=[ordered]@{
+  runId=[guid]::NewGuid().ToString('N')
+  executable=$afl
+  argv=$aflArguments
+  workingDir=[IO.Path]::GetFullPath($parent)
+  evidenceDir=[IO.Path]::GetFullPath($OutputDir)
+  limits=@{max_memory_bytes=1073741824;max_cpu_percent=100}
+  fileProofs=$proofs
+  durationSeconds=$DurationSeconds
+}
+$launchSpecPath=Join-Path $parent 'launch-spec.json'
+$launchSpec | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $launchSpecPath -Encoding utf8
+try {
+  & node --experimental-strip-types (Join-Path $PSScriptRoot 'supervised-winafl.ts') $launchSpecPath
+  if ($LASTEXITCODE -ne 0) { throw "Supervised WinAFL campaign failed with exit $LASTEXITCODE" }
+} finally {
+  Remove-Item -LiteralPath $launchSpecPath -Force -ErrorAction SilentlyContinue
+}
 $statsPath=Join-Path $OutputDir 'fuzzer_stats'
 $first=Join-Path $OutputDir 'first.stats'
 $second=Join-Path $OutputDir 'second.stats'
-$end=$begin.AddSeconds($DurationSeconds)
-try {
-  while ([DateTime]::UtcNow -lt $end) {
-    if ($proc.WaitForExit(3000)) {
-      throw "WinAFL terminated before bounded campaign ended with code $($proc.ExitCode)"
-    }
-    if (Test-Path -LiteralPath $statsPath -PathType Leaf) {
-      if (-not (Test-Path -LiteralPath $first)) {
-        Copy-Item -LiteralPath $statsPath -Destination $first
-      } else {
-        Copy-Item -LiteralPath $statsPath -Destination $second -Force
-      }
-    }
-  }
-  $stopReason='bounded_limit_reached'
-} finally {
-  if (-not $proc.HasExited) {
-    # Explicitly record this as a bounded forced stop; never call it a clean exit.
-    $proc.Kill($true)
-    [void]$proc.WaitForExit(30000)
-  }
-  $proc.Dispose()
-}
 if (-not (Test-Path -LiteralPath $first -PathType Leaf) -or
     -not (Test-Path -LiteralPath $second -PathType Leaf) -or
     -not (Test-Path -LiteralPath $statsPath -PathType Leaf)) {

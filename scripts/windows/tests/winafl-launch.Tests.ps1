@@ -70,4 +70,17 @@ Describe 'Pinned WinAFL namespace acquisition contract' {
     $patch | Should -Match 'SE_DACL_PROTECTED'
     $patch | Should -Match '\-namespace_alias %s -run_sid %s'
   }
+
+  It 'launches the fuzzer through the native supervisor that owns the run namespace' {
+    $runner=Get-Content $script:runner -Raw
+    $supervised=Get-Content (Join-Path $PSScriptRoot '../supervised-winafl.ts') -Raw
+    $native=Get-Content (Join-Path $PSScriptRoot '../../../native/worker-supervisor/src/addon.cpp') -Raw
+    $runner | Should -Match 'supervised-winafl\.ts'
+    $runner | Should -Match 'launch-spec\.json'
+    $runner | Should -Not -Match '&\s+\$afl\s'
+    $supervised | Should -Match 'launchSuspended\(spec\)'
+    $supervised | Should -Match 'stopJob\(job, 0\)'
+    $native | Should -Match 'SUMATRAFUZZ_NAMESPACE_ALIAS'
+    $native | Should -Match 'SUMATRAFUZZ_RUN_SID'
+  }
 }
