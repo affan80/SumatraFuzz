@@ -123,11 +123,14 @@ test('Windows supervisor bounds and tears down a child process tree', {
     ['SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE', 'Authenticated Users'],
   ]) {
     const probePath = process.env[variable];
-    assert.ok(probePath && path.isAbsolute(probePath), `${description} write probe must be provisioned`);
+    assert.ok(
+      probePath && path.isAbsolute(probePath),
+      `${description} write probe must be provisioned`,
+    );
     appendFileSync(probePath, '\nstandard-user-write');
     const deniedJob = supervisor.launchSuspended({
       executable: containmentProbePath,
-      argv: ['--expect-write-denied', probePath],
+      argv: ['-D', toolDir, '-i', inputDir, '-o', evidenceDir, '--expect-write-denied', probePath],
       workingDir: containmentRoot,
       evidenceDir,
       limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
