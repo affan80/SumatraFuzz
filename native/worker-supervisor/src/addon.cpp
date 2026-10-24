@@ -451,7 +451,7 @@ void SetPrivateRestrictedDefaultDacl(HANDLE source_token, HANDLE restricted_toke
   if (!set) throw std::runtime_error("could not restrict child-created kernel objects");
 }
 
-void SetLowIntegrity(HANDLE token) {
+void SetLowIntegrityAndVerifyNoWriteUp(HANDLE token) {
   DWORD sid_size = 0;
   CreateWellKnownSid(WinLowLabelSid, nullptr, nullptr, &sid_size);
   std::vector<BYTE> storage(sizeof(TOKEN_MANDATORY_LABEL) + sid_size);
@@ -465,9 +465,16 @@ void SetLowIntegrity(HANDLE token) {
   if (!SetTokenInformation(token, TokenIntegrityLevel, label,
                            static_cast<DWORD>(storage.size())))
     throw std::runtime_error("could not lower restricted worker integrity level");
-  TOKEN_MANDATORY_POLICY policy{TOKEN_MANDATORY_POLICY_NO_WRITE_UP};
-  if (!SetTokenInformation(token, TokenMandatoryPolicy, &policy, sizeof(policy)))
-    throw std::runtime_error("could not enforce no-write-up integrity policy");
+  // LSA establishes this policy when it creates the source token. Query and
+  // require it here; attempting to set TokenMandatoryPolicy requires a
+  // privilege unavailable to the worker service account.
+  TOKEN_MANDATORY_POLICY policy{};
+  DWORD policy_bytes = 0;
+  if (!GetTokenInformation(token, TokenMandatoryPolicy, &policy, sizeof(policy), &policy_bytes) ||
+      policy_bytes < sizeof(policy) ||
+      (policy.Policy & TOKEN_MANDATORY_POLICY_NO_WRITE_UP) == 0) {
+    throw std::runtime_error("restricted worker token lacks no-write-up integrity policy");
+  }
 }
 
 RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) {
@@ -521,7 +528,7 @@ RestrictedToken CreateEvidenceRestrictedToken(const std::wstring& evidence_dir) 
                                               &restricted.handle);
   if (created) {
     try {
-      SetLowIntegrity(restricted.handle);
+      SetLowIntegrityAndVerifyNoWriteUp(restricted.handle);
       SetPrivateRestrictedDefaultDacl(current, restricted.handle, restricted.sid);
     } catch (...) {
       CloseHandle(current);
