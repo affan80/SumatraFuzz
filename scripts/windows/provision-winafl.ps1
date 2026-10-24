@@ -94,7 +94,7 @@ $compilerDirectory = Split-Path $compilerPath -Parent
 $dumpbin = Join-Path $compilerDirectory 'dumpbin.exe'
 if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) { throw 'Visual Studio dumpbin.exe is required to inspect WinAFL runtime imports' }
 $compilerToolsetDirectory = $compilerPath
-for ($level = 0; $level -lt 3; $level++) { $compilerToolsetDirectory = Split-Path $compilerToolsetDirectory -Parent }
+for ($level = 0; $level -lt 4; $level++) { $compilerToolsetDirectory = Split-Path $compilerToolsetDirectory -Parent }
 $compilerToolsetVersion = Split-Path -Leaf $compilerToolsetDirectory
 if ($compilerToolsetVersion -notmatch '^\d+\.\d+\.') { throw 'Unexpected Visual Studio compiler toolset path' }
 $compilerRuntimeFamily = ($compilerToolsetVersion -split '\.')[0..1] -join '.'

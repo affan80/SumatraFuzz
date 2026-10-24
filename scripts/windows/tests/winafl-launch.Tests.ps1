@@ -98,4 +98,13 @@ Describe 'Pinned WinAFL namespace acquisition contract' {
     $runner | Should -Match 'runtime_dependencies'
     $service | Should -Match 'targetLock\.runtime_dependencies'
   }
+
+  It 'resolves the MSVC toolset version above the compiler bin directory' {
+    $provision=Get-Content (Join-Path $PSScriptRoot '../provision-winafl.ps1') -Raw
+    $provision | Should -Match '\$level -lt 4'
+    $compilerPath='C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe'
+    $toolsetDirectory=$compilerPath
+    for ($level=0; $level -lt 4; $level++) { $toolsetDirectory=Split-Path $toolsetDirectory -Parent }
+    (Split-Path -Leaf $toolsetDirectory) | Should -Be '14.44.35207'
+  }
 }
