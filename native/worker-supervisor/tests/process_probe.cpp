@@ -57,7 +57,7 @@ std::wstring CanonicalResourceContractRoot(const std::wstring& supplied_root) {
   return root.substr(4);
 }
 
-// Real helper contract: no child launch here (Task 3 owns token integration).
+// Shared production-helper contract (Task 3 still owns production token integration).
 DWORD PackageAceMask(const std::wstring& path, PSID sid) {
   PACL acl = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -175,8 +175,22 @@ DWORD ResourceIdentityChild(const std::wstring& root, const std::wstring& expect
   return failed;
 }
 
-DWORD RunResourceIdentityProbe(const std::wstring& executable, const std::wstring& root, PSID sid, bool sibling) {
+// Allocate before launch so an unconfirmed exit can transfer all ownership
+// without allocating or unwinding the grants/profile underneath a live child.
+struct ResourceProbeQuarantine {
+  sumatrafuzz::supervisor::ResourceHandle process;
+  std::unique_ptr<sumatrafuzz::supervisor::RunResourceState> resources;
+  ResourceProbeQuarantine* next = nullptr;
+};
+ResourceProbeQuarantine* g_probe_quarantine = nullptr;
+enum class ResourceDrainFault { None, Timeout, TerminationDenied, DrainWaitFailed };
+
+DWORD RunResourceIdentityProbe(const std::wstring& executable, const std::wstring& root,
+    sumatrafuzz::supervisor::RunResources& resources, bool sibling,
+    ResourceDrainFault fault = ResourceDrainFault::None) {
   using namespace sumatrafuzz::supervisor;
+  auto quarantine = std::make_unique<ResourceProbeQuarantine>();
+  const PSID sid = resources.state->profile.sid;
   LPWSTR text = nullptr;
   if (!ConvertSidToStringSidW(sid, &text)) ResourceError(GetLastError(), "contract package string");
   const std::wstring expected(text);
@@ -199,19 +213,124 @@ DWORD RunResourceIdentityProbe(const std::wstring& executable, const std::wstrin
   PROCESS_INFORMATION process{};
   std::wstring command = L"\"" + executable + L"\" --resource-identity-child \"" + root + L"\" \"" + expected +
       (sibling ? L"\" sibling" : L"\" owner");
+  const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW |
+      (fault == ResourceDrainFault::None ? 0 : CREATE_SUSPENDED);
   if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
-      EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, root.c_str(), &startup.StartupInfo, &process))
-    ResourceError(GetLastError(), "contract AppContainer launch");
-  ResourceHandle child(process.hProcess), thread(process.hThread);
-  DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+      flags, nullptr, root.c_str(), &startup.StartupInfo, &process)) {
+    const DWORD error = GetLastError();
+    ResourceError(error, "contract AppContainer launch");
+  }
+  quarantine->process.value = process.hProcess;
+  ResourceHandle thread(process.hThread);
+  const DWORD wait = WaitForSingleObject(process.hProcess, fault == ResourceDrainFault::None ? 10000 : 1);
   if (wait != WAIT_OBJECT_0) {
-    TerminateProcess(process.hProcess, ERROR_TIMEOUT);
-    WaitForSingleObject(process.hProcess, 10000);
-    ResourceError(ERROR_TIMEOUT, "contract AppContainer drain");
+    const DWORD wait_error = wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+    ResourceHandle denied_termination;
+    HANDLE terminate_handle = process.hProcess;
+    if (fault == ResourceDrainFault::TerminationDenied) {
+      // Use a real process handle without PROCESS_TERMINATE. Do not fake the
+      // kernel denial, and keep the full-access handle for controlled recovery.
+      if (!DuplicateHandle(GetCurrentProcess(), process.hProcess, GetCurrentProcess(),
+          &denied_termination.value, SYNCHRONIZE, FALSE, 0)) {
+        // Invalid handle also fails closed if fault setup fails.
+        denied_termination.value = INVALID_HANDLE_VALUE;
+      }
+      terminate_handle = denied_termination.value == INVALID_HANDLE_VALUE ? nullptr : denied_termination.value;
+    }
+    const BOOL terminated = TerminateProcess(terminate_handle, ERROR_TIMEOUT);
+    const DWORD termination_error = terminated ? ERROR_SUCCESS : GetLastError();
+    const DWORD drained = WaitForSingleObject(
+        fault == ResourceDrainFault::DrainWaitFailed ? nullptr : process.hProcess,
+        fault == ResourceDrainFault::TerminationDenied ? 100 : 10000);
+    const DWORD drain_error = drained == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+    ResourceContractDiagnostic("identity-child-termination", __LINE__, termination_error,
+        terminated ? "termination-requested" : "termination-failed");
+    if (drained != WAIT_OBJECT_0) {
+      ResourceContractDiagnostic("identity-child-quarantine", __LINE__, drain_error,
+          "exit-unconfirmed-resources-retained");
+      quarantine->resources = std::move(resources.state);
+      quarantine->next = g_probe_quarantine;
+      g_probe_quarantine = quarantine.release();
+      ResourceError(terminated ? drain_error : termination_error, "contract AppContainer drain unconfirmed");
+    }
+    // TerminateProcess success alone is insufficient: only the signaled
+    // process permits caller resource teardown.
+    ResourceError(wait_error, "contract AppContainer drain");
   }
   DWORD code = 0;
   if (!GetExitCodeProcess(process.hProcess, &code)) ResourceError(GetLastError(), "contract AppContainer exit");
   return code;
+}
+
+// Windows fault coverage uses real suspended AppContainer processes. Verify
+// quarantine retains active grants and a registered profile, then recover only
+// after a real kernel wait confirms exit. Unexpected test failures leave the
+// quarantine and marker intact for the outer runner, never silently clean up.
+void ResourceDrainFailureContract(const std::wstring& tool, const std::wstring& root,
+    const sumatrafuzz::supervisor::RunResourcePolicy& policy) {
+  using namespace sumatrafuzz::supervisor;
+  for (const auto fault : {ResourceDrainFault::Timeout, ResourceDrainFault::TerminationDenied,
+                          ResourceDrainFault::DrainWaitFailed}) {
+    RunResources resources;
+    resources.state->profile = CreateRunAppContainerProfile();
+    const std::wstring name = resources.state->profile.name;
+    std::vector<BYTE> sid(GetLengthSid(resources.state->profile.sid));
+    if (!CopySid(static_cast<DWORD>(sid.size()), sid.data(), resources.state->profile.sid))
+      ResourceError(GetLastError(), "drain contract SID copy");
+    resources.state->grants.push_back(GrantRunResourceAccess(tool, resources.state->profile.sid,
+        RunResourceAccess::ToolReadExecute, policy));
+    resources.state->grants.push_back(GrantRunResourceAccess(root + L"\\evidence", resources.state->profile.sid,
+        RunResourceAccess::EvidenceModify, policy));
+    bool failed = false;
+    try { RunResourceIdentityProbe(tool, root, resources, false, fault); }
+    catch (const std::system_error& error) {
+      const DWORD expected = fault == ResourceDrainFault::TerminationDenied ? ERROR_ACCESS_DENIED :
+          fault == ResourceDrainFault::DrainWaitFailed ? ERROR_INVALID_HANDLE : ERROR_TIMEOUT;
+      if (error.code().value() != expected) throw;
+      failed = true;
+    }
+    if (!failed) ResourceError(ERROR_INVALID_DATA, "drain contract must fail");
+    if (fault == ResourceDrainFault::Timeout) {
+      if (!resources.state || g_probe_quarantine)
+        ResourceError(ERROR_INVALID_DATA, "confirmed drain ownership");
+    } else {
+      auto* retained = g_probe_quarantine;
+      if (resources.state || !retained || !retained->resources ||
+          !EqualSid(retained->resources->profile.sid, sid.data()) ||
+          !PackageAceMask(tool, sid.data()) || !PackageAceMask(root + L"\\evidence", sid.data()))
+        ResourceError(ERROR_INVALID_DATA, "unconfirmed drain must retain resources");
+      if (fault == ResourceDrainFault::TerminationDenied && WaitForSingleObject(retained->process.value, 0) != WAIT_TIMEOUT)
+        ResourceError(ERROR_INVALID_DATA, "denied termination must leave live child");
+      PSID duplicate = nullptr;
+      const HRESULT exists = CreateAppContainerProfile(name.c_str(), L"Contract", L"Contract", nullptr, 0, &duplicate);
+      if (duplicate) FreeSid(duplicate);
+      if (exists != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS))
+        ResourceError(ERROR_INVALID_DATA, "quarantine must retain registered profile");
+      if (WaitForSingleObject(retained->process.value, 0) != WAIT_OBJECT_0) {
+        const BOOL terminated = TerminateProcess(retained->process.value, ERROR_TIMEOUT);
+        const DWORD error = terminated ? ERROR_SUCCESS : GetLastError();
+        if (WaitForSingleObject(retained->process.value, 10000) != WAIT_OBJECT_0)
+          ResourceError(terminated ? ERROR_TIMEOUT : error, "drain contract recovery unconfirmed");
+      }
+      resources.state = std::move(retained->resources);
+      g_probe_quarantine = retained->next;
+      delete retained;
+    }
+    const DWORD closed = resources.Close();
+    if (closed != ERROR_SUCCESS) ResourceError(closed, "drain contract cleanup");
+    if (PackageAceMask(tool, sid.data()) || PackageAceMask(root + L"\\evidence", sid.data()))
+      ResourceError(ERROR_INVALID_DATA, "drain contract grant removal");
+    PSID recreated = nullptr;
+    const HRESULT created = CreateAppContainerProfile(name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated);
+    if (FAILED(created)) ResourceError(HRESULT_FACILITY(created) == FACILITY_WIN32 ? HRESULT_CODE(created) : ERROR_GEN_FAILURE, "drain contract profile cleanup");
+    const HRESULT removed = DeleteAppContainerProfile(name.c_str());
+    FreeSid(recreated);
+    if (FAILED(removed)) ResourceError(HRESULT_FACILITY(removed) == FACILITY_WIN32 ? HRESULT_CODE(removed) : ERROR_GEN_FAILURE, "drain contract recreated profile removal");
+    ResourceContractDiagnostic("resource-drain-failure-contract", __LINE__, ERROR_SUCCESS,
+        fault == ResourceDrainFault::Timeout ? "timeout-confirmed-exit-cleanup-PASS" :
+        fault == ResourceDrainFault::TerminationDenied ? "termination-denied-live-quarantine-recovery-PASS" :
+        "wait-failed-quarantine-recovery-PASS");
+  }
 }
 
 bool RunResourceContract(const std::wstring& supplied_root) {
@@ -267,7 +386,9 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     RunResources resources;
     resources.state->profile = CreateRunAppContainerProfile();
     auto& profile = resources.state->profile;
-    auto second = CreateRunAppContainerProfile();
+    RunResources sibling_resources;
+    sibling_resources.state->profile = CreateRunAppContainerProfile();
+    auto& second = sibling_resources.state->profile;
     if (!IsRunPackageSid(profile.sid) || EqualSid(profile.sid, second.sid) || profile.name.size() > 64) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
     const auto rejected = [&](const std::wstring& path, RunResourceAccess access, PSID identity) {
       try { auto unexpected = GrantRunResourceAccess(path, identity, access, policy); }
@@ -441,6 +562,8 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     const HRESULT removed_partial = DeleteAppContainerProfile(partial_name.c_str());
     FreeSid(recreated_partial);
     if (FAILED(removed_partial)) return ResourceContractHresultFailure(stage, __LINE__, removed_partial);
+    checkpoint("resource-drain-failure-contract");
+    ResourceDrainFailureContract(tool, root, policy);
     checkpoint("grant-resource-policy");
     for (const auto& rule : policy.objects) {
       if (rule.path == secret || rule.path == link) continue;
@@ -458,15 +581,16 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         (output_mask & (WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES)) ||
         !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
     checkpoint("appcontainer-metadata-boundary");
-    const DWORD package_result = RunResourceIdentityProbe(tool, root, profile.sid, false);
+    const DWORD package_result = RunResourceIdentityProbe(tool, root, resources, false);
     ResourceContractDiagnostic(stage, __LINE__, package_result, "primary-package-mutation-and-evidence-result");
     if (package_result != 0) return ResourceContractFailure(stage, __LINE__, package_result);
     // The sibling may execute the probe but receives no evidence/input grant.
-    auto sibling_tool = GrantRunResourceAccess(tool, second.sid, RunResourceAccess::ToolReadExecute, policy);
-    const DWORD sibling_result = RunResourceIdentityProbe(tool, root, second.sid, true);
+    sibling_resources.state->grants.push_back(GrantRunResourceAccess(tool, second.sid,
+        RunResourceAccess::ToolReadExecute, policy));
+    const DWORD sibling_result = RunResourceIdentityProbe(tool, root, sibling_resources, true);
     ResourceContractDiagnostic(stage, __LINE__, sibling_result, "sibling-package-mutation-and-write-denial-result");
     if (sibling_result != 0) return ResourceContractFailure(stage, __LINE__, sibling_result);
-    const DWORD sibling_tool_remove = sibling_tool->Remove();
+    const DWORD sibling_tool_remove = sibling_resources.state->grants.back()->Remove();
     if (sibling_tool_remove != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, sibling_tool_remove);
     // A separate thread attempts namespace mutation while grants remain held.
     checkpoint("concurrent-mutations");

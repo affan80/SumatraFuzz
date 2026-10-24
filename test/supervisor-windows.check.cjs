@@ -390,6 +390,28 @@ test('run resource ACL foundation constrains grants, proof identity and rollback
   assert.match(binding, /userenv\.lib/);
 });
 
+test('resource fixture is protected at creation and unconfirmed children retain ownership', () => {
+  const fixture = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/ci-supervisor-check.ps1'),
+    'utf8',
+  );
+  const probe = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
+    'utf8',
+  );
+  assert.match(fixture, /CreateDirectoryW\(path, ref attributes\)/);
+  assert.match(fixture, /O:BAG:BAD:P\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)/);
+  assert.doesNotMatch(fixture, /New-Item[^\n]*-Path \$resourceRoot/);
+  assert.doesNotMatch(fixture, /icacls \$resourceRoot \/(?:inheritance|grant|setowner)/);
+  assert.match(fixture, /resource-child-pending/);
+  assert.match(probe, /struct ResourceProbeQuarantine/);
+  assert.match(probe, /quarantine->resources = std::move\(resources.state\)/);
+  assert.match(probe, /if \(drained != WAIT_OBJECT_0\)/);
+  assert.match(probe, /resource-drain-failure-contract/);
+  assert.match(probe, /TerminationDenied/);
+  assert.match(probe, /DrainWaitFailed/);
+});
+
 test('native resource contract reports every early-return branch', () => {
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
@@ -407,8 +429,8 @@ test('native resource contract reports every early-return branch', () => {
   assert.match(contract, /parent-pin-control/);
   assert.match(contract, /reject-untrusted-metadata-writer/);
   assert.match(contract, /trusted-owner-metadata-positive-control/);
-  assert.match(contract, /RunResourceIdentityProbe\(tool, root, profile.sid, false\)/);
-  assert.match(contract, /RunResourceIdentityProbe\(tool, root, second.sid, true\)/);
+  assert.match(contract, /RunResourceIdentityProbe\(tool, root, resources, false\)/);
+  assert.match(contract, /RunResourceIdentityProbe\(tool, root, sibling_resources, true\)/);
   assert.match(probe, /TokenAppContainerSid/);
   assert.match(probe, /error != ERROR_ACCESS_DENIED\) failed \|= 0x10/);
   const joined = contract.indexOf('mutation.join();');
@@ -428,6 +450,10 @@ test('Windows run resources bind proof identities, reject mutations and roll bac
   const root = mkdtempSync(
     path.join(process.env.SUMATRAFUZZ_RESOURCE_ROOT, 'sumatrafuzz-resources-'),
   );
+  // Set before spawn so even a watchdog-killed probe leaves its fixture and
+  // account intact. Clear only after the complete native contract succeeds.
+  const pending = path.join(root, '.resource-child-pending');
+  writeFileSync(pending, 'Resource contract not yet confirmed drained');
   try {
     const result = spawnSync(probe, ['--run-resource-contract', root], {
       encoding: 'utf8',
@@ -444,8 +470,16 @@ test('Windows run resources bind proof identities, reject mutations and roll bac
       0,
       'native resource contract must deny every mutation and preserve child writes',
     );
+    assert.match(result.stderr, /timeout-confirmed-exit-cleanup-PASS/);
+    assert.match(result.stderr, /termination-denied-live-quarantine-recovery-PASS/);
+    assert.match(result.stderr, /wait-failed-quarantine-recovery-PASS/);
+    rmSync(pending);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    if (existsSync(pending)) {
+      t.diagnostic(`Resource child drain unconfirmed; retaining fixture: ${root}`);
+    } else {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

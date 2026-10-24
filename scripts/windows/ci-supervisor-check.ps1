@@ -43,6 +43,7 @@ $worldLowWriteSentinel = Join-Path $temp 'world-low-write-sentinel'
 $authenticatedLowWriteSentinel = Join-Path $temp 'authenticated-low-write-sentinel'
 $proc = $null
 $started = $false
+$resourceCreated = $false
 try {
     $user = New-LocalUser -Name $account -Password $password -AccountNeverExpires -PasswordNeverExpires
     Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')) -Member $user
@@ -93,13 +94,47 @@ try {
     $null = New-Item -ItemType Directory -Path $protected -Force
     Set-Content -LiteralPath $credentialSentinel -Value 'service-only trust and DPAPI sentinel' -NoNewline
     $standardUser = "$env:COMPUTERNAME\$account"
-    $null = New-Item -ItemType Directory -Path $resourceRoot
-    & icacls $resourceRoot /inheritance:r
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect resource admission fixture' }
-    & icacls $resourceRoot /grant:r "${standardUser}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot set resource admission fixture ACL' }
-    & icacls $resourceRoot /setowner '*S-1-5-32-544'
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted resource fixture owner' }
+    # Supply the protected DACL and trusted owner in the creation syscall: an
+    # inherited-ACL interval would permit historical FILE_WRITE_ATTRIBUTES handles.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class ProtectedResourceFixture {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes {
+        public int Length;
+        public IntPtr Descriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+    }
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string descriptor, uint revision, out IntPtr security, out uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectoryW(string path, ref SecurityAttributes attributes);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+    public static void Create(string path, string workerSid) {
+        IntPtr descriptor;
+        uint size;
+        string sddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + workerSid + ")";
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out descriptor, out size))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            var attributes = new SecurityAttributes {
+                Length = Marshal.SizeOf<SecurityAttributes>(), Descriptor = descriptor, InheritHandle = false
+            };
+            // ERROR_ALREADY_EXISTS is a hard failure; never reuse or repair a path.
+            if (!CreateDirectoryW(path, ref attributes))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        } finally { LocalFree(descriptor); }
+    }
+}
+'@
+    [ProtectedResourceFixture]::Create($resourceRoot, $user.SID.Value)
+    $resourceCreated = $true
     & icacls $resourceRoot /setintegritylevel '(OI)(CI)L'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot set resource fixture integrity' }
     & icacls $protected /grant:r "${standardUser}:(RX)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)'
@@ -155,8 +190,15 @@ try {
         if ($started -and -not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(30000) }
         $proc.Dispose()
     }
-    if (Test-Path -LiteralPath $resourceRoot) { Remove-Item -LiteralPath $resourceRoot -Recurse -Force }
-    if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $account }
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    # A killed/timed-out native probe can leave an unconfirmed child. Preserve
+    # its ACLs, profile account, and fixture for the lifetime of this CI runner.
+    $pendingChildren = $resourceCreated -and @(Get-ChildItem -LiteralPath $resourceRoot -Recurse -Force -Filter '.resource-child-pending' -ErrorAction Stop).Count -gt 0
+    if ($pendingChildren) {
+        Write-Warning "Resource child drain unconfirmed; retaining fixture and account: $resourceRoot"
+    } else {
+        if ($resourceCreated) { Remove-Item -LiteralPath $resourceRoot -Recurse -Force }
+        if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $account }
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    }
     $password.Dispose()
 }
