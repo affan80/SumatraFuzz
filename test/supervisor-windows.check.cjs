@@ -354,15 +354,24 @@ test('run resource ACL foundation constrains grants, proof identity and rollback
   const headerPath = path.join(__dirname, '..', 'native/worker-supervisor/include/run_resources.h');
   assert.ok(existsSync(headerPath), 'production run resource owner must exist');
   const header = readFileSync(headerPath, 'utf8');
-  const addon = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'), 'utf8');
-  const binding = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/binding.gyp'), 'utf8');
+  const addon = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
+    'utf8',
+  );
+  const binding = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/binding.gyp'),
+    'utf8',
+  );
   assert.match(header, /struct AppContainerProfile/);
   assert.match(header, /CreateAppContainerProfile[\s\S]*?nullptr, 0,/);
   assert.doesNotMatch(header, /DeriveAppContainerSidFromAppContainerName/);
   assert.match(header, /DeleteAppContainerProfile/);
   assert.match(header, /SECURITY_APP_PACKAGE_BASE_RID/);
   assert.match(header, /SECURITY_APP_PACKAGE_RID_COUNT/);
-  assert.doesNotMatch(header, /WinWorldSid|WinAuthenticatedUserSid|WinInteractiveSid|WinBuiltinUsersSid|GENERIC_ALL|FILE_ALL_ACCESS/);
+  assert.doesNotMatch(
+    header,
+    /WinWorldSid|WinAuthenticatedUserSid|WinInteractiveSid|WinBuiltinUsersSid|GENERIC_ALL|FILE_ALL_ACCESS/,
+  );
   assert.match(header, /FILE_FLAG_OPEN_REPARSE_POINT/);
   assert.match(header, /path\.size\(\) < 3/);
   assert.match(header, /key\.size\(\) == 3/);
@@ -378,16 +387,41 @@ test('run resource ACL foundation constrains grants, proof identity and rollback
   assert.match(binding, /userenv\.lib/);
 });
 
+test('native resource contract reports every early-return branch', () => {
+  const probe = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
+    'utf8',
+  );
+  const contract = probe.slice(
+    probe.indexOf('bool RunResourceContract('),
+    probe.indexOf('void WriteAppContainerDiagnostic(const char* message, DWORD length) {'),
+  );
+  assert.match(contract, /ResourceContractFailure\(stage, __LINE__, GetLastError\(\)\)/);
+  assert.doesNotMatch(contract, /return false;/);
+  assert.match(probe, /resource-contract: stage=%s line=%d win32=%lu/);
+});
+
 test('Windows run resources bind proof identities, reject mutations and roll back setup', {
   skip: process.platform !== 'win32',
 }, (t) => {
   const probe = path.join(__dirname, '..', 'build/worker-supervisor/Debug/process_probe.exe');
   const root = mkdtempSync(path.join(os.tmpdir(), 'sumatrafuzz-resources-'));
   try {
-    const result = spawnSync(probe, ['--run-resource-contract', root], { encoding: 'utf8', timeout: 60000 });
+    const result = spawnSync(probe, ['--run-resource-contract', root], {
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    t.diagnostic(
+      `native resource result: status=${result.status} signal=${result.signal} stdoutBytes=${result.stdout?.length ?? 0} stderrBytes=${result.stderr?.length ?? 0}`,
+    );
+    if (result.stdout) t.diagnostic(result.stdout.trim());
     if (result.stderr) t.diagnostic(result.stderr.trim());
     assert.ifError(result.error);
-    assert.equal(result.status, 0, 'native resource contract must deny every mutation and preserve child writes');
+    assert.equal(
+      result.status,
+      0,
+      'native resource contract must deny every mutation and preserve child writes',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

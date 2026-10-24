@@ -18,6 +18,22 @@
 
 namespace {
 
+void WriteAppContainerDiagnostic(const char* message, DWORD length);
+
+void ResourceContractDiagnostic(const char* stage, int line, DWORD error, const char* detail) {
+  char message[1024]{};
+  const int length = std::snprintf(message, sizeof(message),
+      "resource-contract: stage=%s line=%d win32=%lu detail=%s\n", stage, line,
+      static_cast<unsigned long>(error), detail);
+  if (length > 0 && static_cast<size_t>(length) < sizeof(message))
+    WriteAppContainerDiagnostic(message, static_cast<DWORD>(length));
+}
+
+bool ResourceContractFailure(const char* stage, int line, DWORD error) {
+  ResourceContractDiagnostic(stage, line, error, "FAIL");
+  return false;
+}
+
 // Real helper contract: no child launch here (Task 3 owns token integration).
 DWORD PackageAceMask(const std::wstring& path, PSID sid) {
   PACL acl = nullptr;
@@ -25,7 +41,11 @@ DWORD PackageAceMask(const std::wstring& path, PSID sid) {
   DWORD mask = 0;
   const DWORD result = GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION, nullptr, nullptr, &acl, nullptr, &descriptor);
-  if (result != ERROR_SUCCESS || !acl) throw std::runtime_error("contract ACL query failed");
+  if (result != ERROR_SUCCESS || !acl) {
+    if (descriptor) LocalFree(descriptor);
+    throw std::system_error(result == ERROR_SUCCESS ? ERROR_INVALID_ACL : result,
+                            std::system_category(), "contract ACL query failed");
+  }
   for (DWORD i = 0; i < acl->AceCount; ++i) {
     void* entry = nullptr;
     if (!GetAce(acl, i, &entry)) { LocalFree(descriptor); throw std::runtime_error("contract ACE query failed"); }
@@ -62,17 +82,25 @@ bool SetContractJunction(HANDLE handle, const std::wstring& destination) {
 
 bool RunResourceContract(const std::wstring& supplied_root) {
   using namespace sumatrafuzz::supervisor;
+  const char* stage = "entry";
+  const auto checkpoint = [&](const char* next) {
+    stage = next;
+    ResourceContractDiagnostic(stage, __LINE__, ERROR_SUCCESS, "BEGIN");
+  };
+  checkpoint(stage);
   try {
     // Windows TEMP may use an 8.3 alias. Authorize the canonical fixture root,
     // just as Task 3 must bind its policy to held proof handles.
+    checkpoint("canonical-root");
     auto root_handle = OpenRunResource(supplied_root, FILE_READ_ATTRIBUTES, true);
     std::wstring root(32768, L'\0');
     const DWORD root_length = GetFinalPathNameByHandleW(root_handle.value, root.data(),
         static_cast<DWORD>(root.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (root_length < 4 || root_length >= root.size()) return false;
+    if (root_length < 4 || root_length >= root.size()) return ResourceContractFailure(stage, __LINE__, GetLastError());
     root.resize(root_length);
     root.erase(0, 4);
-    if (ResourcePathKey(L"C:\\") != L"c:\\") return false;
+    checkpoint("volume-root-key");
+    if (ResourcePathKey(L"C:\\") != L"c:\\") return ResourceContractFailure(stage, __LINE__, GetLastError());
     const std::wstring tool = root + L"\\tool.exe";
     const std::wstring input_dir = root + L"\\inputs";
     const std::wstring input = input_dir + L"\\input.pdf";
@@ -80,13 +108,16 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     const std::wstring sibling = root + L"\\sibling";
     const std::wstring secret = root + L"\\credentials";
     const std::wstring link = root + L"\\alias.pdf";
-    if (!CreateDirectoryW(input_dir.c_str(), nullptr)) return false;
+    checkpoint("create-input-directory");
+    if (!CreateDirectoryW(input_dir.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     for (const auto& file : {tool, input, secret}) {
+      checkpoint(file == tool ? "create-tool-file" : file == input ? "create-input-file" : "create-secret-file");
       ResourceHandle created(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                         FILE_ATTRIBUTE_NORMAL, nullptr));
-      if (created.value == INVALID_HANDLE_VALUE) return false;
+      if (created.value == INVALID_HANDLE_VALUE) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
-    if (!CreateDirectoryW(output.c_str(), nullptr) || !CreateDirectoryW(sibling.c_str(), nullptr)) return false;
+    checkpoint("create-evidence-sibling");
+    if (!CreateDirectoryW(output.c_str(), nullptr) || !CreateDirectoryW(sibling.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     std::vector<ResourceHandle> proof_handles;
     const auto rule = [&](const std::wstring& path, RunResourceAccess access) {
       proof_handles.emplace_back(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
@@ -95,57 +126,65 @@ bool RunResourceContract(const std::wstring& supplied_root) {
       if (proof_handles.back().value == INVALID_HANDLE_VALUE) throw std::runtime_error("proof fixture open");
       return RunResourceRule{path, access, proof_handles.back().value};
     };
+    checkpoint("build-proof-policy");
     RunResourcePolicy policy{{rule(tool, RunResourceAccess::ToolReadExecute),
                              rule(input, RunResourceAccess::InputRead),
                              rule(input_dir, RunResourceAccess::InputRead),
                              rule(output, RunResourceAccess::EvidenceModify),
                              rule(secret, RunResourceAccess::EvidenceModify)}, {secret}};
+    checkpoint("create-run-profiles");
     RunResources resources;
     resources.state->profile = CreateRunAppContainerProfile();
     auto& profile = resources.state->profile;
     auto second = CreateRunAppContainerProfile();
-    if (!IsRunPackageSid(profile.sid) || EqualSid(profile.sid, second.sid) || profile.name.size() > 64) return false;
+    if (!IsRunPackageSid(profile.sid) || EqualSid(profile.sid, second.sid) || profile.name.size() > 64) return ResourceContractFailure(stage, __LINE__, GetLastError());
     const auto rejected = [&](const std::wstring& path, RunResourceAccess access, PSID identity) {
       try { auto unexpected = GrantRunResourceAccess(path, identity, access, policy); }
       catch (const std::system_error&) { return true; }
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     };
+    checkpoint("excluded-volume");
     RunResourcePolicy volume_policy{{rule(output, RunResourceAccess::EvidenceModify)}, {root.substr(0, 3)}};
     try {
       auto denied_volume = GrantRunResourceAccess(output, profile.sid, RunResourceAccess::EvidenceModify, volume_policy);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error&) {}
+    checkpoint("reject-volume-grant");
     RunResourcePolicy volume_grant{{rule(root.substr(0, 3), RunResourceAccess::InputRead)}, {}};
     try {
       auto denied_root = GrantRunResourceAccess(root.substr(0, 3), profile.sid, RunResourceAccess::InputRead, volume_grant);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error&) {}
+    checkpoint("reject-missing-proof");
     RunResourcePolicy missing_proof{{{input, RunResourceAccess::InputRead}}, {}};
     try {
       auto unbound = GrantRunResourceAccess(input, profile.sid, RunResourceAccess::InputRead, missing_proof);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error& error) {
       if (error.code().value() != ERROR_INVALID_HANDLE) throw;
     }
     // A stale path authorization must not grant the replacement object.
+    checkpoint("create-replacement-fixture");
     const std::wstring replaced = root + L"\\replaced.pdf";
     {
       ResourceHandle created(CreateFileW(replaced.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-      if (created.value == INVALID_HANDLE_VALUE) return false;
+      if (created.value == INVALID_HANDLE_VALUE) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
+    checkpoint("replace-after-proof");
     RunResourcePolicy replacement_policy{{rule(replaced, RunResourceAccess::InputRead)}, {}};
-    if (!MoveFileExW(replaced.c_str(), (root + L"\\former.pdf").c_str(), 0)) return false;
+    if (!MoveFileExW(replaced.c_str(), (root + L"\\former.pdf").c_str(), 0)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     {
       ResourceHandle created(CreateFileW(replaced.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-      if (created.value == INVALID_HANDLE_VALUE) return false;
+      if (created.value == INVALID_HANDLE_VALUE) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
     try {
       auto unauthorized = GrantRunResourceAccess(replaced, profile.sid, RunResourceAccess::InputRead, replacement_policy);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error& error) {
       if (error.code().value() != ERROR_FILE_INVALID) throw;
     }
-    if (PackageAceMask(replaced, profile.sid)) return false;
+    if (PackageAceMask(replaced, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    checkpoint("reject-broad-excluded-unselected");
     BYTE broad[SECURITY_MAX_SID_SIZE]{};
     DWORD broad_size = sizeof(broad);
     if (!CreateWellKnownSid(WinWorldSid, nullptr, broad, &broad_size) ||
@@ -153,42 +192,49 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         !rejected(sibling, RunResourceAccess::EvidenceModify, profile.sid) ||
         !rejected(secret, RunResourceAccess::EvidenceModify, profile.sid) ||
         !rejected(input, RunResourceAccess::ToolReadExecute, profile.sid) ||
-        !rejected(root + L"\\evidence\\..\\input.pdf", RunResourceAccess::InputRead, profile.sid)) return false;
-    if (!CreateHardLinkW(link.c_str(), input.c_str(), nullptr)) return false;
+        !rejected(root + L"\\evidence\\..\\input.pdf", RunResourceAccess::InputRead, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    checkpoint("create-initial-hardlink");
+    if (!CreateHardLinkW(link.c_str(), input.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     policy.objects.push_back(rule(link, RunResourceAccess::InputRead));
-    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
-    if (!DeleteFileW(link.c_str())) return false;
+    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    checkpoint("delete-initial-hardlink");
+    if (!DeleteFileW(link.c_str())) return ResourceContractFailure(stage, __LINE__, GetLastError());
     // Directory junctions are rejected without requiring symlink privileges.
-    if (!CreateDirectoryW(link.c_str(), nullptr)) return false;
+    checkpoint("create-junction-directory");
+    if (!CreateDirectoryW(link.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     {
       ResourceHandle reparse(CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-      if (!SetContractJunction(reparse.value, sibling)) return false;
+      if (!SetContractJunction(reparse.value, sibling)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
+    checkpoint("reject-junction");
     policy.objects.back() = rule(link, RunResourceAccess::InputRead);
-    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
+    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     // Existing data writers must prevent acquiring a supposedly stable pin.
+    checkpoint("reject-existing-writer");
     for (const auto& directory : {output, input_dir}) {
       ResourceHandle writer(CreateFileW(directory.c_str(), GENERIC_WRITE,
           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
           FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-      if (writer.value == INVALID_HANDLE_VALUE) return false;
+      if (writer.value == INVALID_HANDLE_VALUE) return ResourceContractFailure(stage, __LINE__, GetLastError());
       try {
         auto unstable = GrantRunResourceAccess(directory == output ? output : input, profile.sid,
             directory == output ? RunResourceAccess::EvidenceModify : RunResourceAccess::InputRead, policy);
-        return false;
+        return ResourceContractFailure(stage, __LINE__, GetLastError());
       } catch (const std::system_error& error) {
         if (error.code().value() != ERROR_SHARING_VIOLATION) throw;
       }
     }
+    checkpoint("reject-writable-file");
     RunResourcePolicy writable_file{{rule(input, RunResourceAccess::EvidenceModify)}, {}};
     try {
       auto unstable_file = GrantRunResourceAccess(input, profile.sid, RunResourceAccess::EvidenceModify, writable_file);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error& error) {
       if (error.code().value() != ERROR_ACCESS_DENIED) throw;
     }
     // Partial setup owns a profile too: unwind it only after undoing grants.
+    checkpoint("partial-setup-rollback");
     std::wstring partial_name;
     std::vector<BYTE> partial_sid;
     try {
@@ -196,22 +242,25 @@ bool RunResourceContract(const std::wstring& supplied_root) {
       partial.state->profile = CreateRunAppContainerProfile();
       partial_name = partial.state->profile.name;
       partial_sid.resize(GetLengthSid(partial.state->profile.sid));
-      if (!CopySid(static_cast<DWORD>(partial_sid.size()), partial_sid.data(), partial.state->profile.sid)) return false;
+      if (!CopySid(static_cast<DWORD>(partial_sid.size()), partial_sid.data(), partial.state->profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
       partial.state->grants.push_back(GrantRunResourceAccess(output, partial.state->profile.sid,
           RunResourceAccess::EvidenceModify, policy));
       auto denied = GrantRunResourceAccess(sibling, partial.state->profile.sid, RunResourceAccess::EvidenceModify, policy);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error&) {}
-    if (partial_name.empty() || partial_sid.empty() || PackageAceMask(output, partial_sid.data()) != 0) return false;
+    if (partial_name.empty() || partial_sid.empty() || PackageAceMask(output, partial_sid.data()) != 0) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    checkpoint("verify-partial-profile-deletion");
     PSID recreated_partial = nullptr;
-    if (FAILED(CreateAppContainerProfile(partial_name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated_partial))) return false;
+    if (FAILED(CreateAppContainerProfile(partial_name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated_partial))) return ResourceContractFailure(stage, __LINE__, GetLastError());
     const HRESULT removed_partial = DeleteAppContainerProfile(partial_name.c_str());
     FreeSid(recreated_partial);
-    if (FAILED(removed_partial)) return false;
+    if (FAILED(removed_partial)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    checkpoint("grant-resource-policy");
     for (const auto& rule : policy.objects) {
       if (rule.path == secret || rule.path == link) continue;
       resources.state->grants.push_back(GrantRunResourceAccess(rule.path, profile.sid, rule.access, policy));
     }
+    checkpoint("verify-resource-masks");
     const DWORD tool_mask = PackageAceMask(tool, profile.sid);
     const DWORD input_mask = PackageAceMask(input, profile.sid);
     const DWORD output_mask = PackageAceMask(output, profile.sid);
@@ -221,8 +270,9 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         !(input_mask & FILE_READ_DATA) || (input_mask & (FILE_EXECUTE | FILE_WRITE_DATA | DELETE | WRITE_DAC)) ||
         (output_mask & (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD)) != (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD) ||
         (output_mask & (WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES)) ||
-        !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return false;
+        !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return ResourceContractFailure(stage, __LINE__, GetLastError());
     // A separate thread attempts namespace mutation while grants remain held.
+    checkpoint("concurrent-mutations");
     bool mutation_denied = false;
     std::thread mutation([&] {
       const auto rename_denied = [&](const std::wstring& from, const std::wstring& to, DWORD flags) {
@@ -250,18 +300,22 @@ bool RunResourceContract(const std::wstring& supplied_root) {
           nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
       DWORD written = 0;
       const bool output_writable = child.value != INVALID_HANDLE_VALUE && WriteFile(child.value, "x", 1, &written, nullptr) && written == 1;
-      std::fprintf(stderr, "resource-pin: inputRenameDenied=%d ancestorRenameDenied=%d evidenceRenameDenied=%d replacementDenied=%d writeOpenDenied=%d metadataRetargetDenied=%d metadataError=%lu inputHardlinkDenied=%d inputLinkError=%lu toolHardlinkDenied=%d toolLinkError=%lu childWrite=%d\n",
+      char mutation_message[1024]{};
+      const int mutation_length = std::snprintf(mutation_message, sizeof(mutation_message), "resource-pin: inputRenameDenied=%d ancestorRenameDenied=%d evidenceRenameDenied=%d replacementDenied=%d writeOpenDenied=%d metadataRetargetDenied=%d metadataError=%lu inputHardlinkDenied=%d inputLinkError=%lu toolHardlinkDenied=%d toolLinkError=%lu childWrite=%d\n",
           input_pinned, ancestor_pinned, output_pinned, replacement_pinned, retarget_denied,
           metadata_retarget_denied, static_cast<unsigned long>(metadata_retarget_error),
           !input_linked, static_cast<unsigned long>(input_link_error), !tool_linked,
           static_cast<unsigned long>(tool_link_error), output_writable);
+      if (mutation_length > 0 && static_cast<size_t>(mutation_length) < sizeof(mutation_message))
+        WriteAppContainerDiagnostic(mutation_message, static_cast<DWORD>(mutation_length));
       mutation_denied = input_pinned && ancestor_pinned && output_pinned && replacement_pinned &&
           retarget_denied && metadata_retarget_denied && !input_linked && !tool_linked && output_writable;
     });
     mutation.join();
     // Case-sensitive NTFS can resolve folded-equal names to different IDs.
+    checkpoint("create-case-sensitive-directory");
     const std::wstring case_dir = root + L"\\case-sensitive";
-    if (!CreateDirectoryW(case_dir.c_str(), nullptr)) return false;
+    if (!CreateDirectoryW(case_dir.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     {
       ResourceHandle directory(CreateFileW(case_dir.c_str(), FILE_WRITE_ATTRIBUTES | FILE_ADD_FILE |
           FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -272,46 +326,58 @@ bool RunResourceContract(const std::wstring& supplied_root) {
           static_cast<FILE_INFO_BY_HANDLE_CLASS>(23), &case_sensitive, sizeof(case_sensitive)))
         throw std::system_error(GetLastError(), std::system_category(), "case-sensitive fixture required");
     }
+    checkpoint("create-case-distinct-files");
     const std::wstring lower = case_dir + L"\\input.pdf";
     const std::wstring upper = case_dir + L"\\INPUT.pdf";
     for (const auto& name : {lower, upper}) {
       ResourceHandle created(CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
           FILE_FLAG_POSIX_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr));
-      if (created.value == INVALID_HANDLE_VALUE) return false;
+      if (created.value == INVALID_HANDLE_VALUE) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
+    checkpoint("reject-case-distinct-identity");
     RunResourcePolicy case_policy{{rule(lower, RunResourceAccess::InputRead)}, {}};
     try {
       auto unauthorized = GrantRunResourceAccess(upper, profile.sid, RunResourceAccess::InputRead, case_policy);
-      return false;
+      return ResourceContractFailure(stage, __LINE__, GetLastError());
     } catch (const std::system_error& error) {
       if (error.code().value() != ERROR_FILE_INVALID) throw;
     }
-    if (PackageAceMask(upper, profile.sid)) return false;
+    if (PackageAceMask(upper, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     {
       auto correct_case = GrantRunResourceAccess(lower, profile.sid, RunResourceAccess::InputRead, case_policy);
-      if (!PackageAceMask(lower, profile.sid)) return false;
+      if (!PackageAceMask(lower, profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     }
-    std::fprintf(stderr, "resource-identity: replacementDenied=1 caseDistinctDenied=1 correctCaseGranted=1\n");
+    ResourceContractDiagnostic(stage, __LINE__, ERROR_SUCCESS,
+        "replacementDenied=1 caseDistinctDenied=1 correctCaseGranted=1");
     if (!mutation_denied) throw std::runtime_error("pinned mutation or writable child regression");
     // A concurrent independent package grant must survive our rollback.
+    checkpoint("preserve-other-package-grant");
     auto unrelated = GrantRunResourceAccess(output, second.sid, RunResourceAccess::EvidenceModify, policy);
     std::vector<BYTE> first_sid(GetLengthSid(profile.sid));
-    if (!CopySid(static_cast<DWORD>(first_sid.size()), first_sid.data(), profile.sid)) return false;
+    if (!CopySid(static_cast<DWORD>(first_sid.size()), first_sid.data(), profile.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     const std::wstring name = profile.name;
+    checkpoint("close-moved-resources");
     RunResources moved(std::move(resources));
-    if (resources.Close() != ERROR_SUCCESS || moved.Close() != ERROR_SUCCESS) return false;
+    if (resources.Close() != ERROR_SUCCESS || moved.Close() != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, GetLastError());
     if (PackageAceMask(tool, first_sid.data()) || PackageAceMask(input, first_sid.data()) || PackageAceMask(input_dir, first_sid.data()) ||
-        PackageAceMask(output, first_sid.data()) || !PackageAceMask(output, second.sid)) return false;
-    if (unrelated->Remove() != ERROR_SUCCESS || second.Close() != ERROR_SUCCESS) return false;
+        PackageAceMask(output, first_sid.data()) || !PackageAceMask(output, second.sid)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    if (unrelated->Remove() != ERROR_SUCCESS || second.Close() != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, GetLastError());
     // Creation with the exact former name succeeds only after actual deletion.
+    checkpoint("verify-final-profile-deletion");
     PSID recreated = nullptr;
-    if (FAILED(CreateAppContainerProfile(name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated))) return false;
+    if (FAILED(CreateAppContainerProfile(name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated))) return ResourceContractFailure(stage, __LINE__, GetLastError());
     const HRESULT deleted = DeleteAppContainerProfile(name.c_str());
     FreeSid(recreated);
-    return SUCCEEDED(deleted);
+    if (FAILED(deleted)) return ResourceContractFailure(stage, __LINE__, HRESULT_CODE(deleted));
+    ResourceContractDiagnostic(stage, __LINE__, ERROR_SUCCESS, "PASS");
+    return true;
+  } catch (const std::system_error& error) {
+    const DWORD code = static_cast<DWORD>(error.code().value());
+    ResourceContractDiagnostic(stage, __LINE__, code, error.what());
+    return ResourceContractFailure(stage, __LINE__, code);
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "run-resource contract failed: %s\n", error.what());
-    return false;
+    ResourceContractDiagnostic(stage, __LINE__, GetLastError(), error.what());
+    return ResourceContractFailure(stage, __LINE__, GetLastError());
   }
 }
 
