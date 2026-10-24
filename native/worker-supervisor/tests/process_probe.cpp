@@ -95,8 +95,7 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
     CloseHandle(impersonation_token);
     return error;
   }
-  constexpr DWORD kEventQueryState = 0x0001;
-  GENERIC_MAPPING event_mapping{READ_CONTROL | kEventQueryState | SYNCHRONIZE,
+  GENERIC_MAPPING event_mapping{READ_CONTROL | SYNCHRONIZE,
                                 READ_CONTROL | EVENT_MODIFY_STATE,
                                 READ_CONTROL | SYNCHRONIZE, EVENT_ALL_ACCESS};
   PRIVILEGE_SET privileges{};
