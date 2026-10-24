@@ -24,6 +24,9 @@ test('required Windows workflow exercises the installed service over authenticat
   assert.match(acceptance, /WORKER_SERVICE_VERIFY_FORCED_TERMINATION/);
   assert.match(acceptance, /forced_service_termination_recovered_without_completion/);
   assert.match(acceptance, /slot_remained_reserved_after_forced_termination/);
+  assert.match(acceptance, /steady_state_requests_per_second/);
+  assert.match(acceptance, /latency_ms:[\s\S]*?p95/);
+  assert.match(acceptance, /concurrent_burst_rate_limited/);
   assert.match(acceptance, /organization-private\.pem/);
   assert.doesNotMatch(acceptance, /new WorkerRunCoordinator/);
 

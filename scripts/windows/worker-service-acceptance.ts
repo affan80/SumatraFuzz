@@ -14,6 +14,9 @@ const nativeRoot = path.join(root, 'runs', 'worker-native');
 const summaryPath = path.join(nativeRoot, 'acceptance-summary.json');
 const minimumExecutions = 1_000;
 const maxWaitMs = 10 * 60_000;
+const steadyRequestCount = 60;
+const steadyRequestIntervalMs = 100;
+const burstRequestCount = 8;
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type FixtureProfile = {
@@ -70,6 +73,67 @@ function client(profile: FixtureProfile) {
     workerFingerprint: profile.workerFingerprint,
     timeoutMs: 30_000,
   });
+}
+
+function percentile(sorted: readonly number[], ratio: number): number {
+  return Number(sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1)]?.toFixed(3));
+}
+
+async function measureApiBudget(profile: FixtureProfile, runId: string) {
+  const controller = client(profile);
+  const latencies: number[] = [];
+  const startedAt = performance.now();
+  try {
+    for (let index = 0; index < steadyRequestCount; index += 1) {
+      const requestStartedAt = performance.now();
+      const run = await controller.getRun(runId);
+      invariant(run.run_id === runId, 'steady API measurement returned a different run');
+      latencies.push(performance.now() - requestStartedAt);
+      const nextRequestAt = startedAt + (index + 1) * steadyRequestIntervalMs;
+      await pause(Math.max(0, nextRequestAt - performance.now()));
+    }
+  } finally {
+    controller.close();
+  }
+
+  const elapsedMs = performance.now() - startedAt;
+  const sortedLatencies = [...latencies].sort((left, right) => left - right);
+  const burstClients = Array.from({ length: burstRequestCount }, () => client(profile));
+  let outcomes: number[];
+  try {
+    outcomes = await Promise.all(
+      burstClients.map(async (burstClient) => {
+        try {
+          const run = await burstClient.getRun(runId);
+          invariant(run.run_id === runId, 'burst API measurement returned a different run');
+          return 200;
+        } catch (error) {
+          if (error instanceof WorkerClientError) return error.status;
+          throw error;
+        }
+      }),
+    );
+  } finally {
+    for (const burstClient of burstClients) burstClient.close();
+  }
+  const burstSucceeded = outcomes.filter((status) => status === 200).length;
+  const burstRateLimited = outcomes.filter((status) => status === 429).length;
+  invariant(burstSucceeded > 0 && burstRateLimited > 0, 'concurrent API burst did not exercise both admission outcomes');
+
+  return {
+    target_requests_per_second: 10,
+    steady_state_requests: latencies.length,
+    steady_state_elapsed_ms: Number(elapsedMs.toFixed(3)),
+    steady_state_requests_per_second: Number((latencies.length / (elapsedMs / 1000)).toFixed(3)),
+    latency_ms: {
+      p50: percentile(sortedLatencies, 0.5),
+      p95: percentile(sortedLatencies, 0.95),
+      p99: percentile(sortedLatencies, 0.99),
+    },
+    concurrent_burst_requests: burstRequestCount,
+    concurrent_burst_succeeded: burstSucceeded,
+    concurrent_burst_rate_limited: burstRateLimited,
+  };
 }
 
 async function writeFreshRevocation(profile: FixtureProfile): Promise<string> {
@@ -241,6 +305,7 @@ async function main(): Promise<void> {
     const started = await first.startRun(request);
     invariant(started.state === 'running', 'installed service did not start a running campaign');
     runId = started.run_id;
+    const apiBudgetObservation = await measureApiBudget(firstProfile, started.run_id);
 
     first.close();
     await pause(2_000);
@@ -369,6 +434,7 @@ async function main(): Promise<void> {
       unpaired_certificate_denied: true,
       cross_controller_run_denied: true,
       controller_disconnect_campaign_continued: afterDisconnect.state === 'running',
+      api_budget_observation: apiBudgetObservation,
       forced_termination_run_id: forcedStart.run_id,
       forced_termination_input_bundle_id: secondImported.input_bundle_id,
       live_revocation_destroyed_existing_session: true,

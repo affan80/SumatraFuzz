@@ -890,6 +890,14 @@ describe('worker API contract', () => {
         await continued;
         request.write('P');
         await ended;
+        // The client-side close can race the server's rejected async body iterator.
+        // Wait for a fresh authenticated request to prove the timed-out request lease
+        // (and its per-controller request slot) has actually been released.
+        await vi.waitFor(async () =>
+          expect((await apiRequest(server.address, tlsA, 'GET', '/v1/capabilities')).status).toBe(
+            200,
+          ),
+        );
         const zip = new ZipFile();
         zip.addBuffer(Buffer.from('%PDF-1.4\n%%EOF\n'), 'seed.pdf');
         zip.end();

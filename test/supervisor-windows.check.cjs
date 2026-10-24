@@ -81,13 +81,15 @@ test('Windows supervisor bounds and tears down a child process tree', {
   copyFileSync(probePath, containmentProbePath);
   writeFileSync(inputPath, 'pdf input sentinel');
   writeFileSync(protectedReadPath, 'service-only trust and DPAPI sentinel');
-  // Temporary directories may grant BUILTIN\Users access. Match the worker's
-  // protected trust/credential ACL so adding namespace-only restricting SIDs
-  // cannot accidentally make this sentinel readable to the probe.
-  execFileSync('icacls.exe', [protectedDir, '/inheritance:d', '/T'], { stdio: 'ignore' });
-  execFileSync('icacls.exe', [protectedDir, '/remove:g', '*S-1-5-32-545', '/T'], {
-    stdio: 'ignore',
-  });
+  // Remove inherited temporary-directory grants instead of converting them to
+  // explicit ACEs. Keep only SYSTEM's access so this sentinel models protected
+  // service credentials even when the hosted runner's temp ACL grants broad groups.
+  execFileSync('icacls.exe', [protectedDir, '/inheritance:r', '/T'], { stdio: 'ignore' });
+  execFileSync(
+    'icacls.exe',
+    [protectedDir, '/remove:g', '*S-1-5-32-545', '*S-1-5-11', '*S-1-1-0', '/T'],
+    { stdio: 'ignore' },
+  );
   const baselineEnvironment = { ...process.env };
   delete baselineEnvironment.SUMATRAFUZZ_TEST_SECRET;
   for (const identifiers of [
@@ -164,7 +166,13 @@ test('Windows supervisor bounds and tears down a child process tree', {
       const receipt = supervisor.stopJob(job, 0);
       job = undefined;
       const eventDiagnostic = readdirSync(evidenceDir)
-        .filter((name) => ['named-event-diagnostic.txt', 'namespace-diagnostic.txt'].includes(name))
+        .filter((name) =>
+          [
+            'named-event-diagnostic.txt',
+            'namespace-diagnostic.txt',
+            'containment-diagnostic.txt',
+          ].includes(name),
+        )
         .map((name) => readFileSync(path.join(evidenceDir, name), 'utf8'))
         .join('\n');
       assert.fail(

@@ -61,6 +61,19 @@ void WriteNamespaceFailureDiagnostic(const std::wstring& evidence_dir, unsigned 
   CloseHandle(report);
 }
 
+void WriteContainmentFailureDiagnostic(const std::wstring& evidence_dir, const char* stage,
+                                       DWORD error) {
+  const std::string contents = "containment_stage=" + std::string(stage) +
+      ",win32_error=" + std::to_string(error) + "\n";
+  const std::wstring path = evidence_dir + L"\\containment-diagnostic.txt";
+  HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (report == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  WriteFile(report, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr);
+  CloseHandle(report);
+}
+
 bool ValidAlias(const std::wstring& alias) {
   if (alias.size() != 41 || alias.compare(0, 5, L"SFWR-") != 0) return false;
   for (size_t i = 5; i < alias.size(); ++i) {
@@ -153,22 +166,36 @@ struct ProbeNamespace {
 };
 
 bool ProtectedReadsAndWritesDenied(const std::wstring& protected_read,
-                                   const std::wstring& protected_write) {
+                                   const std::wstring& protected_write,
+                                   const std::wstring& evidence_dir) {
   HANDLE read_file = CreateFileW(protected_read.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (read_file != INVALID_HANDLE_VALUE) {
     CloseHandle(read_file);
+    WriteContainmentFailureDiagnostic(evidence_dir, "protected_read_unexpected_success",
+                                      ERROR_SUCCESS);
     return false;
   }
-  if (GetLastError() != ERROR_ACCESS_DENIED) return false;
+  const DWORD read_error = GetLastError();
+  if (read_error != ERROR_ACCESS_DENIED) {
+    WriteContainmentFailureDiagnostic(evidence_dir, "protected_read", read_error);
+    return false;
+  }
   HANDLE write_file = CreateFileW(protected_write.c_str(), GENERIC_WRITE, 0, nullptr,
                                   CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (write_file != INVALID_HANDLE_VALUE) {
     CloseHandle(write_file);
     DeleteFileW(protected_write.c_str());
+    WriteContainmentFailureDiagnostic(evidence_dir, "protected_write_unexpected_success",
+                                      ERROR_SUCCESS);
     return false;
   }
-  return GetLastError() == ERROR_ACCESS_DENIED;
+  const DWORD write_error = GetLastError();
+  if (write_error != ERROR_ACCESS_DENIED) {
+    WriteContainmentFailureDiagnostic(evidence_dir, "protected_write", write_error);
+    return false;
+  }
+  return true;
 }
 
 bool ReadAllowedInput(const std::wstring& input_path) {
@@ -202,8 +229,15 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   const std::wstring event_name = ns.alias + L"\\" + object_name;
   const bool grandchild = argc > probe_index + 6 && std::wstring(argv[probe_index + 6]) == L"--grandchild";
   const bool child = grandchild || (argc > probe_index + 6 && std::wstring(argv[probe_index + 6]) == L"--child");
-  if (!WriteEvidenceFile(evidence_dir) || !ReadAllowedInput(input_path) ||
-      !ProtectedReadsAndWritesDenied(protected_read, protected_write)) return 21;
+  if (!WriteEvidenceFile(evidence_dir)) {
+    WriteContainmentFailureDiagnostic(evidence_dir, "evidence_write", GetLastError());
+    return 21;
+  }
+  if (!ReadAllowedInput(input_path)) {
+    WriteContainmentFailureDiagnostic(evidence_dir, "input_read", GetLastError());
+    return 21;
+  }
+  if (!ProtectedReadsAndWritesDenied(protected_read, protected_write, evidence_dir)) return 21;
   if (child) {
     HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str());
     if (!event) return 2200 + static_cast<int>(GetLastError());
