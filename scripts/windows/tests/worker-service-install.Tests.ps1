@@ -55,10 +55,10 @@ Describe 'Worker service policy validation' {
     $path = Join-Path $TestDrive 'low-integrity-output'
     [void](New-Item -ItemType Directory -Path $path)
     Set-WorkerOutputLowIntegrity -Path $path
-    $integritySddl = (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm(
-      [Security.AccessControl.AccessControlSections]::Audit
-    )
-    $integritySddl | Should -Match '\(ML;OICI;NW;;;LW\)'
+    $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
+    $integrityAcl = & $icacls $path
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read back the worker output integrity label' }
+    ($integrityAcl -join "`n") | Should -Match 'Low Mandatory Level:\(OI\)\(CI\)\(NW\)'
   }
 
   It 'locks the runtime root and validates every existing descendant before service startup' {
