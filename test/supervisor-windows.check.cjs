@@ -349,12 +349,30 @@ test('Windows supervisor bounds and tears down a child process tree', {
 });
 
 test('AppContainer feasibility probe is Windows-only and fails closed on profile and ACL checks', () => {
-  const workflow = readFileSync(path.join(__dirname, '..', '.github/workflows/electron-typescript.yml'), 'utf8');
-  const fixture = readFileSync(path.join(__dirname, '..', 'scripts/windows/ci-supervisor-check.ps1'), 'utf8');
-  const appContainerScript = readFileSync(path.join(__dirname, '..', 'scripts/windows/tests/appcontainer-probe.ps1'), 'utf8');
-  const nativeProbe = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'), 'utf8');
-  assert.match(workflow, /Test Windows supervisor and AppContainer as a standard user[\s\S]*?if: runner\.os == 'Windows'/);
-  assert.ok(workflow.indexOf('Test native supervisor argument contract') < workflow.indexOf('Test Windows supervisor and AppContainer as a standard user'));
+  const workflow = readFileSync(
+    path.join(__dirname, '..', '.github/workflows/electron-typescript.yml'),
+    'utf8',
+  );
+  const fixture = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/ci-supervisor-check.ps1'),
+    'utf8',
+  );
+  const appContainerScript = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/tests/appcontainer-probe.ps1'),
+    'utf8',
+  );
+  const nativeProbe = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
+    'utf8',
+  );
+  assert.match(
+    workflow,
+    /Test Windows supervisor and AppContainer as a standard user[\s\S]*?if: runner\.os == 'Windows'/,
+  );
+  assert.ok(
+    workflow.indexOf('Test native supervisor argument contract') <
+      workflow.indexOf('Test Windows supervisor and AppContainer as a standard user'),
+  );
   assert.match(fixture, /tests\/appcontainer-probe\.ps1/);
   assert.match(appContainerScript, /if \(-not \$IsWindows\)/);
   assert.match(appContainerScript, /nonadministrator identity/);
@@ -372,10 +390,16 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(nativeProbe, /AppContainerTempPath=/);
   assert.match(nativeProbe, /bool DeleteProbeProfiles\(/);
   assert.match(nativeProbe, /AppContainer profile cleanup failed/);
-  assert.match(nativeProbe, /DeleteProbeProfiles\(profile, second_profile,\s*first_created, second_created\)/);
+  assert.match(
+    nativeProbe,
+    /DeleteProbeProfiles\(profile, second_profile,\s*first_created, second_created\)/,
+  );
   assert.match(nativeProbe, /cleanup_succeeded = DeleteProbeProfiles/);
   assert.match(nativeProbe, /probe exception left profile cleanup incomplete/);
-  assert.match(appContainerScript, /Remove-Item -LiteralPath \$output -Recurse -Force -ErrorAction Stop/);
+  assert.match(
+    appContainerScript,
+    /Remove-Item -LiteralPath \$output -Recurse -Force -ErrorAction Stop/,
+  );
   assert.match(appContainerScript, /AppContainer temporary output directory remains after cleanup/);
   assert.match(fixture, /world-low-write-sentinel/);
   assert.match(fixture, /authenticated-low-write-sentinel/);
