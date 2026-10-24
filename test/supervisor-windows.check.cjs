@@ -348,6 +348,31 @@ test('Windows supervisor bounds and tears down a child process tree', {
   assert.throws(() => supervisor.unprotectSecret(Buffer.from('tampered')));
 });
 
+test('AppContainer feasibility probe is Windows-only and fails closed on profile and ACL checks', () => {
+  const workflow = readFileSync(path.join(__dirname, '..', '.github/workflows/electron-typescript.yml'), 'utf8');
+  const fixture = readFileSync(path.join(__dirname, '..', 'scripts/windows/ci-supervisor-check.ps1'), 'utf8');
+  const appContainerScript = readFileSync(path.join(__dirname, '..', 'scripts/windows/tests/appcontainer-probe.ps1'), 'utf8');
+  const nativeProbe = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'), 'utf8');
+  assert.match(workflow, /Test Windows supervisor and AppContainer as a standard user[\s\S]*?if: runner\.os == 'Windows'/);
+  assert.ok(workflow.indexOf('Test native supervisor argument contract') < workflow.indexOf('Test Windows supervisor and AppContainer as a standard user'));
+  assert.match(fixture, /tests\/appcontainer-probe\.ps1/);
+  assert.match(appContainerScript, /if \(-not \$IsWindows\)/);
+  assert.match(appContainerScript, /nonadministrator identity/);
+  assert.match(appContainerScript, /--appcontainer-probe/);
+  assert.match(nativeProbe, /CreateAppContainerProfile/);
+  assert.match(nativeProbe, /DeleteAppContainerProfile/);
+  assert.match(nativeProbe, /PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES/);
+  assert.match(nativeProbe, /SECURITY_CAPABILITIES/);
+  assert.match(nativeProbe, /CapabilityCount = 0/);
+  assert.match(nativeProbe, /ERROR_ACCESS_DENIED/);
+  assert.match(nativeProbe, /appcontainer-probe-result/);
+  assert.match(nativeProbe, /AppContainerProfilePath=/);
+  assert.match(nativeProbe, /AppContainerTempPath=/);
+  assert.match(fixture, /world-low-write-sentinel/);
+  assert.match(fixture, /authenticated-low-write-sentinel/);
+  assert.match(fixture, /setintegritylevel/);
+});
+
 test('service identity probe rejects a non-service process without returning token data', {
   skip: process.platform !== 'win32',
 }, () => {

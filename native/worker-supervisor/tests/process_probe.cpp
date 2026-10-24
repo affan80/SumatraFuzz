@@ -4,12 +4,14 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <userenv.h>
 #include <sddl.h>
 #include <cstring>
 #include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 namespace {
 
@@ -35,6 +37,147 @@ bool WriteNamedEventMarker(const std::wstring& evidence_dir) {
   const bool okay = WriteFile(file, data, sizeof(data), &written, nullptr) && written == sizeof(data);
   CloseHandle(file);
   return okay;
+}
+
+bool AppContainerChild(const std::wstring& output, const std::wstring& world,
+                       const std::wstring& authenticated, const std::wstring& world_low,
+                       const std::wstring& authenticated_low) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+  DWORD is_appcontainer = 0;
+  DWORD bytes = 0;
+  bool okay = GetTokenInformation(token, TokenIsAppContainer, &is_appcontainer,
+                                  sizeof(is_appcontainer), &bytes) && is_appcontainer != 0;
+  // A zero-capability AppContainer is required; the package SID is separate
+  // from TokenCapabilities and must not be counted as a granted capability.
+  std::vector<BYTE> capabilities(sizeof(TOKEN_GROUPS));
+  auto* groups = reinterpret_cast<TOKEN_GROUPS*>(capabilities.data());
+  DWORD capability_bytes = static_cast<DWORD>(capabilities.size());
+  okay = okay && GetTokenInformation(token, TokenCapabilities, groups, capability_bytes,
+                                     &capability_bytes) && groups->GroupCount == 0;
+  CloseHandle(token);
+  if (!okay) return false;
+  const std::wstring output_file = output + L"\\appcontainer-probe-result";
+  HANDLE file = CreateFileW(output_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  const char marker[] = "appcontainer-write";
+  DWORD written = 0;
+  okay = WriteFile(file, marker, sizeof(marker), &written, nullptr) && written == sizeof(marker);
+  CloseHandle(file);
+  for (const auto* sentinel : {&world, &authenticated, &world_low, &authenticated_low}) {
+    SetLastError(ERROR_SUCCESS);
+    HANDLE denied = CreateFileW(sentinel->c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD error = GetLastError();
+    if (denied != INVALID_HANDLE_VALUE) CloseHandle(denied);
+    okay = okay && denied == INVALID_HANDLE_VALUE && error == ERROR_ACCESS_DENIED;
+  }
+  return okay;
+}
+
+bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
+  PACL existing_dacl = nullptr;
+  const DWORD query = GetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr, nullptr);
+  if (query != ERROR_SUCCESS) return false;
+  EXPLICIT_ACCESSW access{};
+  access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+  access.grfAccessMode = GRANT_ACCESS;
+  access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+  access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+  PACL dacl = nullptr;
+  const DWORD acl_result = SetEntriesInAclW(1, &access, existing_dacl, &dacl);
+  if (existing_dacl) LocalFree(existing_dacl);
+  if (acl_result != ERROR_SUCCESS) return false;
+  const DWORD result = SetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+  LocalFree(dacl);
+  return result == ERROR_SUCCESS;
+}
+
+bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& output,
+                          const std::wstring& world, const std::wstring& authenticated,
+                          const std::wstring& world_low, const std::wstring& authenticated_low) {
+  const std::wstring profile = L"SumatraFuzz-Probe-" + std::to_wstring(GetCurrentProcessId()) +
+                               L"-" + std::to_wstring(GetTickCount64());
+  const std::wstring second_profile = profile + L"-unique";
+  PSID sid = nullptr;
+  PSID second_sid = nullptr;
+  bool first_created = false;
+  bool second_created = false;
+  bool okay = false;
+  PWSTR profile_path = nullptr;
+  try {
+    HRESULT result = CreateAppContainerProfile(profile.c_str(), L"SumatraFuzz API Probe",
+                                                L"Ephemeral feasibility probe", nullptr, 0, &sid);
+    if (FAILED(result) || !sid) goto cleanup;
+    first_created = true;
+    result = GetAppContainerFolderPath(sid, &profile_path);
+    if (FAILED(result) || !profile_path || GetFullPathNameW(profile_path, 0, nullptr, nullptr) == 0)
+      goto cleanup;
+    std::fwprintf(stdout, L"AppContainerProfilePath=%ls\n", profile_path);
+    std::fwprintf(stdout, L"AppContainerTempPath=%ls\n", output.c_str());
+    result = CreateAppContainerProfile(second_profile.c_str(), L"SumatraFuzz API Probe",
+                                        L"Ephemeral feasibility probe", nullptr, 0, &second_sid);
+    if (FAILED(result) || !second_sid || EqualSid(sid, second_sid)) goto cleanup;
+    second_created = true;
+    if (!GrantAppContainerDirectoryAccess(output, sid)) goto cleanup;
+    {
+      const std::wstring appcontainer_executable = output + L"\\appcontainer-probe.exe";
+      if (!CopyFileW(executable.c_str(), appcontainer_executable.c_str(), TRUE)) goto cleanup;
+      SIZE_T bytes = 0;
+      InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+      std::vector<BYTE> attributes(bytes);
+      auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+      if (!InitializeProcThreadAttributeList(list, 1, 0, &bytes)) goto cleanup;
+      SECURITY_CAPABILITIES security{};
+      security.AppContainerSid = sid;
+      security.CapabilityCount = 0;
+      security.Capabilities = nullptr;
+      const bool updated = UpdateProcThreadAttribute(list, 0,
+          PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr);
+      if (!updated) { DeleteProcThreadAttributeList(list); goto cleanup; }
+      STARTUPINFOEXW startup{};
+      startup.StartupInfo.cb = sizeof(startup);
+      startup.lpAttributeList = list;
+      PROCESS_INFORMATION process{};
+      std::wstring command = L"\"" + appcontainer_executable + L"\" --appcontainer-child \"" + output +
+          L"\" \"" + world + L"\" \"" + authenticated + L"\" \"" + world_low +
+          L"\" \"" + authenticated_low + L"\"";
+      const BOOL launched = CreateProcessW(appcontainer_executable.c_str(), command.data(), nullptr, nullptr,
+          FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, output.c_str(),
+          &startup.StartupInfo, &process);
+      DeleteProcThreadAttributeList(list);
+      if (!launched) goto cleanup;
+      DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+      if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        wait = WaitForSingleObject(process.hProcess, 30000);
+      }
+      DWORD exit_code = 0xffffffff;
+      if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exit_code);
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+      okay = wait == WAIT_OBJECT_0 && exit_code == 0;
+    }
+  cleanup:
+    if (profile_path) CoTaskMemFree(profile_path);
+    if (sid) FreeSid(sid);
+    if (second_sid) FreeSid(second_sid);
+    if (first_created && FAILED(DeleteAppContainerProfile(profile.c_str()))) okay = false;
+    if (second_created && FAILED(DeleteAppContainerProfile(second_profile.c_str()))) okay = false;
+    return okay;
+  } catch (...) {
+    if (profile_path) CoTaskMemFree(profile_path);
+    if (sid) FreeSid(sid);
+    if (second_sid) FreeSid(second_sid);
+    if (first_created) DeleteAppContainerProfile(profile.c_str());
+    if (second_created) DeleteAppContainerProfile(second_profile.c_str());
+    return false;
+  }
 }
 
 // Probe diagnostics intentionally contain only a stable code and Win32 error.
@@ -539,6 +682,10 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 7 && std::wstring(argv[1]) == L"--appcontainer-child")
+    return AppContainerChild(argv[2], argv[3], argv[4], argv[5], argv[6]) ? 0 : 81;
+  if (argc == 7 && std::wstring(argv[1]) == L"--appcontainer-probe")
+    return RunAppContainerProbe(argv[0], argv[2], argv[3], argv[4], argv[5], argv[6]) ? 0 : 82;
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::wstring(argv[i]) == L"--startup-marker") {
       HANDLE marker = CreateFileW(argv[i + 1], GENERIC_WRITE, 0, nullptr, CREATE_NEW,

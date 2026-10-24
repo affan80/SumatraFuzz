@@ -45,7 +45,7 @@ jobs:
         run: npm run test:worker-api-security
       - name: Test worker trust, pairing and audit boundaries
         run: npm run test:worker-trust-security
-      - name: Test Windows supervisor as a standard user
+      - name: Test Windows supervisor and AppContainer as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
         run: pwsh -File scripts/windows/ci-supervisor-check.ps1 -RepoRoot (Get-Location).Path
