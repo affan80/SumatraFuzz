@@ -140,12 +140,14 @@ DWORD CheckPrivateNamespaceDacl(HANDLE namespace_handle, BOOL* traverse_granted,
   *traverse_granted = FALSE;
   *create_object_granted = FALSE;
   DWORD descriptor_bytes = 0;
-  GetKernelObjectSecurity(namespace_handle, DACL_SECURITY_INFORMATION, nullptr, 0,
+  constexpr SECURITY_INFORMATION kNamespaceSecurity = OWNER_SECURITY_INFORMATION |
+      GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+  GetKernelObjectSecurity(namespace_handle, kNamespaceSecurity, nullptr, 0,
                           &descriptor_bytes);
   if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || descriptor_bytes == 0)
     return GetLastError();
   std::vector<BYTE> descriptor_storage(descriptor_bytes);
-  if (!GetKernelObjectSecurity(namespace_handle, DACL_SECURITY_INFORMATION,
+  if (!GetKernelObjectSecurity(namespace_handle, kNamespaceSecurity,
                                descriptor_storage.data(), descriptor_bytes,
                                &descriptor_bytes)) return GetLastError();
   // Object-directory rights are not exported by the user-mode SDK headers.
