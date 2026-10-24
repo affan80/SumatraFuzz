@@ -174,6 +174,16 @@ bool RunSid(PSID sid) {
       std::memcmp(GetSidIdentifierAuthority(sid), &authority, sizeof(authority)) == 0;
 }
 
+bool AddLowIntegrityBoundaryLabel(HANDLE* boundary) {
+  DWORD bytes = 0;
+  CreateWellKnownSid(WinLowLabelSid, nullptr, nullptr, &bytes);
+  if (bytes == 0) return false;
+  std::vector<BYTE> storage(bytes);
+  PSID sid = storage.data();
+  return CreateWellKnownSid(WinLowLabelSid, nullptr, sid, &bytes) &&
+         AddIntegrityLabelToBoundaryDescriptor(boundary, sid);
+}
+
 struct ProbeNamespace {
   HANDLE token = nullptr;
   HANDLE boundary = nullptr;
@@ -256,7 +266,8 @@ struct ProbeNamespace {
     if (!ValidAlias(target_alias)) { SetLastError(ERROR_INVALID_NAME); return false; }
     boundary = CreateBoundaryDescriptorW(target_alias.c_str(), 0);
     if (!boundary || !AddSIDToBoundaryDescriptor(&boundary,
-        reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid)) return false;
+        reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid) ||
+        !AddLowIntegrityBoundaryLabel(&boundary)) return false;
     handle = OpenPrivateNamespaceW(boundary, target_alias.c_str());
     return handle != nullptr;
   }

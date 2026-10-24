@@ -327,6 +327,17 @@ PrivateNamespace CreateRunPrivateNamespace(const RestrictedToken& restricted) {
   boundary.handle = CreateBoundaryDescriptorW(result.alias.c_str(), 0);
   if (!boundary.handle || !AddSIDToBoundaryDescriptor(&boundary.handle, worker_sid))
     throw std::runtime_error("private namespace boundary setup failed");
+  // WinAFL runs at low integrity; give its private object directory the same
+  // label so mandatory integrity does not block run-scoped named IPC.
+  DWORD low_label_bytes = 0;
+  CreateWellKnownSid(WinLowLabelSid, nullptr, nullptr, &low_label_bytes);
+  std::vector<BYTE> low_label_storage(low_label_bytes);
+  PSID low_label_sid = low_label_storage.data();
+  if (low_label_bytes == 0 ||
+      !CreateWellKnownSid(WinLowLabelSid, nullptr, low_label_sid, &low_label_bytes) ||
+      !AddIntegrityLabelToBoundaryDescriptor(&boundary.handle, low_label_sid)) {
+    throw std::runtime_error("private namespace low-integrity boundary setup failed");
+  }
   const sumatrafuzz::supervisor::PrivateAclGrant grants[] = {
       {worker_sid, GENERIC_ALL}, {restricted.sid, GENERIC_ALL}};
   LocalMemory acl;

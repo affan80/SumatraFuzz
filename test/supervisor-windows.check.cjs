@@ -427,6 +427,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   assert.match(addon, /\{restricted\.sid, 0\}/);
   assert.match(addon, /CreateProcessAsUserW\(/);
   assert.match(addon, /CreatePrivateAccessAcl\(/);
+  assert.match(addon, /AddIntegrityLabelToBoundaryDescriptor\(&boundary\.handle, low_label_sid\)/);
   assert.match(addon, /SetPrivateRestrictedDefaultDacl/);
   assert.match(addon, /WinRestrictedCodeSid/);
   assert.match(addon, /WinAuthenticatedUserSid/);
@@ -446,6 +447,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
     path.join(__dirname, '..', 'native', 'worker-supervisor', 'tests', 'process_probe.cpp'),
     'utf8',
   );
+  assert.match(probe, /AddIntegrityLabelToBoundaryDescriptor\(boundary, sid\)/);
   assert.match(probe, /ProtectedReadsAndWritesDenied/);
   assert.match(probe, /ReadAllowedInput/);
   assert.match(probe, /CreateEventExW\(/);
