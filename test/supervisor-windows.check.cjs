@@ -704,6 +704,10 @@ test('private namespace probe reports the exact private ACL construction failure
   assert.match(probe, /ns\.Initialize\(&namespace_stage, &namespace_error\)/);
   assert.match(
     probe,
+    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventW\(&attributes, TRUE, FALSE, event_name\.c_str\(\)\);\s+const DWORD event_error = GetLastError\(\);/,
+  );
+  assert.match(
+    probe,
     /WriteNamespaceFailureDiagnostic\(evidence_dir, namespace_stage, namespace_error\)/,
   );
 });

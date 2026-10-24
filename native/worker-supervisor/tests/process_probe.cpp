@@ -261,9 +261,11 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   }
 
   SECURITY_ATTRIBUTES attributes{sizeof(attributes), &ns.descriptor, FALSE};
+  SetLastError(ERROR_SUCCESS);
   HANDLE event = CreateEventW(&attributes, TRUE, FALSE, event_name.c_str());
-  if (!event || GetLastError() == ERROR_ALREADY_EXISTS) {
-    const DWORD error = GetLastError();
+  const DWORD event_error = GetLastError();
+  if (!event || event_error == ERROR_ALREADY_EXISTS) {
+    const DWORD error = event_error;
     if (event) CloseHandle(event);
     WriteNamedEventFailureDiagnostic(evidence_dir, error);
     return 2400 + static_cast<int>(error);
