@@ -368,6 +368,13 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(nativeProbe, /appcontainer-probe-result/);
   assert.match(nativeProbe, /AppContainerProfilePath=/);
   assert.match(nativeProbe, /AppContainerTempPath=/);
+  assert.match(nativeProbe, /bool DeleteProbeProfiles\(/);
+  assert.match(nativeProbe, /AppContainer profile cleanup failed/);
+  assert.match(nativeProbe, /DeleteProbeProfiles\(profile, second_profile,\s*first_created, second_created\)/);
+  assert.match(nativeProbe, /cleanup_succeeded = DeleteProbeProfiles/);
+  assert.match(nativeProbe, /probe exception left profile cleanup incomplete/);
+  assert.match(appContainerScript, /Remove-Item -LiteralPath \$output -Recurse -Force -ErrorAction Stop/);
+  assert.match(appContainerScript, /AppContainer temporary output directory remains after cleanup/);
   assert.match(fixture, /world-low-write-sentinel/);
   assert.match(fixture, /authenticated-low-write-sentinel/);
   assert.match(fixture, /setintegritylevel/);

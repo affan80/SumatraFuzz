@@ -12,3 +12,14 @@ Validation run on this host:
 - `git diff --check`: passed.
 
 Concern: this workspace is running on macOS, so the Windows C++ APIs could not be compiled or exercised here, and actual profile/temp measurements and cleanup behavior remain pending the hosted Windows x64 job. This result is only an API feasibility slice. It does not establish installed-service identity acceptance or quota-backed storage; those remain later gates, including Task 5's installed-service check. If Windows CI cannot prove bounded profile scratch and cleanup, the sandbox must fail closed and product-code work must not claim acceptance.
+
+## Fix round: cleanup must fail closed
+
+Addressed both review findings. The PowerShell probe now checks that its output directory is absent after `Remove-Item`; removal errors or a surviving directory raise a terminating error. Native profile cleanup now runs through one helper on both normal and exception paths. The helper attempts deletion of each profile independently, checks both HRESULTs, and emits a profile-specific stderr diagnostic for every deletion failure. An exception path remains failed and additionally reports incomplete profile cleanup.
+
+Focused verification for this fix round:
+
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped (Windows-only runtime checks), 0 failed.
+- `git diff --check`: passed.
+
+The Windows runtime caveat in the initial report still applies.

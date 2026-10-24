@@ -33,5 +33,16 @@ try {
     }
     Write-Output 'Verified nonadministrator AppContainer API probe; native output records profile and temp paths'
 } finally {
-    if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Recurse -Force }
+    if (Test-Path -LiteralPath $output) {
+        try {
+            Remove-Item -LiteralPath $output -Recurse -Force -ErrorAction Stop
+        } catch {
+            if (Test-Path -LiteralPath $output) {
+                throw "AppContainer temporary output cleanup failed for '$output': $($_.Exception.Message)"
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $output) {
+        throw "AppContainer temporary output directory remains after cleanup: $output"
+    }
 }

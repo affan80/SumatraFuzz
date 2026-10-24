@@ -98,6 +98,28 @@ bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   return result == ERROR_SUCCESS;
 }
 
+bool DeleteProbeProfiles(const std::wstring& profile, const std::wstring& second_profile,
+                         bool first_created, bool second_created) {
+  bool okay = true;
+  if (first_created) {
+    const HRESULT result = DeleteAppContainerProfile(profile.c_str());
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"AppContainer profile cleanup failed: %ls (HRESULT=0x%08lx)\n",
+                    profile.c_str(), static_cast<unsigned long>(result));
+      okay = false;
+    }
+  }
+  if (second_created) {
+    const HRESULT result = DeleteAppContainerProfile(second_profile.c_str());
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"AppContainer profile cleanup failed: %ls (HRESULT=0x%08lx)\n",
+                    second_profile.c_str(), static_cast<unsigned long>(result));
+      okay = false;
+    }
+  }
+  return okay;
+}
+
 bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& output,
                           const std::wstring& world, const std::wstring& authenticated,
                           const std::wstring& world_low, const std::wstring& authenticated_low) {
@@ -167,15 +189,18 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
     if (profile_path) CoTaskMemFree(profile_path);
     if (sid) FreeSid(sid);
     if (second_sid) FreeSid(second_sid);
-    if (first_created && FAILED(DeleteAppContainerProfile(profile.c_str()))) okay = false;
-    if (second_created && FAILED(DeleteAppContainerProfile(second_profile.c_str()))) okay = false;
+    const bool profiles_deleted = DeleteProbeProfiles(profile, second_profile,
+                                                       first_created, second_created);
+    okay = profiles_deleted && okay;
     return okay;
   } catch (...) {
     if (profile_path) CoTaskMemFree(profile_path);
     if (sid) FreeSid(sid);
     if (second_sid) FreeSid(second_sid);
-    if (first_created) DeleteAppContainerProfile(profile.c_str());
-    if (second_created) DeleteAppContainerProfile(second_profile.c_str());
+    const bool cleanup_succeeded = DeleteProbeProfiles(profile, second_profile,
+                                                        first_created, second_created);
+    if (!cleanup_succeeded)
+      std::fwprintf(stderr, L"AppContainer probe exception left profile cleanup incomplete\n");
     return false;
   }
 }
