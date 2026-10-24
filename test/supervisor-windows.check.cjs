@@ -159,7 +159,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
       assert.equal(
         existsSync(startupMarker),
         true,
-        `restricted child must reach its probe entry point for ${description}`,
+        `restricted child must reach its probe entry point for ${description} (exit ${deniedSample.root_exit_code})`,
       );
       assert.equal(
         deniedSample.root_exit_code,
