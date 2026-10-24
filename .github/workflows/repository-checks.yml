@@ -77,16 +77,16 @@ jobs:
       - name: Install Pester 5
         shell: pwsh
         run: |
-          Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
       - name: Validate Windows toolchain code
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0
+          Import-Module Pester -RequiredVersion 5.7.1
           Invoke-Pester -Path scripts/windows/tests -CI
       - name: Parse all Windows PowerShell scripts before expensive builds
         shell: pwsh
         run: |
-          $paths = @(Get-ChildItem -Path scripts/windows -Filter '*.ps1' -Recurse -File)
+          $paths = @(Get-ChildItem -Path scripts/windows -Recurse -File | Where-Object { $_.Extension -in @('.ps1', '.psm1') })
           if ($paths.Count -lt 3) { throw 'Expected native Windows verification scripts not found' }
           foreach ($file in $paths) {
             $tokens = $null
@@ -208,12 +208,44 @@ jobs:
         shell: pwsh
         run: |
           pwsh -File scripts/windows/provision-winafl.ps1 -Workspace (Join-Path (Get-Location) 'external/native-tools') -SumatraSource (Resolve-Path external/sumatrapdf).Path
+      - name: Generate ephemeral worker-service acceptance identities
+        shell: pwsh
+        env:
+          WORKER_SERVICE_FIXTURE_ROOT: ${{ runner.temp }}\sf-worker-service-fixture
+        run: |
+          if (Test-Path -LiteralPath $env:WORKER_SERVICE_FIXTURE_ROOT) { throw 'Ephemeral worker fixture path already exists' }
+          New-Item -ItemType Directory -Path $env:WORKER_SERVICE_FIXTURE_ROOT | Out-Null
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          & icacls.exe $env:WORKER_SERVICE_FIXTURE_ROOT '/inheritance:r' '/grant:r' `
+            '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${identity}:(OI)(CI)F" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not protect ephemeral worker fixture directory' }
+          node scripts/windows/create-worker-service-fixture.mjs "$env:WORKER_SERVICE_FIXTURE_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate ephemeral worker fixture identities' }
+      - name: Build SCM host and stage the protected worker-service payload
+        shell: pwsh
+        env:
+          WORKER_SERVICE_FIXTURE_ROOT: ${{ runner.temp }}\sf-worker-service-fixture
+        run: |
+          cmake -S native/worker-supervisor -B build/worker-supervisor
+          cmake --build build/worker-supervisor --config Release --target sumatrafuzz_worker_service_host
+          node scripts/stage-worker-service.mjs `
+            --node (Get-Command node).Source `
+            --host (Resolve-Path build/worker-supervisor/Release/SumatraFuzzWorkerHost.exe).Path `
+            --public-key (Join-Path $env:WORKER_SERVICE_FIXTURE_ROOT 'organization-public.pem') `
+            --output release/worker-service/SumatraFuzz
       - name: Verify A4–A6 as a standard Windows user
         shell: pwsh
         timeout-minutes: 35
         env:
           WORKER_ACCEPTANCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: pwsh -File scripts/windows/ci-native-gate.ps1 -RepoRoot (Get-Location).Path
+      - name: Run installed Windows service acceptance over mTLS
+        shell: pwsh
+        timeout-minutes: 35
+        env:
+          WORKER_ACCEPTANCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          WORKER_SERVICE_FIXTURE_ROOT: ${{ runner.temp }}\sf-worker-service-fixture
+        run: pwsh -File scripts/windows/worker-service-acceptance.ps1 -RepoRoot (Get-Location).Path
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

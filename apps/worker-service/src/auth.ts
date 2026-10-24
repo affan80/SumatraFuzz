@@ -1,3 +1,6 @@
+import { isNonNilUuid } from '@sumatrafuzz/worker-protocol';
+import type { TrustRecord, WorkerTrustRepository } from './trust-store.js';
+
 export interface PeerCertificateIdentity {
   readonly fingerprint256: string;
   readonly validFrom: string;
@@ -13,15 +16,15 @@ function normalizeFingerprint(value: string): string {
 
 export function authorizePairedCertificate(
   peer: PeerCertificateIdentity | null,
-  pairedFingerprints: ReadonlySet<string>,
-  revokedFingerprints: ReadonlySet<string>,
+  trust: Pick<WorkerTrustRepository, 'resolveFingerprint'>,
   now = Date.now(),
-): string {
+): TrustRecord {
   if (!peer?.authorized) throw new Error('client certificate is missing or not CA-authorized');
   const fingerprint = normalizeFingerprint(peer.fingerprint256);
   const validFrom = Date.parse(peer.validFrom);
   const validTo = Date.parse(peer.validTo);
   if (
+    !Number.isFinite(now) ||
     !Number.isFinite(validFrom) ||
     !Number.isFinite(validTo) ||
     now < validFrom ||
@@ -29,9 +32,14 @@ export function authorizePairedCertificate(
   ) {
     throw new Error('client certificate is expired or outside its validity period');
   }
-  const revoked = new Set([...revokedFingerprints].map(normalizeFingerprint));
-  if (revoked.has(fingerprint)) throw new Error('client certificate is revoked');
-  const paired = new Set([...pairedFingerprints].map(normalizeFingerprint));
-  if (!paired.has(fingerprint)) throw new Error('client certificate is unpaired');
-  return fingerprint;
+  const record = trust.resolveFingerprint(fingerprint, new Date(now));
+  if (
+    !record ||
+    record.fingerprint !== fingerprint ||
+    record.status !== 'active' ||
+    !isNonNilUuid(record.controllerId)
+  ) {
+    throw new Error('client certificate is unpaired or revoked');
+  }
+  return record;
 }

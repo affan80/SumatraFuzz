@@ -20,7 +20,7 @@ BeforeAll {
             architecture='x64'
             source_commit='16c59fde8b824ab54c56f23aef910a6fdd874ad0'
             harness_entry='fuzz_one_file'; nargs=1
-            acquisition=@{winafl_source_commit='fd85f38548b14352f4b70ad414f364ea6dc1a769';dynamorio_release='cronbuild-11.91.20735'}
+            acquisition=@{winafl_patch_sha256=(Get-FileHash (Join-Path $PSScriptRoot '../patches/winafl-private-namespace.patch') -Algorithm SHA256).Hash.ToLowerInvariant();winafl_source_commit='fd85f38548b14352f4b70ad414f364ea6dc1a769';dynamorio_release='cronbuild-11.91.20735'}
             tools=@{
                 drrun=@{path=$tool;sha256=$hash}
                 afl_fuzz=@{path=$tool;sha256=$hash}

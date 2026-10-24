@@ -53,6 +53,11 @@ test('Node CI runs in both operating systems and keeps the lockfile cache scoped
   assert.match(workflow, /npm run native:supervisor:build/);
   assert.match(workflow, /npm run native:supervisor:contract/);
   assert.match(workflow, /scripts\/windows\/ci-supervisor-check\.ps1/);
+  assert.match(workflow, /npm run test:worker-api-security/);
+  assert.ok(
+    readJson('package.json').scripts['test:worker-api-security'],
+    'focused API security suite must be available to both CI operating systems',
+  );
   assert.ok(existsSync('scripts/windows/ci-supervisor-check.ps1'));
   const { verify } = readJson('package.json').scripts;
   for (const command of [

@@ -57,6 +57,7 @@ async function setup() {
       quota_bytes: 1024 * 1024 * 1024,
       available_bytes: 1024 * 1024 * 1024,
       used_bytes: 0,
+      volume_id: '\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\',
     })),
   };
   const evidence = {

@@ -1,0 +1,472 @@
+import { createHash, createPrivateKey, randomUUID, sign } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { createWorkerClient, WorkerClientError } from '@sumatrafuzz/worker-client';
+import { asControllerId, validateRunRequest } from '@sumatrafuzz/worker-protocol';
+import { ZipFile } from 'yazl';
+
+const root = process.cwd();
+const fixtureRoot = process.env.WORKER_SERVICE_FIXTURE_ROOT;
+const workerDataRoot = process.env.WORKER_SERVICE_DATA_ROOT;
+const seedRoot = path.join(root, 'runs', 'a5', 'seeds');
+const nativeRoot = path.join(root, 'runs', 'worker-native');
+const summaryPath = path.join(nativeRoot, 'acceptance-summary.json');
+const minimumExecutions = 1_000;
+const maxWaitMs = 10 * 60_000;
+const steadyRequestCount = 60;
+const steadyRequestIntervalMs = 100;
+const burstRequestCount = 8;
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type FixtureProfile = {
+  workerId: string;
+  controllerId: string;
+  baseUrl: string;
+  workerFingerprint: string;
+  controllerCertificatePem: string;
+  controllerPrivateKeyPem: string;
+  trustedCaPem: string;
+};
+
+function invariant(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
+}
+
+async function readProfile(name: string): Promise<FixtureProfile> {
+  invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+  const file = path.join(fixtureRoot, name);
+  const metadata = await lstat(file);
+  invariant(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= 1024 * 1024, 'unsafe test identity file');
+  return JSON.parse(await readFile(file, 'utf8')) as FixtureProfile;
+}
+
+async function zipSeeds(files: readonly string[]): Promise<Buffer> {
+  const zip = new ZipFile();
+  for (const file of files) zip.addBuffer(await readFile(file), path.basename(file), { compress: true });
+  zip.end();
+  const chunks: Buffer[] = [];
+  for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+async function readExecutions(file: string): Promise<number | null> {
+  try {
+    const metadata = await lstat(file);
+    invariant(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= 1024 * 1024, 'unsafe WinAFL stats file');
+    const match = /^execs_done\s*:\s*(\d+)\s*$/m.exec(await readFile(file, 'utf8'));
+    if (!match) return null;
+    const count = Number(match[1]);
+    return Number.isSafeInteger(count) ? count : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function client(profile: FixtureProfile) {
+  return createWorkerClient({
+    baseUrl: profile.baseUrl,
+    controllerCertificate: Buffer.from(profile.controllerCertificatePem),
+    controllerKey: Buffer.from(profile.controllerPrivateKeyPem),
+    trustedCa: Buffer.from(profile.trustedCaPem),
+    workerFingerprint: profile.workerFingerprint,
+    timeoutMs: 30_000,
+  });
+}
+
+function percentile(sorted: readonly number[], ratio: number): number {
+  return Number(sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1)]?.toFixed(3));
+}
+
+async function measureApiBudget(profile: FixtureProfile, runId: string) {
+  const controller = client(profile);
+  const latencies: number[] = [];
+  const startedAt = performance.now();
+  try {
+    for (let index = 0; index < steadyRequestCount; index += 1) {
+      const requestStartedAt = performance.now();
+      const run = await controller.getRun(runId);
+      invariant(run.run_id === runId, 'steady API measurement returned a different run');
+      latencies.push(performance.now() - requestStartedAt);
+      const nextRequestAt = startedAt + (index + 1) * steadyRequestIntervalMs;
+      await pause(Math.max(0, nextRequestAt - performance.now()));
+    }
+  } finally {
+    controller.close();
+  }
+
+  const elapsedMs = performance.now() - startedAt;
+  const sortedLatencies = [...latencies].sort((left, right) => left - right);
+  const burstClients = Array.from({ length: burstRequestCount }, () => client(profile));
+  let outcomes: number[];
+  try {
+    outcomes = await Promise.all(
+      burstClients.map(async (burstClient) => {
+        try {
+          const run = await burstClient.getRun(runId);
+          invariant(run.run_id === runId, 'burst API measurement returned a different run');
+          return 200;
+        } catch (error) {
+          if (error instanceof WorkerClientError) return error.status;
+          throw error;
+        }
+      }),
+    );
+  } finally {
+    for (const burstClient of burstClients) burstClient.close();
+  }
+  const burstSucceeded = outcomes.filter((status) => status === 200).length;
+  const burstRateLimited = outcomes.filter((status) => status === 429).length;
+  invariant(burstSucceeded > 0 && burstRateLimited > 0, 'concurrent API burst did not exercise both admission outcomes');
+
+  return {
+    target_requests_per_second: 10,
+    steady_state_requests: latencies.length,
+    steady_state_elapsed_ms: Number(elapsedMs.toFixed(3)),
+    steady_state_requests_per_second: Number((latencies.length / (elapsedMs / 1000)).toFixed(3)),
+    latency_ms: {
+      p50: percentile(sortedLatencies, 0.5),
+      p95: percentile(sortedLatencies, 0.95),
+      p99: percentile(sortedLatencies, 0.99),
+    },
+    concurrent_burst_requests: burstRequestCount,
+    concurrent_burst_succeeded: burstSucceeded,
+    concurrent_burst_rate_limited: burstRateLimited,
+  };
+}
+
+async function writeFreshRevocation(profile: FixtureProfile): Promise<string> {
+  invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+  const privateKeyBytes = await readFile(path.join(fixtureRoot, 'organization-private.pem'));
+  const transactionPath = path.join(fixtureRoot, 'revoke-controller-1.sftxn');
+  let payload: Buffer | undefined;
+  let signature: Buffer | undefined;
+  let envelope: Buffer | undefined;
+  try {
+    const privateKey = createPrivateKey(privateKeyBytes);
+    const issuedAt = new Date();
+    payload = Buffer.from(
+      JSON.stringify({
+        format: 'sumatrafuzz-worker-trust-operation-v1',
+        workerId: profile.workerId,
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: new Date(issuedAt.getTime() + 5 * 60_000).toISOString(),
+        operation: {
+          type: 'unpair_controller',
+          controllerId: profile.controllerId,
+          fingerprint: null,
+        },
+      }),
+    );
+    signature = sign(null, payload, privateKey);
+    envelope = Buffer.from(
+      JSON.stringify({
+        format: 'sumatrafuzz-worker-pairing-bundle-v1',
+        payload: payload.toString('base64'),
+        signature: signature.toString('base64'),
+      }),
+    );
+    await writeFile(transactionPath, envelope, { flag: 'wx', mode: 0o600 });
+    return transactionPath;
+  } finally {
+    privateKeyBytes.fill(0);
+    payload?.fill(0);
+    signature?.fill(0);
+    envelope?.fill(0);
+  }
+}
+
+async function main(): Promise<void> {
+  invariant(process.platform === 'win32' && process.arch === 'x64', 'installed-service acceptance requires Windows x64');
+  invariant(process.env.GITHUB_ACTIONS === 'true', 'installed-service acceptance requires an ephemeral CI worker');
+  invariant(fixtureRoot && workerDataRoot, 'installed-service acceptance paths are required');
+  const workflowCommit = process.env.GITHUB_SHA ?? '';
+  const sourceCommit = process.env.WORKER_ACCEPTANCE_HEAD_SHA ?? '';
+  invariant(/^[0-9a-f]{40}$/i.test(workflowCommit) && /^[0-9a-f]{40}$/i.test(sourceCommit), 'acceptance requires exact workflow and source commits');
+  const checkedOutCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  invariant(checkedOutCommit.toLowerCase() === workflowCommit.toLowerCase(), 'acceptance checkout does not match the exact workflow commit');
+  execFileSync('git', ['merge-base', '--is-ancestor', sourceCommit, checkedOutCommit], { cwd: root, stdio: 'ignore' });
+  await mkdir(nativeRoot, { recursive: true });
+
+  const firstProfile = await readProfile('controller-1.json');
+  const secondProfile = await readProfile('controller-2.json');
+  if (process.env.WORKER_SERVICE_VERIFY_FORCED_TERMINATION === 'true') {
+    const second = client(secondProfile);
+    try {
+      const evidence = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      const forcedRunId = evidence.forced_termination_run_id;
+      const inputBundleId = evidence.forced_termination_input_bundle_id;
+      invariant(typeof forcedRunId === 'string', 'forced-termination run ID is missing');
+      invariant(typeof inputBundleId === 'string', 'forced-termination input bundle ID is missing');
+      const active = await second.activeRun();
+      invariant(
+        active?.run_id === forcedRunId && active.state !== 'completed',
+        'forced service termination fabricated completion or lost the operator-held run',
+      );
+      const capabilities = await second.capabilities();
+      let competingRunDenied = false;
+      try {
+        await second.startRun(
+          validateRunRequest({
+            request_id: randomUUID(),
+            controller_id: asControllerId(secondProfile.controllerId),
+            input_bundle_id: inputBundleId,
+            target_lock_sha256: capabilities.target_lock_sha256,
+            limits: capabilities.max_limits,
+            label: 'forced termination slot reservation check',
+          }),
+        );
+      } catch (error) {
+        competingRunDenied = error instanceof WorkerClientError && error.status === 409;
+      }
+      invariant(competingRunDenied, 'forced termination released the ambiguous worker slot');
+      const activeAfterDeniedStart = await second.activeRun();
+      invariant(
+        activeAfterDeniedStart?.run_id === forcedRunId,
+        'forced termination recovery changed the active run after a denied start',
+      );
+      const treeProof = JSON.parse(
+        await readFile(path.join(fixtureRoot, 'forced-termination-tree-verified.json'), 'utf8'),
+      ) as { descendantsTerminated?: unknown };
+      invariant(treeProof.descendantsTerminated === true, 'forced service descendants were not verified terminated');
+      Object.assign(evidence, {
+        forced_service_termination_recovered_without_completion: true,
+        forced_run_state_after_restart: active.state,
+        slot_remained_reserved_after_forced_termination: true,
+        forced_service_process_tree_terminated: true,
+      });
+      await writeFile(summaryPath, `${JSON.stringify(evidence, null, 2)}\n`);
+      console.log('Verified forced service termination and operator-held run recovery.');
+      return;
+    } finally {
+      second.close();
+    }
+  }
+  const verifyRevocation = process.env.WORKER_SERVICE_VERIFY_REVOCATION === 'true';
+  if (verifyRevocation) {
+    const first = client(firstProfile);
+    const second = client(secondProfile);
+    try {
+      let revokedDenied = false;
+      try {
+        await first.capabilities();
+      } catch {
+        revokedDenied = true;
+      }
+      invariant(revokedDenied, 'revoked controller was accepted after service restart');
+      const capabilities = await second.capabilities();
+      invariant(capabilities.worker_id === secondProfile.workerId, 'remaining controller trust did not survive restart');
+      console.log('Verified durable controller revocation after service restart.');
+      return;
+    } finally {
+      first.close();
+      second.close();
+    }
+  }
+  const unpairedProfile = await readProfile('controller-3.json');
+  invariant(firstProfile.workerId === secondProfile.workerId, 'test controllers do not share a worker identity');
+  let first = client(firstProfile);
+  const second = client(secondProfile);
+  const unpaired = client(unpairedProfile);
+  let archive: Buffer | undefined;
+  let runId: string | undefined;
+  let forcedRunId: string | undefined;
+  let forcedTerminationArmed = false;
+  let stopped = false;
+  try {
+    const capabilities = await first.capabilities();
+    invariant(capabilities.worker_id === firstProfile.workerId, 'mTLS returned a different worker identity');
+    invariant(capabilities.controller_id === firstProfile.controllerId, 'mTLS returned a different controller identity');
+    const secondCapabilities = await second.capabilities();
+    invariant(secondCapabilities.controller_id === secondProfile.controllerId, 'second controller pairing was not persisted');
+    let unpairedDenied = false;
+    try {
+      await unpaired.capabilities();
+    } catch {
+      unpairedDenied = true;
+    }
+    invariant(unpairedDenied, 'worker accepted an unpaired controller certificate');
+
+    const seeds = (await readdir(seedRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.pdf'))
+      .map((entry) => path.join(seedRoot, entry.name));
+    invariant(seeds.length >= 2, 'genuine A5 PDF seeds are required');
+    archive = await zipSeeds(seeds);
+    const imported = await first.importInputBundle(archive);
+    const request = validateRunRequest({
+      request_id: randomUUID(),
+      controller_id: asControllerId(firstProfile.controllerId),
+      input_bundle_id: imported.input_bundle_id,
+      target_lock_sha256: capabilities.target_lock_sha256,
+      limits: capabilities.max_limits,
+      label: 'installed Windows worker acceptance',
+    });
+    const started = await first.startRun(request);
+    invariant(started.state === 'running', 'installed service did not start a running campaign');
+    runId = started.run_id;
+    const apiBudgetObservation = await measureApiBudget(firstProfile, started.run_id);
+
+    first.close();
+    await pause(2_000);
+    first = client(firstProfile);
+    const afterDisconnect = await first.getRun(started.run_id);
+    invariant(
+      afterDisconnect.state === 'running',
+      'controller disconnect stopped or lost the active installed-service campaign',
+    );
+
+    let crossControllerDenied = false;
+    try {
+      await second.getRun(started.run_id);
+    } catch (error) {
+      crossControllerDenied = error instanceof WorkerClientError && error.status === 404;
+    }
+    invariant(crossControllerDenied, 'second controller learned the first controller run');
+
+    const serviceProcessTree = path.join(root, 'scripts', 'windows', 'assert-worker-service-process-tree.ps1');
+    execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', serviceProcessTree], {
+      cwd: root,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+
+    const statsPath = path.join(workerDataRoot, 'outputs', started.run_id, 'fuzzer_stats');
+    const deadline = Date.now() + maxWaitMs;
+    let executions = 0;
+    while (Date.now() < deadline) {
+      const observed = await readExecutions(statsPath);
+      if (observed !== null) executions = Math.max(executions, observed);
+      if (executions >= minimumExecutions) break;
+      const status = await first.getRun(started.run_id);
+      invariant(
+        status.state === 'running',
+        `installed worker stopped before ${minimumExecutions} genuine executions ` +
+          `(state=${status.state}, stop_reason=${String(status.stop_reason ?? 'unknown')}, observed_execs=${executions})`,
+      );
+      await pause(1_000);
+    }
+    invariant(executions >= minimumExecutions, `installed worker timed out below ${minimumExecutions} genuine executions (observed_execs=${executions})`);
+
+    const stop = await first.stopRun(started.run_id);
+    stopped = true;
+    invariant(stop.state === 'completed' && stop.stop_reason === 'requested', 'installed worker did not complete the requested stop');
+    const finalCount = await readExecutions(statsPath);
+    invariant(finalCount !== null && finalCount >= minimumExecutions, 'installed worker finalized fewer than 1,000 measured executions');
+    const statsSha256 = createHash('sha256').update(await readFile(statsPath)).digest('hex');
+    const events = await first.eventsAfter(started.run_id, 0n);
+    const eventTypes = events.map((event) => event.event_type);
+    const teardown = eventTypes.lastIndexOf('process_teardown');
+    const finalized = eventTypes.lastIndexOf('evidence_finalized');
+    const completed = eventTypes.lastIndexOf('state_changed');
+    invariant(teardown >= 0 && finalized > teardown && completed > finalized, 'service event history does not prove ordered teardown and finalization');
+
+    invariant(process.env.WORKER_SERVICE_PROVISIONER_PATH, 'live trust provisioner path is unavailable');
+    const revocationPath = await writeFreshRevocation(firstProfile);
+    execFileSync(
+      'pwsh',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-File',
+        process.env.WORKER_SERVICE_PROVISIONER_PATH,
+        '-TrustOperationPath',
+        revocationPath,
+        '-Live',
+      ],
+      { cwd: root, stdio: 'pipe', windowsHide: true },
+    );
+    let reusedSessionRevoked = false;
+    try {
+      await first.getRun(started.run_id);
+    } catch {
+      reusedSessionRevoked = true;
+    }
+    invariant(reusedSessionRevoked, 'live revocation did not deny the existing authenticated client session');
+    invariant(
+      (await second.capabilities()).controller_id === secondProfile.controllerId,
+      'revoking one controller disrupted another controller trust record',
+    );
+
+    const secondImported = await second.importInputBundle(archive);
+    const forcedStart = await second.startRun(
+      validateRunRequest({
+        request_id: randomUUID(),
+        controller_id: asControllerId(secondProfile.controllerId),
+        input_bundle_id: secondImported.input_bundle_id,
+        target_lock_sha256: secondCapabilities.target_lock_sha256,
+        limits: secondCapabilities.max_limits,
+        label: 'installed Windows forced-termination recovery acceptance',
+      }),
+    );
+    invariant(forcedStart.state === 'running', 'second controller campaign did not start for forced-stop acceptance');
+    forcedRunId = forcedStart.run_id;
+    execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', serviceProcessTree], {
+      cwd: root,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+    await pause(1_000);
+    invariant(
+      (await second.getRun(forcedStart.run_id)).state === 'running',
+      'forced-stop acceptance campaign did not remain active before host termination',
+    );
+    invariant(fixtureRoot, 'worker-service fixture root is unavailable');
+    await writeFile(
+      path.join(fixtureRoot, 'forced-termination-run.json'),
+      `${JSON.stringify({ runId: forcedStart.run_id, inputBundleId: secondImported.input_bundle_id })}\n`,
+      { flag: 'wx', mode: 0o600 },
+    );
+
+    const record = {
+      schema_version: 1,
+      source_commit: sourceCommit.toLowerCase(),
+      checked_out_commit: checkedOutCommit.toLowerCase(),
+      state: stop.state,
+      stop_reason: stop.stop_reason,
+      worker_id: capabilities.worker_id,
+      controller_id: capabilities.controller_id,
+      run_id: started.run_id,
+      executions_done: finalCount,
+      fuzzer_stats_sha256: statsSha256,
+      process_tree_verified_as_service_sid: true,
+      paired_controllers: 2,
+      unpaired_certificate_denied: true,
+      cross_controller_run_denied: true,
+      controller_disconnect_campaign_continued: afterDisconnect.state === 'running',
+      api_budget_observation: apiBudgetObservation,
+      forced_termination_run_id: forcedStart.run_id,
+      forced_termination_input_bundle_id: secondImported.input_bundle_id,
+      live_revocation_destroyed_existing_session: true,
+      event_types: eventTypes,
+    };
+    await writeFile(summaryPath, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+    forcedTerminationArmed = true;
+    console.log(`Verified installed mTLS service campaign: ${finalCount} genuine WinAFL executions.`);
+  } finally {
+    archive?.fill(0);
+    if (runId && !stopped) {
+      try {
+        await first.stopRun(runId);
+      } catch {
+        // Failed shutdown is recorded by the service journal; do not fabricate a pass summary.
+      }
+    }
+    if (forcedRunId && !forcedTerminationArmed) {
+      try {
+        await second.stopRun(forcedRunId);
+      } catch {
+        // If setup failed, the service journal remains authoritative and the runner fails closed.
+      }
+    }
+    first.close();
+    second.close();
+    unpaired.close();
+  }
+}
+
+await main().finally(async () => {
+  if (process.env.WORKER_SERVICE_ACCEPTANCE_CLEANUP === 'true') {
+    await rm(nativeRoot, { recursive: true, force: true });
+  }
+});

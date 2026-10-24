@@ -25,7 +25,7 @@ BeforeAll {
     $dll=Join-Path $bin 'winafl.dll'
     $dr=Join-Path $bin 'drrun.exe'
     New-PE $afl; New-PE $dll; New-PE $dr
-    return @{SumatraSource=$src;WinAflExe=$afl;WinAflDll=$dll;DrrunExe=$dr;Workspace=(Join-Path $Root 'work dir');TargetConfig=$cfg}
+    return @{SumatraSource=$src;WinAflExe=$afl;WinAflDll=$dll;DrrunExe=$dr;Workspace=(Join-Path $Root 'work dir');TargetConfig=$cfg;WinAflPatchSha256=(Get-FileHash (Join-Path $PSScriptRoot '../patches/winafl-private-namespace.patch') -Algorithm SHA256).Hash.ToLowerInvariant()}
   }
 }
 Describe 'Windows toolchain validation' -Skip:(!$IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
@@ -34,6 +34,8 @@ Describe 'Windows toolchain validation' -Skip:(!$IsWindows -or [Runtime.InteropS
     { & $script:scriptPath @fixture } | Should -Not -Throw
     $lock=Get-Content -LiteralPath (Join-Path $fixture.Workspace 'target-lock.json') -Raw | ConvertFrom-Json
     $lock.tools.drrun.sha256 | Should -Match '^[0-9a-f]{64}$'
+    $lock.acquisition.winafl_source_commit | Should -Be 'fd85f38548b14352f4b70ad414f364ea6dc1a769'
+    $lock.acquisition.winafl_patch_sha256 | Should -Be $fixture.WinAflPatchSha256
     $lock.source_commit | Should -Be ((& git -C $fixture.SumatraSource rev-parse HEAD).Trim())
   }
   It 'rejects missing binary' {

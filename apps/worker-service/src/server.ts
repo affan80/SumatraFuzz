@@ -1,4 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
+import type { Socket } from 'node:net';
 import type { PeerCertificate, TLSSocket } from 'node:tls';
 import type { SqliteRunStore } from '@sumatrafuzz/run-store';
 import {
@@ -9,9 +11,27 @@ import {
   validateRunRequest,
   validateRunStatus,
 } from '@sumatrafuzz/worker-protocol';
+import { TLS_MIN_VERSION, validateEndpointCertificate } from '@sumatrafuzz/worker-security';
+import {
+  type AdmissionPolicy,
+  createAdmissionController,
+  createAuditEventLimiter,
+  PROVISIONAL_ADMISSION_POLICY,
+  type RequestLease,
+  type SocketLease,
+} from './admission.js';
 import { authorizePairedCertificate, type PeerCertificateIdentity } from './auth.js';
 import { importInputBundleFrom, MAX_ARCHIVE_BYTES } from './input-bundles.js';
 import { type BindMode, validateBindAddress } from './network-policy.js';
+import { type AuthenticatedPrincipal, authorizeRoute } from './route-policy.js';
+import {
+  type AuditAction,
+  AuditError,
+  type AuditRecord,
+  type AuditResource,
+  type SecurityAudit,
+} from './security-audit.js';
+import type { WorkerTrustRequestSource } from './trust-store.js';
 
 export interface WorkerEventRecord {
   readonly seq: string;
@@ -60,18 +80,23 @@ export interface WorkerServerConfig {
   readonly key: Buffer;
   readonly cert: Buffer;
   readonly ca: Buffer;
-  readonly pairedControllers: ReadonlyMap<string, string>;
-  readonly revokedFingerprints?: ReadonlySet<string>;
+  /** Single service-owned repository; all supported operator mutations use this instance. */
+  readonly trust: WorkerTrustRequestSource;
+  readonly audit: SecurityAudit;
   readonly handlers: WorkerApiHandlers;
   readonly store: Pick<SqliteRunStore, 'ownsRun'>;
   readonly inputRoot: string;
   readonly ensureInputCapacity: (bytesToWrite: number) => Promise<void>;
   readonly maxInputBundleBytes: number;
   readonly maxRequestBytes?: number;
+  readonly admissionPolicy?: AdmissionPolicy;
+  readonly shutdownTimeoutMs?: number;
 }
 
 export interface WorkerServer {
   readonly address: string;
+  /** Call after trust revocation commits; this hook supplies cancellation, not trust authority. */
+  disconnectController(controllerId: string): void;
   close(): Promise<void>;
 }
 
@@ -82,6 +107,89 @@ const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const WORKER_PROTOCOL_VERSION = '1';
 const FINGERPRINT = /^[0-9a-f]{64}$/i;
 const MAX_SQLITE_SEQUENCE = '9223372036854775807';
+const MAX_REQUEST_HEADER_FIELDS = 64;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+
+const SAFE_ERROR_CODES = new Map([
+  [400, 'invalid_request'],
+  [401, 'unauthorized'],
+  [403, 'forbidden'],
+  [404, 'not_found'],
+  [408, 'request_timeout'],
+  [409, 'conflict'],
+  [413, 'payload_too_large'],
+  [414, 'uri_too_long'],
+  [415, 'unsupported_media_type'],
+  [416, 'range_not_satisfiable'],
+  [426, 'protocol_version_unsupported'],
+  [429, 'too_many_requests'],
+  [431, 'headers_too_large'],
+  [500, 'internal_error'],
+  [503, 'service_unavailable'],
+  [507, 'insufficient_storage'],
+]);
+
+function safeFailure(error: unknown, requestId: string): { status: number; value: object } {
+  const candidate = error && typeof error === 'object' && 'status' in error ? error.status : 500;
+  const status = typeof candidate === 'number' && SAFE_ERROR_CODES.has(candidate) ? candidate : 500;
+  return { status, value: { error: SAFE_ERROR_CODES.get(status), request_id: requestId } };
+}
+
+function rejectRequest(status: number): never {
+  throw Object.assign(new Error('worker request rejected'), { status });
+}
+
+function auditErrorCode(error: unknown): AuditRecord['errorCode'] {
+  if (error instanceof AuditError) return 'audit_degraded';
+  const status = error && typeof error === 'object' && 'status' in error ? error.status : 500;
+  if (status === 400) return 'invalid_request';
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 408) return 'request_timeout';
+  if (status === 409) return 'conflict';
+  if (status === 413 || status === 429 || status === 507) return 'resource_limit';
+  if (status === 503) return 'service_unavailable';
+  return 'operation_failed';
+}
+
+/** Node rejects CL/TE conflicts and duplicate CL before dispatch; cover the remaining ambiguity. */
+function validateRequestFraming(request: import('node:http').IncomingMessage): void {
+  // maxHeadersCount truncates request.headers, not the parser's raw framing input.
+  if (request.rawHeaders.length > MAX_REQUEST_HEADER_FIELDS * 2) rejectRequest(400);
+  const values = (name: string): string[] =>
+    request.rawHeaders.filter(
+      (_value, index) => index % 2 === 1 && request.rawHeaders[index - 1]?.toLowerCase() === name,
+    );
+  const lengths = values('content-length');
+  const encodings = values('transfer-encoding');
+  const length = lengths[0];
+  const encoding = encodings[0];
+  if (
+    lengths.length > 1 ||
+    encodings.length > 1 ||
+    (length !== undefined && encoding !== undefined) ||
+    (length !== undefined &&
+      (!/^(0|[1-9][0-9]*)$/.test(length) || !Number.isSafeInteger(Number(length)))) ||
+    (encoding !== undefined && encoding.toLowerCase() !== 'chunked')
+  )
+    rejectRequest(400);
+}
+
+function requireContentType(
+  request: import('node:http').IncomingMessage,
+  expected: 'application/json' | 'application/zip',
+): void {
+  const values = request.rawHeaders.filter(
+    (value, index) => index % 2 === 0 && value.toLowerCase() === 'content-type',
+  );
+  const type = request.headers['content-type'];
+  const supported =
+    expected === 'application/json'
+      ? /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?\s*$/i
+      : /^application\/zip\s*$/i;
+  if (values.length !== 1 || typeof type !== 'string' || !supported.test(type)) rejectRequest(415);
+}
 
 function peerIdentity(peer: PeerCertificate, authorized: boolean): PeerCertificateIdentity | null {
   if (!peer.fingerprint256 || !peer.valid_from || !peer.valid_to) return null;
@@ -246,18 +354,47 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
     requestLimit > MAX_ARCHIVE_BYTES
   )
     throw new RangeError('invalid request size limit');
-  const pairedControllers = new Map<string, string>();
-  for (const [fingerprint, controllerId] of config.pairedControllers) {
-    const normalized = fingerprint.replaceAll(':', '').toLowerCase();
-    if (!FINGERPRINT.test(normalized) || !isNonNilUuid(controllerId))
-      throw new TypeError('invalid paired controller certificate record');
-    if (pairedControllers.has(normalized))
-      throw new TypeError('duplicate paired certificate fingerprint');
-    pairedControllers.set(normalized, controllerId);
-  }
+  if (
+    !config.trust ||
+    typeof config.trust.resolveFingerprint !== 'function' ||
+    typeof config.trust.subscribe !== 'function'
+  )
+    throw new TypeError('live worker trust repository is required');
+  if (
+    !config.audit ||
+    typeof config.audit.append !== 'function' ||
+    config.audit.health.state !== 'healthy'
+  )
+    throw new TypeError('healthy durable worker audit is required');
   if (typeof config.ensureInputCapacity !== 'function')
     throw new TypeError('input bundle disk capacity check is required');
+  validateEndpointCertificate(config.cert, 'server');
   const inputImportGate = createExclusiveRequestGate();
+  const admissionPolicy = Object.freeze({
+    ...(config.admissionPolicy ?? PROVISIONAL_ADMISSION_POLICY),
+  });
+  const admission = createAdmissionController(admissionPolicy);
+  const allowTlsRejectionAudit = createAuditEventLimiter(10, 60_000);
+  const allowUnauthenticatedDenialAudit = createAuditEventLimiter(10, 60_000);
+  const allowAdmissionDenialAudit = createAuditEventLimiter(20, 60_000);
+  const shutdownTimeoutMs = config.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(shutdownTimeoutMs) ||
+    shutdownTimeoutMs < 1 ||
+    shutdownTimeoutMs > 120_000
+  )
+    throw new RangeError('invalid worker shutdown timeout');
+  const activeWork = new Set<Promise<void>>();
+  type Connection = { socket: Socket; lease: SocketLease; requests: number; fingerprint?: string };
+  const connections = new Map<string, Connection>();
+  const socketKey = (socket: Socket): string =>
+    JSON.stringify([
+      socket.remoteAddress,
+      socket.remotePort,
+      socket.localAddress,
+      socket.localPort,
+    ]);
+  let closing: Promise<void> | undefined;
 
   const server: HttpsServer = createHttpsServer(
     {
@@ -266,59 +403,252 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
       ca: config.ca,
       requestCert: true,
       rejectUnauthorized: true,
-      minVersion: 'TLSv1.2',
+      minVersion: TLS_MIN_VERSION,
+      maxHeaderSize: admissionPolicy.maxHeaderBytes,
+      handshakeTimeout: admissionPolicy.handshakeTimeoutMs,
     },
     (request, response) => {
-      void (async () => {
-        const socket = request.socket as TLSSocket;
-        const peer = socket.getPeerCertificate(true);
-        const fingerprint = authorizePairedCertificate(
-          peerIdentity(peer, socket.authorized),
-          new Set(pairedControllers.keys()),
-          config.revokedFingerprints ?? new Set(),
-        );
-        const controllerId = pairedControllers.get(fingerprint);
-        if (!controllerId || !isNonNilUuid(controllerId))
-          throw new Error('paired controller identity is invalid');
-        assertProtocolVersion(request.headers['x-sf-protocol-version']);
-        if (
-          !request.url?.startsWith('/') ||
-          request.url.startsWith('//') ||
-          request.url.includes('\\')
-        ) {
-          throw Object.assign(new Error('origin-form request path required'), { status: 400 });
+      const requestId = randomUUID();
+      const connection = connections.get(socketKey(request.socket));
+      let lease: RequestLease | undefined;
+      let workDone = false;
+      let transportDone = false;
+      if (connection) {
+        connection.requests++;
+        connection.lease.headersReceived();
+      }
+      const release = () => {
+        if (workDone && transportDone) lease?.release();
+      };
+      const finished = () => {
+        if (transportDone) return;
+        transportDone = true;
+        if (connection) {
+          connection.requests--;
+          if (connection.requests === 0 && connection.lease.active)
+            connection.lease.waitForHeaders();
         }
-        const url = new URL(request.url, 'https://worker.invalid');
-        const segments = url.pathname.split('/').filter(Boolean);
-
-        if (request.method === 'GET' && url.pathname === '/v1/capabilities') {
-          json(response, 200, await config.handlers.capabilities(controllerId));
+        release();
+      };
+      response.once('finish', finished);
+      response.once('close', () => {
+        if (!response.writableFinished && connection) {
+          connection.lease.release();
+          connection.socket.destroy();
+        }
+        finished();
+      });
+      request.once('aborted', () => {
+        connection?.lease.release();
+        connection?.socket.destroy();
+      });
+      const admitted = async <T>(operation: () => Promise<T>): Promise<T> => {
+        if (!lease) rejectRequest(503);
+        lease.assertActive();
+        const result = await operation();
+        lease.assertActive();
+        return result;
+      };
+      const work = (async () => {
+        if (!connection?.lease.active) {
+          request.destroy();
           return;
         }
-        if (request.method === 'GET' && url.pathname === '/v1/runs/active') {
-          const activeRun = await config.handlers.activeRun(controllerId);
+        if (Buffer.byteLength(request.url ?? '') > admissionPolicy.maxTargetBytes)
+          rejectRequest(414);
+        let headerBytes = 2;
+        for (let index = 0; index < request.rawHeaders.length; index += 2) {
+          headerBytes +=
+            Buffer.byteLength(request.rawHeaders[index] ?? '') +
+            Buffer.byteLength(request.rawHeaders[index + 1] ?? '') +
+            4;
+        }
+        if (headerBytes > admissionPolicy.maxHeaderBytes) rejectRequest(431);
+        validateRequestFraming(request);
+        const socket = request.socket as TLSSocket;
+        const peer = socket.getPeerCertificate(true);
+        if (!socket.authorized || !peer.raw) rejectRequest(401);
+        let principal: AuthenticatedPrincipal;
+        try {
+          validateEndpointCertificate(peer.raw, 'client');
+          const record = authorizePairedCertificate(
+            peerIdentity(peer, socket.authorized),
+            config.trust,
+          );
+          principal = {
+            controllerId: record.controllerId,
+            fingerprint: record.fingerprint,
+            permissions: record.permissions,
+          };
+          connection.fingerprint = record.fingerprint;
+        } catch {
+          if (allowUnauthenticatedDenialAudit()) {
+            const fingerprint =
+              typeof peer.fingerprint256 === 'string' &&
+              /^[0-9a-f]{64}$/i.test(peer.fingerprint256.replaceAll(':', ''))
+                ? peer.fingerprint256.replaceAll(':', '').toLowerCase()
+                : undefined;
+            try {
+              await config.audit.append({
+                timestamp: new Date().toISOString(),
+                requestId,
+                action: 'authorize',
+                resource: 'unknown',
+                decision: 'deny',
+                trustRevision: config.trust.revision,
+                ...(fingerprint === undefined ? {} : { fingerprint }),
+                errorCode: 'unauthorized',
+              });
+            } catch {
+              // Authentication remains denied even if the audit store is unavailable.
+            }
+          }
+          rejectRequest(401);
+        }
+        const controllerId = principal.controllerId;
+        const protocolValid = request.headers['x-sf-protocol-version'] === WORKER_PROTOCOL_VERSION;
+        const target = request.url ?? '';
+        const pathname = target.split('?')[0] ?? '';
+        // Authorize the original target first: URL would normalize dot segments and hide aliases.
+        const decision = authorizeRoute(principal, request.method ?? '', pathname);
+        const resource: AuditResource = decision.allowed ? decision.route : 'unknown';
+        const auditBase = {
+          timestamp: new Date().toISOString(),
+          requestId,
+          action: 'authorize' as const,
+          resource,
+          trustRevision: config.trust.revision,
+          fingerprint: principal.fingerprint,
+          controllerId: principal.controllerId,
+          ...(decision.allowed && decision.scope.kind !== 'controller'
+            ? { runId: decision.scope.runId }
+            : {}),
+          ...(decision.allowed && decision.scope.kind === 'artifact'
+            ? { artifactId: decision.scope.artifactId }
+            : {}),
+        };
+        const scope =
+          decision.allowed && decision.route === 'importInputBundle'
+            ? { kind: 'upload' as const }
+            : decision.allowed && decision.route === 'artifact'
+              ? { kind: 'artifact' as const }
+              : decision.allowed &&
+                  decision.route === 'eventsAfter' &&
+                  decision.scope.kind !== 'controller'
+                ? { kind: 'replay' as const, runId: decision.scope.runId }
+                : { kind: 'ordinary' as const };
+        const permitted = admission.acquireRequest(connection.lease, controllerId, scope);
+        if (!permitted.allowed) {
+          if (allowAdmissionDenialAudit()) {
+            try {
+              await config.audit.append({
+                ...auditBase,
+                decision: 'deny',
+                errorCode: permitted.status === 429 ? 'resource_limit' : 'service_unavailable',
+              });
+            } catch {
+              // Admission denial remains bounded and cannot be bypassed by audit failure.
+            }
+          }
+          rejectRequest(permitted.status);
+        }
+        lease = permitted.lease;
+        await config.audit.append({
+          ...auditBase,
+          decision: decision.allowed && protocolValid ? 'allow' : 'deny',
+          ...(!protocolValid ? { errorCode: 'invalid_request' as const } : {}),
+        });
+        if (!protocolValid) assertProtocolVersion(request.headers['x-sf-protocol-version']);
+        if (!decision.allowed || target.includes('#')) rejectRequest(404);
+        if (
+          decision.scope.kind !== 'controller' &&
+          !config.store.ownsRun(asControllerId(controllerId), asRunId(decision.scope.runId))
+        ) {
+          await config.audit.append({ ...auditBase, decision: 'deny', errorCode: 'not_found' });
+          rejectRequest(404);
+        }
+
+        const auditedMutation = async <T>(
+          action: AuditAction,
+          resource: AuditResource,
+          operation: () => Promise<T>,
+        ): Promise<T> => {
+          if (config.audit.health.state !== 'healthy') {
+            throw Object.assign(new AuditError('degraded'), { status: 503 });
+          }
+          const record = {
+            ...auditBase,
+            action,
+            resource,
+            decision: 'intent' as const,
+          };
+          await config.audit.append(record);
+          try {
+            const result = await operation();
+            const resultRunId =
+              result &&
+              typeof result === 'object' &&
+              'run_id' in result &&
+              typeof result.run_id === 'string' &&
+              isNonNilUuid(result.run_id)
+                ? result.run_id
+                : undefined;
+            await config.audit.append({
+              ...record,
+              decision: 'success',
+              ...(resultRunId === undefined ? {} : { runId: resultRunId }),
+            });
+            return result;
+          } catch (error) {
+            try {
+              await config.audit.append({
+                ...record,
+                decision: 'failure',
+                ...(auditErrorCode(error) === undefined
+                  ? {}
+                  : { errorCode: auditErrorCode(error) as NonNullable<AuditRecord['errorCode']> }),
+              });
+            } catch {
+              // Preserve the operation error; audit health is already degraded and gates later work.
+            }
+            throw error;
+          }
+        };
+
+        const url = new URL(target, 'https://worker.invalid');
+
+        if (decision.route === 'capabilities') {
+          json(response, 200, await admitted(() => config.handlers.capabilities(controllerId)));
+          return;
+        }
+        if (decision.route === 'activeRun') {
+          const activeRun = await admitted(() => config.handlers.activeRun(controllerId));
           json(response, 200, {
             active_run: activeRun === null ? null : validateRunStatus(activeRun),
           });
           return;
         }
-        if (request.method === 'POST' && url.pathname === '/v1/input-bundles') {
+        if (decision.route === 'importInputBundle') {
+          requireContentType(request, 'application/zip');
           const release = inputImportGate.tryAcquire();
           if (!release) {
             request.resume();
-            json(response, 429, { error: 'another input bundle import is already in progress' });
-            return;
+            rejectRequest(429);
           }
           try {
             json(
               response,
               201,
-              await importInputBundleFrom(
-                config.inputRoot,
-                controllerId,
-                () => body(request, requestLimit),
-                config.maxInputBundleBytes,
-                { ensureCapacity: config.ensureInputCapacity },
+              await auditedMutation('input_bundle_import', 'importInputBundle', () =>
+                admitted(() =>
+                  importInputBundleFrom(
+                    config.inputRoot,
+                    controllerId,
+                    () => admitted(() => body(request, requestLimit)),
+                    config.maxInputBundleBytes,
+                    { ensureCapacity: config.ensureInputCapacity },
+                  ),
+                ),
               ),
             );
           } finally {
@@ -326,8 +656,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
           }
           return;
         }
-        if (request.method === 'POST' && url.pathname === '/v1/runs') {
-          const raw = await body(request, Math.min(requestLimit, 1024 * 1024));
+        if (decision.route === 'startRun') {
+          requireContentType(request, 'application/json');
+          const raw = await admitted(() => body(request, Math.min(requestLimit, 1024 * 1024)));
           let payload: unknown;
           try {
             payload = JSON.parse(raw.toString('utf8')) as unknown;
@@ -339,29 +670,40 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             request.headers['idempotency-key'],
             controllerId,
           );
-          json(response, 202, await config.handlers.startRun(controllerId, runRequest));
+          json(
+            response,
+            202,
+            await auditedMutation('run_start', 'startRun', () =>
+              admitted(() => config.handlers.startRun(controllerId, runRequest)),
+            ),
+          );
           return;
         }
-        if (segments[0] === 'v1' && segments[1] === 'runs' && isNonNilUuid(segments[2] ?? '')) {
-          const runId = segments[2] as string;
-          if (!config.store.ownsRun(asControllerId(controllerId), asRunId(runId))) {
-            throw Object.assign(new Error('run not found'), { status: 404 });
-          }
-          if (request.method === 'GET' && segments.length === 3) {
-            json(response, 200, await config.handlers.getRun(controllerId, runId));
+        if (decision.scope.kind !== 'controller') {
+          const runId = decision.scope.runId;
+          if (decision.route === 'getRun') {
+            json(response, 200, await admitted(() => config.handlers.getRun(controllerId, runId)));
             return;
           }
-          if (request.method === 'POST' && segments.length === 4 && segments[3] === 'stop') {
-            json(response, 202, await config.handlers.stopRun(controllerId, runId));
+          if (decision.route === 'stopRun') {
+            json(
+              response,
+              202,
+              await auditedMutation('run_stop', 'stopRun', () =>
+                admitted(() => config.handlers.stopRun(controllerId, runId)),
+              ),
+            );
             return;
           }
-          if (request.method === 'GET' && segments.length === 4 && segments[3] === 'events') {
+          if (decision.route === 'eventsAfter') {
             const after = url.searchParams.get('after') ?? request.headers['last-event-id'] ?? '0';
             if (typeof after !== 'string')
               throw Object.assign(new Error('invalid event replay sequence'), { status: 400 });
             parseEventSequence(after);
             const limit = parseEventPageLimit(url.searchParams.get('limit'));
-            const events = await config.handlers.eventsAfter(controllerId, runId, after, limit);
+            const events = await admitted(() =>
+              config.handlers.eventsAfter(controllerId, runId, after, limit),
+            );
             if (events.length > limit)
               throw new Error('event handler exceeded the requested page size');
             const frames: string[] = [];
@@ -389,21 +731,18 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             response.end();
             return;
           }
-          if (request.method === 'GET' && segments.length === 4 && segments[3] === 'manifest') {
-            json(response, 200, await config.handlers.manifest(controllerId, runId));
+          if (decision.route === 'manifest') {
+            json(
+              response,
+              200,
+              await admitted(() => config.handlers.manifest(controllerId, runId)),
+            );
             return;
           }
-          if (
-            request.method === 'GET' &&
-            segments.length === 5 &&
-            segments[3] === 'artifacts' &&
-            /^[A-Za-z0-9_-]{1,128}$/.test(segments[4] ?? '')
-          ) {
-            const artifactId = segments[4] as string;
-            const metadata = await config.handlers.artifactMetadata(
-              controllerId,
-              runId,
-              artifactId,
+          if (decision.route === 'artifact' && decision.scope.kind === 'artifact') {
+            const artifactId = decision.scope.artifactId;
+            const metadata = await admitted(() =>
+              config.handlers.artifactMetadata(controllerId, runId, artifactId),
             );
             if (
               !Number.isSafeInteger(metadata.totalBytes) ||
@@ -424,7 +763,9 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
               start: 0,
               end: Math.min(metadata.totalBytes - 1, MAX_ARTIFACT_CHUNK_BYTES - 1),
             };
-            const chunk = await config.handlers.artifact(controllerId, runId, artifactId, range);
+            const chunk = await admitted(() =>
+              config.handlers.artifact(controllerId, runId, artifactId, range),
+            );
             if (
               chunk.bytes.length !== chunk.end - chunk.start + 1 ||
               chunk.totalBytes !== metadata.totalBytes ||
@@ -449,43 +790,167 @@ export async function createWorkerServer(config: WorkerServerConfig): Promise<Wo
             return;
           }
         }
-        json(response, 404, { error: 'not_found' });
-      })().catch((error: unknown) => {
-        if (response.headersSent) {
-          response.destroy(error instanceof Error ? error : new Error('worker request failed'));
-          return;
-        }
-        const status =
-          error && typeof error === 'object' && 'status' in error ? Number(error.status) : 500;
-        json(response, Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500, {
-          error: status === 500 ? 'internal_error' : 'invalid_request',
-          message: status === 500 ? 'worker request failed' : 'request rejected',
+        rejectRequest(404);
+      })()
+        .catch((error: unknown) => {
+          if (response.destroyed || request.socket.destroyed) return;
+          if (response.headersSent) {
+            response.destroy(error instanceof Error ? error : new Error('worker request failed'));
+            return;
+          }
+          request.resume();
+          const failure =
+            error instanceof AuditError
+              ? { status: 503, value: { error: 'service_unavailable', request_id: requestId } }
+              : safeFailure(error, requestId);
+          if (failure.status === 429 || failure.status === 503)
+            response.setHeader('retry-after', '1');
+          json(response, failure.status, failure.value);
+        })
+        .finally(() => {
+          workDone = true;
+          release();
         });
-      });
+      activeWork.add(work);
+      void work.then(() => activeWork.delete(work));
     },
   );
-  server.headersTimeout = 15_000;
-  server.requestTimeout = 10 * 60_000;
-  server.keepAliveTimeout = 5_000;
-  server.maxHeadersCount = 64;
-
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(config.port, config.host, () => {
-      server.off('error', reject);
-      resolve();
+  server.on('connection', (socket: Socket) => {
+    const key = socketKey(socket);
+    const lease = admission.acquireSocket(() => socket.destroy());
+    if (!lease) {
+      socket.destroy();
+      return;
+    }
+    const connection: Connection = { socket, lease, requests: 0 };
+    connections.set(key, connection);
+    socket.once('close', () => {
+      lease.release();
+      if (connections.get(key) === connection) connections.delete(key);
     });
   });
+  server.on('secureConnection', (socket: TLSSocket) => {
+    const key = socketKey(socket);
+    const connection = connections.get(key);
+    if (!connection) {
+      socket.destroy();
+      return;
+    }
+    connection.lease.secure();
+    const peerFingerprint = socket
+      .getPeerCertificate(true)
+      .fingerprint256?.replaceAll(':', '')
+      .toLowerCase();
+    if (peerFingerprint && FINGERPRINT.test(peerFingerprint))
+      connection.fingerprint = peerFingerprint;
+    socket.on('data', () => connection.lease.touch());
+    socket.once('close', () => {
+      connection.lease.release();
+      if (connections.get(key) === connection) connections.delete(key);
+    });
+  });
+  server.on('clientError', (error, socket) => {
+    if (!socket.writable || socket.writableEnded) return;
+    const status = (error as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' ? 431 : 400;
+    const failure = safeFailure({ status }, randomUUID());
+    const serialized = serializeBoundedJson(failure.value);
+    socket.end(
+      `HTTP/1.1 ${status} ${status === 431 ? 'Request Header Fields Too Large' : 'Bad Request'}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(serialized)}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n${serialized}`,
+    );
+  });
+  server.on('tlsClientError', () => {
+    if (!allowTlsRejectionAudit()) return;
+    try {
+      void config.audit
+        .append({
+          timestamp: new Date().toISOString(),
+          requestId: randomUUID(),
+          action: 'tls_rejected',
+          decision: 'deny',
+          trustRevision: config.trust.revision,
+          errorCode: 'unauthorized',
+        })
+        .catch(() => {});
+    } catch {
+      // A rejected handshake stays rejected even when trust state cannot be read.
+    }
+  });
+  server.headersTimeout = admissionPolicy.headersTimeoutMs;
+  server.requestTimeout = admissionPolicy.uploadTimeoutMs;
+  server.keepAliveTimeout = Math.min(5_000, admissionPolicy.idleTimeoutMs);
+  server.maxHeadersCount = MAX_REQUEST_HEADER_FIELDS;
+
+  const unsubscribeTrust = config.trust.subscribe((change) => {
+    for (const fingerprint of change.fingerprints) {
+      let authorized = false;
+      try {
+        authorized = config.trust.resolveFingerprint(fingerprint, new Date()) !== null;
+      } catch {
+        /* Trust lookup failure denies continued socket use. */
+      }
+      if (authorized) continue;
+      for (const connection of connections.values())
+        if (connection.fingerprint === fingerprint) {
+          connection.lease.release();
+          connection.socket.destroy();
+        }
+    }
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(config.port, config.host, () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    unsubscribeTrust();
+    admission.close();
+    throw error;
+  }
   const address = server.address();
   if (!address || typeof address === 'string') {
+    unsubscribeTrust();
+    admission.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     throw new Error('worker server did not bind a TCP address');
   }
   return {
     address: `https://${config.host.includes(':') ? `[${config.host}]` : config.host}:${address.port}`,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      ),
+    disconnectController(controllerId) {
+      admission.revokeController(controllerId);
+    },
+    close: () => {
+      if (!closing) {
+        unsubscribeTrust();
+        admission.close();
+        closing = (async () => {
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+          const deadline = performance.now() + shutdownTimeoutMs;
+          while (activeWork.size > 0) {
+            const remainingMs = deadline - performance.now();
+            if (remainingMs <= 0) throw new Error('worker request drain timed out');
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                Promise.allSettled([...activeWork]),
+                new Promise<never>((_resolve, reject) => {
+                  timeout = setTimeout(
+                    () => reject(new Error('worker request drain timed out')),
+                    remainingMs,
+                  );
+                }),
+              ]);
+            } finally {
+              if (timeout) clearTimeout(timeout);
+            }
+          }
+        })();
+      }
+      return closing;
+    },
   };
 }

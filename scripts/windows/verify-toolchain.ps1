@@ -6,6 +6,7 @@ param(
   [Parameter(Mandatory)][string]$WinAflDll,
   [Parameter(Mandatory)][string]$DrrunExe,
   [Parameter(Mandatory)][string]$Workspace,
+  [string]$WinAflPatchSha256,
   [string]$TargetConfig = (Join-Path $PSScriptRoot '../../configs/targets/sumatrapdf-3.6.1rel.json')
 )
 Set-StrictMode -Version Latest
@@ -56,8 +57,19 @@ if (Test-Path -LiteralPath $Workspace -PathType Leaf) { throw 'Workspace must be
 [void](New-Item -ItemType Directory -Path $Workspace -Force)
 $probe = Join-Path $Workspace ('probe-' + [guid]::NewGuid().ToString('N'))
 try { [IO.File]::WriteAllText($probe,'probe') } catch { throw "Workspace unwritable: $($_.Exception.Message)" } finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+# Require the reviewed compatibility patch receipt even for externally supplied artifacts.
+$expectedPatchHash = 'bd16e8457a0f7b61f602b6d03c3ef740496382f559f2852335f6be1e6c9c8d33'
+$patchPath = Join-Path $PSScriptRoot 'patches/winafl-private-namespace.patch'
+if ($WinAflPatchSha256 -cne $expectedPatchHash -or
+    (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedPatchHash) {
+  throw 'WinAFL namespace patch digest missing or mismatched'
+}
 $lock = [ordered]@{
   schema_version=1
+  acquisition=[ordered]@{
+    winafl_source_commit='fd85f38548b14352f4b70ad414f364ea6dc1a769'
+    winafl_patch_sha256=$WinAflPatchSha256
+  }
   target_id=$config.target_id
   source_commit=$head
   source_tag=$config.source_tag

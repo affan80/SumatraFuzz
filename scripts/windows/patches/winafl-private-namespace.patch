@@ -1,0 +1,327 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index da9ac89..39856b2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -210,3 +210,9 @@ if (NOT "${DynamoRIO_DIR}" STREQUAL "")
+   endif()
+ 
+ endif()
++
++# APIs used only by the pinned SumatraFuzz private IPC compatibility patch.
++target_compile_definitions(afl-fuzz PRIVATE _WIN32_WINNT=0x0601)
++if (TARGET winafl)
++  target_compile_definitions(winafl PRIVATE _WIN32_WINNT=0x0601)
++endif()
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 88db5d5..d7e4ee7 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -35,6 +35,7 @@
+ #define MAX_SAMPLE_SIZE 1000000
+ 
+ #include <windows.h>
++#include "sf_private_namespace.h"
+ #include <TlHelp32.h>
+ #include <stdarg.h>
+ #include <io.h>
+@@ -1424,16 +1425,9 @@ static void setup_sample_shm() {
+ 	 unsigned int seeds[2];
+ 	 u64 name_seed;
+ 
+-  SECURITY_DESCRIPTOR sd;
+   SECURITY_ATTRIBUTES sa;
+-
+-  // give everyone access, to allow attached processes to communicate
+-  InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+-  SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+-
+-  sa.nLength = sizeof(sa);
+-  sa.lpSecurityDescriptor = &sd;
+-  sa.bInheritHandle = FALSE;
++  if (!sf_namespace.namespace_handle) sf_namespace_init(&sf_namespace, NULL, NULL);
++  sf_security(&sf_namespace, &sa, FILE_MAP_ALL_ACCESS);
+ 
+ 	 if (fuzzer_id == NULL) {
+ 	   // If it is null, it means we have to generate a random seed to name the instance
+@@ -1443,12 +1437,12 @@ static void setup_sample_shm() {
+ 		 fuzzer_id = (char*)alloc_printf("%I64x", name_seed);
+ 	 }
+ 	
+-  sample_shm_str = (char*)alloc_printf("sample_afl_shm_%s", fuzzer_id);
++  sample_shm_str = (char*)alloc_printf("%s\\sample_afl_shm_%s", sf_namespace.alias, fuzzer_id);
+ 	//SAYF("sample_shm_str:\r\n", sample_shm_str);	
+ 
+ 	sample_shm_handle = CreateFileMapping(
+ 			INVALID_HANDLE_VALUE,    // use paging file
+-			&sa,                     // allow access to everyone
++			&sa,                     // protected worker/run DACL
+ 			PAGE_READWRITE,          // read/write access
+ 			0,                       // maximum object size (high-order DWORD)
+ 			MAX_SAMPLE_SIZE + sizeof(uint32_t),                // maximum object size (low-order DWORD)
+@@ -1479,16 +1473,9 @@ static void setup_shm(void) {
+   u64 name_seed;
+   u8 attempts = 0;
+ 
+-  SECURITY_DESCRIPTOR sd;
+   SECURITY_ATTRIBUTES sa;
+-
+-  // give everyone access, to allow attached processes to communicate
+-  InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+-  SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+-
+-  sa.nLength = sizeof(sa);
+-  sa.lpSecurityDescriptor = &sd;
+-  sa.bInheritHandle = FALSE;
++  if (!sf_namespace.namespace_handle) sf_namespace_init(&sf_namespace, NULL, NULL);
++  sf_security(&sf_namespace, &sa, FILE_MAP_ALL_ACCESS);
+ 
+   while(attempts < 5) {
+     if(fuzzer_id == NULL) {
+@@ -1499,11 +1486,11 @@ static void setup_shm(void) {
+       fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
+     }
+ 
+-    shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
++    shm_str = (char *)alloc_printf("%s\\afl_shm_%s", sf_namespace.alias, fuzzer_id);
+ 
+     shm_handle = CreateFileMapping(
+                    INVALID_HANDLE_VALUE,    // use paging file
+-                   &sa,                     // allow access to everyone
++                   &sa,                     // protected worker/run DACL
+                    PAGE_READWRITE,          // read/write access
+                    0,                       // maximum object size (high-order DWORD)
+                    MAP_SIZE,                // maximum object size (low-order DWORD)
+@@ -2420,16 +2407,8 @@ static void create_target_process(char** argv) {
+   STARTUPINFO si;
+   PROCESS_INFORMATION pi;
+ 
+-  SECURITY_DESCRIPTOR sd;
+   SECURITY_ATTRIBUTES sa;
+-
+-  // give everyone access, to allow attached processes to communicate
+-  InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+-  SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+-
+-  sa.nLength = sizeof(sa);
+-  sa.lpSecurityDescriptor = &sd;
+-  sa.bInheritHandle = FALSE;
++  sf_security(&sf_namespace, &sa, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+ 
+   pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
+ 
+@@ -2442,7 +2421,7 @@ static void create_target_process(char** argv) {
+     512,                      // output buffer size
+     512,                      // input buffer size
+     20000,                    // client time-out
+-    &sa);                     // allow access to everyone
++    &sa);                     // protected worker/run DACL
+ 
+   if (pipe_handle == INVALID_HANDLE_VALUE) {
+     FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+@@ -2462,9 +2441,9 @@ static void create_target_process(char** argv) {
+   }
+ 
+   if (expert_mode) {
+-    client_invocation = alloc_printf("-t winafl");
++    client_invocation = alloc_printf("-t winafl -namespace_alias %s -run_sid %s", sf_namespace.alias, sf_namespace.run_sid);
+   } else {
+-    client_invocation = alloc_printf("-c %s", winafl_dll_path);
++    client_invocation = alloc_printf("-c %s -namespace_alias %s -run_sid %s", winafl_dll_path, sf_namespace.alias, sf_namespace.run_sid);
+   }
+ 
+   if(drioless) {
+diff --git a/sf_private_namespace.h b/sf_private_namespace.h
+new file mode 100644
+index 0000000..ebd8765
+--- /dev/null
++++ b/sf_private_namespace.h
+@@ -0,0 +1,105 @@
++/* SumatraFuzz: narrow IPC compatibility for the pinned Windows x64 worker.
++ * The supervisor owns the namespace. Never create it or widen the token here. */
++#ifndef SF_PRIVATE_NAMESPACE_H
++#define SF_PRIVATE_NAMESPACE_H
++#include <windows.h>
++#include <sddl.h>
++#include <string.h>
++#pragma comment(lib, "advapi32.lib")
++
++typedef struct {
++  char alias[42];
++  char run_sid[128];
++  DWORD worker_sid[SECURITY_MAX_SID_SIZE / sizeof(DWORD)];
++  PSID restricted_sid;
++  HANDLE namespace_handle;
++  DWORD acl[256];
++  SECURITY_DESCRIPTOR descriptor;
++} SF_NAMESPACE;
++static SF_NAMESPACE sf_namespace;
++
++static void sf_fail(void) {
++  /* No token, SID, command line or paths in diagnostics. */
++  OutputDebugStringA("SF_IPC_NAMESPACE_FAILURE");
++  TerminateProcess(GetCurrentProcess(), 130);
++  ExitProcess(130);
++}
++
++static void *sf_token_info(HANDLE token, TOKEN_INFORMATION_CLASS kind) {
++  DWORD size = 0;
++  void *data;
++  GetTokenInformation(token, kind, NULL, 0, &size);
++  if (!size || size > 65536) sf_fail();
++  data = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
++  if (!data || !GetTokenInformation(token, kind, data, size, &size)) sf_fail();
++  return data;
++}
++
++static void sf_namespace_init(SF_NAMESPACE *ns, const char *alias_option,
++                              const char *sid_option) {
++  DWORD length, i;
++  HANDLE token;
++  TOKEN_USER *user;
++  TOKEN_GROUPS *restricted;
++  BOOL found = FALSE;
++  SID_IDENTIFIER_AUTHORITY authority = {{0x53,0x46,0x57,0x52,0x4b,0x31}};
++  LPSTR canonical = NULL;
++  HANDLE boundary;
++  length = GetEnvironmentVariableA("SUMATRAFUZZ_NAMESPACE_ALIAS", ns->alias, sizeof(ns->alias));
++  if (length != 41 || memcmp(ns->alias, "SFWR-", 5)) sf_fail();
++  for (i = 5; i < 41; ++i) {
++    char c = ns->alias[i];
++    if (i == 13 || i == 18 || i == 23 || i == 28) {
++      if (c != '-') sf_fail();
++    } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++                 (c >= 'A' && c <= 'F'))) sf_fail();
++  }
++  length = GetEnvironmentVariableA("SUMATRAFUZZ_RUN_SID", ns->run_sid, sizeof(ns->run_sid));
++  if (!length || length >= sizeof(ns->run_sid)) sf_fail();
++  if ((alias_option && strcmp(alias_option, ns->alias)) ||
++      (sid_option && strcmp(sid_option, ns->run_sid))) sf_fail();
++  if (!ConvertStringSidToSidA(ns->run_sid, &ns->restricted_sid) ||
++      !IsValidSid(ns->restricted_sid) ||
++      memcmp(GetSidIdentifierAuthority(ns->restricted_sid), &authority, sizeof(authority)) ||
++      *GetSidSubAuthorityCount(ns->restricted_sid) != 3 ||
++      !ConvertSidToStringSidA(ns->restricted_sid, &canonical) ||
++      lstrcmpiA(canonical, ns->run_sid)) sf_fail();
++  LocalFree(canonical);
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) sf_fail();
++  user = (TOKEN_USER *)sf_token_info(token, TokenUser);
++  restricted = (TOKEN_GROUPS *)sf_token_info(token, TokenRestrictedSids);
++  for (i = 0; i < restricted->GroupCount; ++i)
++    if (EqualSid(ns->restricted_sid, restricted->Groups[i].Sid)) found = TRUE;
++  if (!found || !CopySid(sizeof(ns->worker_sid), ns->worker_sid, user->User.Sid)) sf_fail();
++  HeapFree(GetProcessHeap(), 0, user);
++  HeapFree(GetProcessHeap(), 0, restricted);
++  CloseHandle(token);
++  boundary = CreateBoundaryDescriptorA(ns->alias, 0);
++  if (!boundary || !AddSIDToBoundaryDescriptor(&boundary, ns->worker_sid)) sf_fail();
++  ns->namespace_handle = OpenPrivateNamespaceA(boundary, ns->alias);
++  DeleteBoundaryDescriptor(boundary);
++  if (!ns->namespace_handle) sf_fail();
++}
++
++static void sf_security(SF_NAMESPACE *ns, SECURITY_ATTRIBUTES *sa, DWORD rights) {
++  PACL acl = (PACL)ns->acl;
++  if (!InitializeAcl(acl, sizeof(ns->acl), ACL_REVISION) ||
++      !AddAccessAllowedAce(acl, ACL_REVISION, rights, ns->worker_sid) ||
++      !AddAccessAllowedAce(acl, ACL_REVISION, rights, ns->restricted_sid) ||
++      !InitializeSecurityDescriptor(&ns->descriptor, SECURITY_DESCRIPTOR_REVISION) ||
++      !SetSecurityDescriptorDacl(&ns->descriptor, TRUE, acl, FALSE) ||
++      !SetSecurityDescriptorControl(&ns->descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) sf_fail();
++  sa->nLength = sizeof(*sa);
++  sa->lpSecurityDescriptor = &ns->descriptor;
++  sa->bInheritHandle = FALSE;
++}
++
++static void sf_namespace_name(SF_NAMESPACE *ns, const char *object,
++                               char *output, size_t capacity) {
++  size_t a = strlen(ns->alias), n = strlen(object);
++  if (!n || strchr(object, '\\') || strchr(object, '/') || a + 1 + n >= capacity) sf_fail();
++  memcpy(output, ns->alias, a);
++  output[a] = '\\';
++  memcpy(output + a + 1, object, n + 1);
++}
++#endif
+diff --git a/winafl.c b/winafl.c
+index 766ab92..fd0b4af 100644
+--- a/winafl.c
++++ b/winafl.c
+@@ -42,6 +42,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <windows.h>
++#include "sf_private_namespace.h"
+ 
+ #define UNKNOWN_MODULE_ID USHRT_MAX
+ 
+@@ -823,19 +824,21 @@ setup_pipe() {
+          0,              // default attributes
+          NULL);          // no template file
+ 
+-    if (pipe == INVALID_HANDLE_VALUE) DR_ASSERT_MSG(false, "error connecting to pipe");
++    if (pipe == INVALID_HANDLE_VALUE) sf_fail();
+ }
+ 
+ static void
+ setup_shmem() {
+    HANDLE map_file;
++   char private_name[MAXIMUM_PATH];
++   sf_namespace_name(&sf_namespace, options.shm_name, private_name, sizeof(private_name));
+ 
+    map_file = OpenFileMapping(
+                    FILE_MAP_ALL_ACCESS,   // read/write access
+                    FALSE,                 // do not inherit the name
+-                   options.shm_name);            // name of mapping object
++                   private_name);            // name of mapping object
+ 
+-   if (map_file == NULL) DR_ASSERT_MSG(false, "error accesing shared memory");
++   if (map_file == NULL) sf_fail();
+ 
+    winafl_data.afl_area = (unsigned char *) MapViewOfFile(map_file, // handle to map object
+                FILE_MAP_ALL_ACCESS,  // read/write permission
+@@ -843,7 +846,7 @@ setup_shmem() {
+                0,
+                MAP_SIZE);
+ 
+-   if (winafl_data.afl_area == NULL) DR_ASSERT_MSG(false, "error accesing shared memory");
++   if (winafl_data.afl_area == NULL) sf_fail();
+ }
+ 
+ static void
+@@ -851,6 +854,7 @@ options_init(client_id_t id, int argc, const char *argv[])
+ {
+     int i;
+     const char *token;
++    const char *namespace_alias = NULL, *run_sid = NULL;
+     target_module_t *target_modules;
+     /* default values */
+ 	options.persistence_mode = native_mode;
+@@ -887,8 +891,17 @@ options_init(client_id_t id, int argc, const char *argv[])
+             USAGE_CHECK((i + 1) < argc, "missing logdir path");
+             strncpy(options.logdir, argv[++i], BUFFER_SIZE_ELEMENTS(options.logdir));
+         }
++        else if (strcmp(token, "-namespace_alias") == 0) {
++            if (namespace_alias || i + 1 >= argc) sf_fail();
++            namespace_alias = argv[++i];
++        }
++        else if (strcmp(token, "-run_sid") == 0) {
++            if (run_sid || i + 1 >= argc) sf_fail();
++            run_sid = argv[++i];
++        }
+         else if (strcmp(token, "-fuzzer_id") == 0) {
+             USAGE_CHECK((i + 1) < argc, "missing fuzzer id");
++            if (strlen(argv[i+1]) > 128 || strchr(argv[i+1], '\\') || strchr(argv[i+1], '/')) sf_fail();
+             strcpy(options.pipe_name, "\\\\.\\pipe\\afl_pipe_");
+             strcpy(options.shm_name, "afl_shm_");
+             strcat(options.pipe_name, argv[i+1]);
+@@ -981,6 +994,11 @@ options_init(client_id_t id, int argc, const char *argv[])
+     if(options.num_fuz_args) {
+         options.func_args = (void **)dr_global_alloc(options.num_fuz_args * sizeof(void *));
+     }
++    if (!options.debug_mode || namespace_alias || run_sid) {
++        if (!namespace_alias || !run_sid) sf_fail();
++        sf_namespace_init(&sf_namespace, namespace_alias, run_sid);
++    }
++
+ }
+ 
+ DR_EXPORT void
