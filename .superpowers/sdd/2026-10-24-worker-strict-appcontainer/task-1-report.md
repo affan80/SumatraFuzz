@@ -84,3 +84,17 @@ Local checks:
 - `git diff --check`: passed.
 
 Microsoft API references: [CreateAppContainerProfile](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile) documents `FreeSid` for its returned SID; [GetAppContainerFolderPath](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getappcontainerfolderpath) documents a SID string and `CoTaskMemFree` for the returned path; [ConvertSidToStringSid](https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw) documents `LocalFree` for its returned string.
+
+## Fix round: AppContainer ACL descriptor ownership
+
+The latest Windows checkpoint sequence stopped after `AC:ACL_EXISTING_FREE_BEGIN`, identifying the invalid free in `GrantAppContainerDirectoryAccess`. `GetNamedSecurityInfoW` returns `existing_dacl` as a pointer into the security descriptor it allocated. The probe now receives that descriptor through the final argument, keeps it alive while `SetEntriesInAclW` consumes the DACL, and releases only the descriptor with `LocalFree`. It never frees the interior DACL pointer. The replacement ACL returned by `SetEntriesInAclW` continues to be released with `LocalFree`; failure paths release any allocated descriptor or replacement ACL before returning.
+
+Added static regression checks for the descriptor out-parameter, DACL use, descriptor lifetime, and absence of `LocalFree(existing_dacl)`. Microsoft documents this ownership relationship in [GetNamedSecurityInfoW](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getnamedsecurityinfow); [SetEntriesInAclW](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setentriesinaclw) documents `LocalFree` for its returned ACL.
+
+Local verification:
+
+- `npm run format:check`: passed; Biome checked 139 files.
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
+- `git diff --check`: passed.
+
+The fix is not confirmed by Windows execution yet. A fresh exact-head Windows x64 run is required to verify the ACL stage and the full feasibility probe; this remains an ordinary-user API feasibility slice and does not establish service identity or quota-backed storage acceptance.

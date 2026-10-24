@@ -111,9 +111,14 @@ bool AppContainerChild(const std::wstring& output, const std::wstring& world,
 bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   AppContainerCheckpoint("AC:ACL_QUERY_BEGIN\n");
   PACL existing_dacl = nullptr;
+  PSECURITY_DESCRIPTOR security_descriptor = nullptr;
   const DWORD query = GetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
-      DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr, nullptr);
-  if (query != ERROR_SUCCESS) { SetLastError(query); return false; }
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr, &security_descriptor);
+  if (query != ERROR_SUCCESS) {
+    if (security_descriptor) LocalFree(security_descriptor);
+    SetLastError(query);
+    return false;
+  }
   AppContainerCheckpoint("AC:ACL_QUERY_OK\n");
   EXPLICIT_ACCESSW access{};
   access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
@@ -126,10 +131,20 @@ bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   AppContainerCheckpoint("AC:ACL_BUILD_BEGIN\n");
   const DWORD acl_result = SetEntriesInAclW(1, &access, existing_dacl, &dacl);
   AppContainerCheckpoint("AC:ACL_BUILD_RETURNED\n");
-  if (existing_dacl) AppContainerCheckpoint("AC:ACL_EXISTING_FREE_BEGIN\n");
-  if (existing_dacl) LocalFree(existing_dacl);
-  if (existing_dacl) AppContainerCheckpoint("AC:ACL_EXISTING_FREE_DONE\n");
-  if (acl_result != ERROR_SUCCESS) { SetLastError(acl_result); return false; }
+  // existing_dacl points into this returned descriptor; it is not separately
+  // allocated and must remain valid until SetEntriesInAclW has copied it.
+  if (security_descriptor) AppContainerCheckpoint("AC:ACL_DESCRIPTOR_FREE_BEGIN\n");
+  if (security_descriptor) LocalFree(security_descriptor);
+  if (security_descriptor) AppContainerCheckpoint("AC:ACL_DESCRIPTOR_FREE_DONE\n");
+  if (acl_result != ERROR_SUCCESS) {
+    if (dacl) LocalFree(dacl);
+    SetLastError(acl_result);
+    return false;
+  }
+  if (!dacl) {
+    SetLastError(ERROR_INVALID_DATA);
+    return false;
+  }
   AppContainerCheckpoint("AC:ACL_BUILD_OK\n");
   AppContainerCheckpoint("AC:ACL_SET_BEGIN\n");
   const DWORD result = SetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,

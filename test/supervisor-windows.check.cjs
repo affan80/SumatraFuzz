@@ -384,6 +384,17 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(appContainerScript, /nonadministrator identity/);
   assert.match(appContainerScript, /--appcontainer-probe/);
   assert.match(nativeProbe, /CreateAppContainerProfile/);
+  assert.match(
+    nativeProbe,
+    /GetNamedSecurityInfoW\([\s\S]*?&existing_dacl,\s*nullptr,\s*&security_descriptor\)/,
+  );
+  assert.match(nativeProbe, /SetEntriesInAclW\(1, &access, existing_dacl, &dacl\)/);
+  assert.match(nativeProbe, /LocalFree\(security_descriptor\)/);
+  assert.doesNotMatch(nativeProbe, /LocalFree\(existing_dacl\)/);
+  assert.match(
+    nativeProbe,
+    /SetEntriesInAclW\([\s\S]*?AC:ACL_DESCRIPTOR_FREE_BEGIN[\s\S]*?LocalFree\(security_descriptor\)/,
+  );
   assert.match(nativeProbe, /ConvertSidToStringSidW\(sid,\s*&sid_string\)/);
   assert.match(nativeProbe, /GetAppContainerFolderPath\(sid_string,\s*&profile_path\)/);
   assert.match(nativeProbe, /LocalFree\(sid_string\)/);
@@ -414,6 +425,8 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
     'AC:FOLDER_QUERY_RETURNED',
     'AC:ACL_QUERY_BEGIN',
     'AC:ACL_BUILD_BEGIN',
+    'AC:ACL_DESCRIPTOR_FREE_BEGIN',
+    'AC:ACL_DESCRIPTOR_FREE_DONE',
     'AC:ACL_SET_OK',
     'AC:ACL_FREE_BEGIN',
     'AC:CHILD_LAUNCH_BEGIN',
