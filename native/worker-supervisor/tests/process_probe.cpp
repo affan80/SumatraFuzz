@@ -95,9 +95,10 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
     CloseHandle(impersonation_token);
     return error;
   }
-  GENERIC_MAPPING event_mapping{EVENT_QUERY_STATE | SYNCHRONIZE,
-                                EVENT_MODIFY_STATE | SYNCHRONIZE,
-                                SYNCHRONIZE, EVENT_ALL_ACCESS};
+  constexpr DWORD kEventQueryState = 0x0001;
+  GENERIC_MAPPING event_mapping{READ_CONTROL | kEventQueryState | SYNCHRONIZE,
+                                READ_CONTROL | EVENT_MODIFY_STATE,
+                                READ_CONTROL | SYNCHRONIZE, EVENT_ALL_ACCESS};
   PRIVILEGE_SET privileges{};
   DWORD privilege_bytes = sizeof(privileges);
   DWORD granted_access = 0;
