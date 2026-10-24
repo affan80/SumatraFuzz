@@ -37,8 +37,21 @@ bool WriteNamedEventMarker(const std::wstring& evidence_dir) {
 }
 
 // Probe diagnostics intentionally contain only a stable code and Win32 error.
-void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error) {
-  const std::string contents = "private_event_failed=" + std::to_string(error) + "\n";
+DWORD ProbeEventCreation(const std::wstring& name) {
+  SetLastError(ERROR_SUCCESS);
+  HANDLE event = CreateEventExW(nullptr, name.empty() ? nullptr : name.c_str(),
+                                CREATE_EVENT_MANUAL_RESET,
+                                EVENT_MODIFY_STATE | SYNCHRONIZE);
+  const DWORD error = GetLastError();
+  if (event) CloseHandle(event);
+  return event ? (error == ERROR_ALREADY_EXISTS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS) : error;
+}
+
+void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error,
+                                      DWORD unnamed_error, DWORD local_error) {
+  const std::string contents = "private_event_failed=" + std::to_string(error) +
+      ",unnamed_event_error=" + std::to_string(unnamed_error) +
+      ",local_named_event_error=" + std::to_string(local_error) + "\n";
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
   HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -283,7 +296,13 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   if (!event || event_error == ERROR_ALREADY_EXISTS) {
     const DWORD error = event_error;
     if (event) CloseHandle(event);
-    WriteNamedEventFailureDiagnostic(evidence_dir, error);
+    // Gather safe comparisons only after the required private-namespace event
+    // fails. This distinguishes token default-DACL failures from namespace
+    // object-creation failures without weakening the acceptance check.
+    const DWORD unnamed_error = ProbeEventCreation(L"");
+    const std::wstring local_name = L"Local\\SFProbe-" + std::to_wstring(GetCurrentProcessId());
+    const DWORD local_error = ProbeEventCreation(local_name);
+    WriteNamedEventFailureDiagnostic(evidence_dir, error, unnamed_error, local_error);
     return 2400 + static_cast<int>(error);
   }
   const std::wstring name_path = evidence_dir + L"\\private-event-name.txt";
