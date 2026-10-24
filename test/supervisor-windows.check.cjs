@@ -130,27 +130,28 @@ test('Windows supervisor bounds and tears down a child process tree', {
       `${description} write probe must be provisioned`,
     );
     appendFileSync(probePath, '\nstandard-user-write');
-    const deniedJob = supervisor.launchSuspended({
-      executable: containmentProbePath,
-      argv: [
-        '-D',
-        toolDir,
-        '-i',
-        inputDir,
-        '-o',
-        evidenceDir,
-        '--startup-marker',
-        startupMarker,
-        '--expect-write-denied',
-        probePath,
-      ],
-      workingDir: containmentRoot,
-      evidenceDir,
-      limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
-      fileProofs: [{ ...proof, path: containmentProbePath, root: toolDir }],
-    });
+    let deniedJob;
     let deniedSample;
     try {
+      deniedJob = supervisor.launchSuspended({
+        executable: containmentProbePath,
+        argv: [
+          '-D',
+          toolDir,
+          '-i',
+          inputDir,
+          '-o',
+          evidenceDir,
+          '--startup-marker',
+          startupMarker,
+          '--expect-write-denied',
+          probePath,
+        ],
+        workingDir: containmentRoot,
+        evidenceDir,
+        limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
+        fileProofs: [{ ...proof, path: containmentProbePath, root: toolDir }],
+      });
       for (let i = 0; i < 100; i++) {
         deniedSample = supervisor.sampleJob(deniedJob);
         if (deniedSample.root_exited) break;
@@ -167,7 +168,8 @@ test('Windows supervisor bounds and tears down a child process tree', {
         `restricted child must be denied write access granted to ${description}`,
       );
     } finally {
-      supervisor.stopJob(deniedJob, 0);
+      if (deniedJob) supervisor.stopJob(deniedJob, 0);
+      rmSync(startupMarker, { force: true });
     }
   }
   let job;
