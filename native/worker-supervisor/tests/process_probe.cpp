@@ -261,8 +261,11 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
   }
 
   SECURITY_ATTRIBUTES attributes{sizeof(attributes), &ns.descriptor, FALSE};
+  // CreateEvent returns full access to the new handle; request only the rights
+  // granted by this run-private object's ACL instead.
   SetLastError(ERROR_SUCCESS);
-  HANDLE event = CreateEventW(&attributes, TRUE, FALSE, event_name.c_str());
+  HANDLE event = CreateEventExW(&attributes, event_name.c_str(), CREATE_EVENT_MANUAL_RESET,
+                                EVENT_MODIFY_STATE | SYNCHRONIZE);
   const DWORD event_error = GetLastError();
   if (!event || event_error == ERROR_ALREADY_EXISTS) {
     const DWORD error = event_error;

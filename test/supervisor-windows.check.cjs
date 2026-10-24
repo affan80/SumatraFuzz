@@ -387,7 +387,7 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   );
   assert.match(probe, /ProtectedReadsAndWritesDenied/);
   assert.match(probe, /ReadAllowedInput/);
-  assert.match(probe, /CreateEventW\(/);
+  assert.match(probe, /CreateEventExW\(/);
   assert.match(probe, /OpenEventW\(/);
   const config = readFileSync(
     path.join(__dirname, '..', 'scripts', 'windows', 'worker-service-config.psm1'),
@@ -704,7 +704,7 @@ test('private namespace probe reports the exact private ACL construction failure
   assert.match(probe, /ns\.Initialize\(&namespace_stage, &namespace_error\)/);
   assert.match(
     probe,
-    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventW\(&attributes, TRUE, FALSE, event_name\.c_str\(\)\);\s+const DWORD event_error = GetLastError\(\);/,
+    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventExW\(&attributes, event_name\.c_str\(\), CREATE_EVENT_MANUAL_RESET,\s+EVENT_MODIFY_STATE \| SYNCHRONIZE\);\s+const DWORD event_error = GetLastError\(\);/,
   );
   assert.match(
     probe,
