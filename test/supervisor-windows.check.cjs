@@ -409,8 +409,8 @@ test('WinAFL children have full restricted-token read and write boundaries', () 
   assert.match(addon, /CreatePrivateAccessAcl\(/);
   assert.match(addon, /SetPrivateRestrictedDefaultDacl/);
   assert.match(addon, /WinRestrictedCodeSid/);
-  assert.match(addon, /WinAuthenticatedUserSid/);
-  assert.match(addon, /WinWorldSid/);
+  assert.match(addon, /2, restricting_sids, &restricted\.handle/);
+  assert.doesNotMatch(addon, /WinAuthenticatedUserSid|WinWorldSid/);
   assert.match(addon, /SetEntriesInAclW\(1, &grant, existing_dacl/);
   assert.match(addon, /grant\.Trustee, sid/);
   assert.match(addon, /CoCreateGuid\(&run\)/);
