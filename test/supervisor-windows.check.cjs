@@ -67,7 +67,8 @@ test('Windows supervisor bounds and tears down a child process tree', {
   const evidenceDir = path.join(containmentRoot, 'evidence');
   const siblingEvidenceDir = path.join(containmentRoot, 'sibling-evidence');
   const inputDir = path.join(containmentRoot, 'input');
-  const protectedDir = path.join(containmentRoot, 'protected');
+  const protectedDir = process.env.SUMATRAFUZZ_PROTECTED_DIR;
+  assert.ok(protectedDir && path.isAbsolute(protectedDir), 'protected fixture must be provisioned');
   const containmentProbePath = path.join(toolDir, path.basename(probePath));
   const inputPath = path.join(inputDir, 'seed.pdf');
   const protectedReadPath = path.join(protectedDir, 'credential-sentinel');
@@ -77,33 +78,9 @@ test('Windows supervisor bounds and tears down a child process tree', {
   mkdirSync(evidenceDir);
   mkdirSync(siblingEvidenceDir);
   mkdirSync(inputDir);
-  mkdirSync(protectedDir);
   copyFileSync(probePath, containmentProbePath);
   writeFileSync(inputPath, 'pdf input sentinel');
-  writeFileSync(protectedReadPath, 'service-only trust and DPAPI sentinel');
-  // Keep the directory inspectable by the standard test user while granting it
-  // no create rights; the credential sentinel itself is SYSTEM-only. Modify
-  // each owned object directly so the check needs no recursive ACL privilege.
-  execFileSync('icacls.exe', [protectedDir, '/inheritance:r'], { stdio: 'ignore' });
-  execFileSync('icacls.exe', [protectedReadPath, '/inheritance:r'], { stdio: 'ignore' });
-  execFileSync(
-    'icacls.exe',
-    [protectedDir, '/remove:g', '*S-1-5-32-545', '*S-1-5-11', '*S-1-1-0'],
-    { stdio: 'ignore' },
-  );
-  execFileSync(
-    'icacls.exe',
-    [protectedReadPath, '/remove:g', '*S-1-5-32-545', '*S-1-5-11', '*S-1-1-0'],
-    { stdio: 'ignore' },
-  );
-  execFileSync(
-    'icacls.exe',
-    [protectedDir, '/grant:r', '*S-1-5-32-545:(RX)', '*S-1-5-18:(OI)(CI)(F)'],
-    { stdio: 'ignore' },
-  );
-  execFileSync('icacls.exe', [protectedReadPath, '/grant:r', '*S-1-5-18:(F)'], {
-    stdio: 'ignore',
-  });
+  assert.deepEqual(readdirSync(protectedDir), ['credential-sentinel']);
   const baselineEnvironment = { ...process.env };
   delete baselineEnvironment.SUMATRAFUZZ_TEST_SECRET;
   for (const identifiers of [
