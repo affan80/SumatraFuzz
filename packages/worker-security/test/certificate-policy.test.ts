@@ -34,6 +34,7 @@ describe('endpoint certificate policy', () => {
       '-pkeyopt',
       `ec_paramgen_curve:${curve}`,
     ]);
+    expect(Date.parse(new X509Certificate(leaf.cert).validFrom)).toBeLessThan(Date.now() - 60_000);
     expect(policy.validateEndpointCertificate(leaf.cert, 'client')).toBeInstanceOf(X509Certificate);
   });
   it.each([

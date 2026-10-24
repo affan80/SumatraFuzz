@@ -15,6 +15,7 @@ const defaultPublicKey = path.join(
 );
 const expectedLayout = [
   'apps/worker-service/dist/src/service-entry.js',
+  'apps/worker-service/dist/src/trust-schema.sql',
   'config/organization-signing-public-key.pem',
   'native/worker-supervisor/build/Release/worker_supervisor.node',
   'packages/run-store/dist/index.js',
@@ -312,7 +313,7 @@ async function main() {
   await copyRuntimeTree(
     serviceDist,
     path.join(stage, 'apps', 'worker-service', 'dist', 'src'),
-    new Set(['.js']),
+    new Set(['.js', '.sql']),
   );
   await copyFile(
     path.join(repositoryRoot, 'apps', 'worker-service', 'package.json'),

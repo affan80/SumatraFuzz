@@ -168,24 +168,43 @@ export async function issueCertificate(
       { stdio: 'ignore' },
     );
   } else {
+    const configPath = (value: string) => value.replaceAll('\\', '/');
+    const start = new Date(Date.now() - 5 * 60_000);
+    const end = new Date(Date.now() + Number(days) * 24 * 60 * 60_000);
+    const opensslTime = (value: Date) =>
+      value
+        .toISOString()
+        .replaceAll('-', '')
+        .replaceAll(':', '')
+        .replace('T', '')
+        .replace(/\.\d{3}Z$/, 'Z');
+    await writeFile(file('index'), '');
+    await writeFile(file('serial'), '01\n');
+    await writeFile(
+      file('conf'),
+      `[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=${configPath(file('index'))}\nserial=${configPath(file('serial'))}\nnew_certs_dir=${configPath(root)}\ncertificate=${configPath(path.join(root, 'ca.crt'))}\nprivate_key=${configPath(path.join(root, 'ca.key'))}\ndefault_md=sha256\npolicy=names\n[names]\ncommonName=supplied\n`,
+    );
+    await writeFile(file('ext'), `[leaf]\n${extensions}`);
     execFileSync(
       'openssl',
       [
-        'x509',
-        '-req',
+        'ca',
+        '-batch',
+        '-config',
+        file('conf'),
         '-in',
         file('csr'),
-        '-CA',
-        path.join(root, 'ca.crt'),
-        '-CAkey',
-        path.join(root, 'ca.key'),
-        '-CAcreateserial',
         '-out',
         file('crt'),
-        '-days',
-        days,
+        '-notext',
+        '-startdate',
+        opensslTime(start),
+        '-enddate',
+        opensslTime(end),
         '-extfile',
         file('ext'),
+        '-extensions',
+        'leaf',
       ],
       { stdio: 'ignore' },
     );

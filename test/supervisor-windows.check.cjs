@@ -633,6 +633,8 @@ test('worker payload contains admin-only first-run and certificate lifecycle pro
     'utf8',
   );
   assert.match(stage, /provisioning\/provision-worker-service\.ps1/);
+  assert.match(stage, /apps\/worker-service\/dist\/src\/trust-schema\.sql/);
+  assert.match(stage, /new Set\(\['\.js', '\.sql'\]\)/);
   assert.match(stage, /provisioning\/worker-service-config\.psm1/);
   assert.match(install, /'start=', 'demand'/);
   assert.match(provision, /Assert-WorkerPlatform -RequireElevation/);
