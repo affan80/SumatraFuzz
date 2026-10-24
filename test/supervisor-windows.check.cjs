@@ -658,6 +658,7 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(addon, /SUMATRAFUZZ_NAMESPACE_ALIAS/);
   assert.match(addon, /SUMATRAFUZZ_RUN_SID/);
   assert.match(addon, /AFL_NO_UI/);
+  assert.match(addon, /executable_dir \+ L";" \+ tool_dir \+ L";"/);
   assert.match(addon, /sample\.Set\("root_exited", root_exited\)/);
   assert.match(addon, /sample\.Set\("root_exit_code"/);
   assert.match(addon, /ClosePrivateNamespace\(handle, PRIVATE_NAMESPACE_FLAG_DESTROY\)/);

@@ -240,19 +240,24 @@ std::wstring RunSidText(PSID sid) {
   return static_cast<const wchar_t*>(text.value);
 }
 
-std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, const std::wstring& tool_dir,
-                                          const std::wstring& namespace_alias, const std::wstring& run_sid) {
+std::vector<wchar_t> BuildWorkerEnvironment(const std::wstring& working_dir, const std::wstring& executable,
+                                          const std::wstring& tool_dir, const std::wstring& namespace_alias,
+                                          const std::wstring& run_sid) {
   LocalMemory parsed_sid;
   if (!ValidNamespaceAlias(namespace_alias) || run_sid.size() > 184 ||
       !ConvertStringSidToSidW(run_sid.c_str(), reinterpret_cast<PSID*>(&parsed_sid.value)) ||
       !ValidRunSid(parsed_sid.value) || RunSidText(parsed_sid.value) != run_sid)
     throw std::runtime_error("invalid private namespace identifiers");
   const std::wstring system_root = EnvironmentValue(L"SystemRoot");
+  const size_t executable_separator = executable.find_last_of(L'\\');
+  if (executable_separator == std::wstring::npos || executable_separator == 0)
+    throw std::runtime_error("verified executable directory is unavailable");
+  const std::wstring executable_dir = executable.substr(0, executable_separator);
   std::map<std::wstring, std::wstring> values;
   values.emplace(L"SUMATRAFUZZ_NAMESPACE_ALIAS", namespace_alias);
   values.emplace(L"SUMATRAFUZZ_RUN_SID", run_sid);
   values.emplace(L"AFL_NO_UI", L"1");
-  values.emplace(L"PATH", tool_dir + L";" + system_root + L"\\System32");
+  values.emplace(L"PATH", executable_dir + L";" + tool_dir + L";" + system_root + L"\\System32");
   values.emplace(L"SystemRoot", system_root);
   values.emplace(L"TEMP", working_dir);
   values.emplace(L"TMP", working_dir);
@@ -658,7 +663,7 @@ Napi::Value LaunchSuspended(const Napi::CallbackInfo& info) {
     RestrictedToken restricted = CreateEvidenceRestrictedToken(evidence_dir);
     PrivateNamespace private_namespace = CreateRunPrivateNamespace(restricted);
     std::vector<wchar_t> environment = BuildWorkerEnvironment(
-        evidence_dir, tool_dir, private_namespace.alias, RunSidText(restricted.sid));
+        evidence_dir, executable, tool_dir, private_namespace.alias, RunSidText(restricted.sid));
     auto job = std::make_unique<Job>();
     job->launch_namespace = &private_namespace;
     STARTUPINFOW startup{};
