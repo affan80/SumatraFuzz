@@ -360,6 +360,8 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(appContainerScript, /nonadministrator identity/);
   assert.match(appContainerScript, /--appcontainer-probe/);
   assert.match(nativeProbe, /CreateAppContainerProfile/);
+  assert.match(nativeProbe, /GetAppContainerFolderPath\(profile\.c_str\(\),\s*&profile_path\)/);
+  assert.doesNotMatch(nativeProbe, /GetAppContainerFolderPath\(sid,/);
   assert.match(nativeProbe, /DeleteAppContainerProfile/);
   assert.match(nativeProbe, /PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES/);
   assert.match(nativeProbe, /SECURITY_CAPABILITIES/);

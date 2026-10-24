@@ -23,3 +23,14 @@ Focused verification for this fix round:
 - `git diff --check`: passed.
 
 The Windows runtime caveat in the initial report still applies.
+
+## Fix round: AppContainer folder-path argument
+
+Hosted Windows x64 compilation identified that `GetAppContainerFolderPath` takes the profile name (`PCWSTR`), not the package SID. Updated the probe to pass `profile.c_str()` and added a static regression assertion for that exact call plus a negative assertion against passing `sid`.
+
+Local covering checks:
+
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
+- `git diff --check`: passed.
+
+The API correction is based on the hosted Windows SDK compiler diagnostic. Local Windows API compilation remains pending because this workspace is macOS; the next hosted Windows x64 run must confirm the corrected native build and probe execution.

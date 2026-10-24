@@ -137,7 +137,7 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
                                                 L"Ephemeral feasibility probe", nullptr, 0, &sid);
     if (FAILED(result) || !sid) goto cleanup;
     first_created = true;
-    result = GetAppContainerFolderPath(sid, &profile_path);
+    result = GetAppContainerFolderPath(profile.c_str(), &profile_path);
     if (FAILED(result) || !profile_path || GetFullPathNameW(profile_path, 0, nullptr, nullptr) == 0)
       goto cleanup;
     std::fwprintf(stdout, L"AppContainerProfilePath=%ls\n", profile_path);
