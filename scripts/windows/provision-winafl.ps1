@@ -87,9 +87,9 @@ $aflCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'afl-fuzz.exe' -Rec
 $dllCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'winafl.dll' -Recurse -File)
 if ($aflCandidates.Count -ne 1 -or $dllCandidates.Count -ne 1) { throw 'WinAFL x64 artifacts missing/ambiguous' }
 $cmakeCache = Join-Path $build 'CMakeCache.txt'
-$compilerEntries = @(Get-Content -LiteralPath $cmakeCache | Where-Object { $_ -match '^CMAKE_C_COMPILER:FILEPATH=' })
+$compilerEntries = @(Get-Content -LiteralPath $cmakeCache | Where-Object { $_ -match '^CMAKE_C_COMPILER:(?:FILEPATH|STRING)=' })
 if ($compilerEntries.Count -ne 1) { throw 'Cannot resolve the configured Visual Studio compiler from CMake' }
-$compilerPath = $compilerEntries[0] -replace '^CMAKE_C_COMPILER:FILEPATH=', ''
+$compilerPath = $compilerEntries[0] -replace '^CMAKE_C_COMPILER:(?:FILEPATH|STRING)=', ''
 $compilerDirectory = Split-Path $compilerPath -Parent
 $dumpbin = Join-Path $compilerDirectory 'dumpbin.exe'
 if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) { throw 'Visual Studio dumpbin.exe is required to inspect WinAFL runtime imports' }
