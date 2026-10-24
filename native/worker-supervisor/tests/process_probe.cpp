@@ -139,11 +139,15 @@ DWORD CheckPrivateNamespaceDacl(HANDLE namespace_handle, BOOL* traverse_granted,
                                 BOOL* create_object_granted) {
   *traverse_granted = FALSE;
   *create_object_granted = FALSE;
-  PACL dacl = nullptr;
-  PSECURITY_DESCRIPTOR descriptor = nullptr;
-  const DWORD read_error = GetSecurityInfo(namespace_handle, SE_KERNEL_OBJECT,
-      DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
-  if (read_error != ERROR_SUCCESS) return read_error;
+  DWORD descriptor_bytes = 0;
+  GetKernelObjectSecurity(namespace_handle, DACL_SECURITY_INFORMATION, nullptr, 0,
+                          &descriptor_bytes);
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || descriptor_bytes == 0)
+    return GetLastError();
+  std::vector<BYTE> descriptor_storage(descriptor_bytes);
+  if (!GetKernelObjectSecurity(namespace_handle, DACL_SECURITY_INFORMATION,
+                               descriptor_storage.data(), descriptor_bytes,
+                               &descriptor_bytes)) return GetLastError();
   // Object-directory rights are not exported by the user-mode SDK headers.
   // Use their documented values and map GENERIC_ALL to DIRECTORY_ALL_ACCESS.
   constexpr DWORD kDirectoryTraverse = 0x0002;
@@ -152,12 +156,11 @@ DWORD CheckPrivateNamespaceDacl(HANDLE namespace_handle, BOOL* traverse_granted,
   const GENERIC_MAPPING mapping{READ_CONTROL | 0x0003, READ_CONTROL | 0x000C,
                                 READ_CONTROL | kDirectoryTraverse, kDirectoryAllAccess};
   const DWORD traverse_error = CheckObjectDacl(
-      static_cast<SECURITY_DESCRIPTOR*>(descriptor), kDirectoryTraverse, mapping,
-      traverse_granted);
+      reinterpret_cast<SECURITY_DESCRIPTOR*>(descriptor_storage.data()),
+      kDirectoryTraverse, mapping, traverse_granted);
   const DWORD create_error = CheckObjectDacl(
-      static_cast<SECURITY_DESCRIPTOR*>(descriptor), kDirectoryCreateObject, mapping,
-      create_object_granted);
-  LocalFree(descriptor);
+      reinterpret_cast<SECURITY_DESCRIPTOR*>(descriptor_storage.data()),
+      kDirectoryCreateObject, mapping, create_object_granted);
   if (traverse_error != ERROR_SUCCESS) return traverse_error;
   return create_error;
 }
