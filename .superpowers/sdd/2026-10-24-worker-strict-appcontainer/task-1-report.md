@@ -97,4 +97,8 @@ Local verification:
 - `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
 - `git diff --check`: passed.
 
-The fix is not confirmed by Windows execution yet. A fresh exact-head Windows x64 run is required to verify the ACL stage and the full feasibility probe; this remains an ordinary-user API feasibility slice and does not establish service identity or quota-backed storage acceptance.
+The ACL ownership fix was subsequently exercised by exact-head Windows x64 run `40089250286`. The AppContainer feasibility probe passed profile creation, distinct package SID verification, ACL update, child launch, in-run write, broad-ACL write-denial checks, and profile deletion. It reported the profile folder under `C:\Users\sf-probe...\AppData\Local\Packages\...\AC` and temporary output under the run directory.
+
+The job is not green: after the successful probe, the existing restricted-token test failed because its child did not reach the World-SID assertion and exited with `3221225781` (`0xC0000135`, `STATUS_DLL_NOT_FOUND`). This is a separate legacy restricted-token child startup/runtime dependency failure and remains unresolved; do not count the whole Windows gate as passing.
+
+The profile location under LocalAppData is outside the reported run directory. The probe has not shown that writes to default AppContainer profile storage are routed to, or charged against, the worker's configured disk quota. Task 5 must explicitly test profile-write accounting and cleanup through the installed service identity and require bounded, quota-backed storage. This Task 1 result remains ordinary-user API feasibility only and does not establish service identity or quota-backed storage acceptance.
