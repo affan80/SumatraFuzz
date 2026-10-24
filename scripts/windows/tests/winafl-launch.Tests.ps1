@@ -89,6 +89,10 @@ Describe 'Pinned WinAFL namespace acquisition contract' {
     $runner=Get-Content $script:runner -Raw
     $service=Get-Content (Join-Path $PSScriptRoot '../worker-service-acceptance.ps1') -Raw
     $provision | Should -Match 'dumpbin.*dependents'
+    $provision | Should -Match 'CMAKE_C_COMPILER:FILEPATH='
+    $provision | Should -Match 'compilerDirectory.*dumpbin.exe'
+    $provision | Should -Not -Match 'Get-Command dumpbin.exe'
+    $provision | Should -Match 'VCToolsRedistDir'
     $provision | Should -Match 'Get-AuthenticodeSignature'
     $provision | Should -Match 'runtime_dependencies'
     $runner | Should -Match 'runtime_dependencies'

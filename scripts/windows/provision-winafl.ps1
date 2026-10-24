@@ -86,31 +86,32 @@ if ($LASTEXITCODE -ne 0) { throw 'WinAFL build failed' }
 $aflCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'afl-fuzz.exe' -Recurse -File)
 $dllCandidates = @(Get-ChildItem -LiteralPath $build -Filter 'winafl.dll' -Recurse -File)
 if ($aflCandidates.Count -ne 1 -or $dllCandidates.Count -ne 1) { throw 'WinAFL x64 artifacts missing/ambiguous' }
-$dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe is required to inspect WinAFL runtime imports' }
-$compiler = Get-Command cl.exe -ErrorAction SilentlyContinue
-if (-not $compiler) { throw 'Visual Studio cl.exe is required to identify the WinAFL runtime family' }
-$compilerVersionDirectory = $compiler.Source
-for ($level = 0; $level -lt 4; $level++) { $compilerVersionDirectory = Split-Path $compilerVersionDirectory -Parent }
-$compilerToolsetVersion = Split-Path -Leaf $compilerVersionDirectory
+$cmakeCache = Join-Path $build 'CMakeCache.txt'
+$compilerEntries = @(Get-Content -LiteralPath $cmakeCache | Where-Object { $_ -match '^CMAKE_C_COMPILER:FILEPATH=' })
+if ($compilerEntries.Count -ne 1) { throw 'Cannot resolve the configured Visual Studio compiler from CMake' }
+$compilerPath = $compilerEntries[0] -replace '^CMAKE_C_COMPILER:FILEPATH=', ''
+$compilerDirectory = Split-Path $compilerPath -Parent
+$dumpbin = Join-Path $compilerDirectory 'dumpbin.exe'
+if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) { throw 'Visual Studio dumpbin.exe is required to inspect WinAFL runtime imports' }
+$compilerToolsetDirectory = $compilerPath
+for ($level = 0; $level -lt 3; $level++) { $compilerToolsetDirectory = Split-Path $compilerToolsetDirectory -Parent }
+$compilerToolsetVersion = Split-Path -Leaf $compilerToolsetDirectory
+if ($compilerToolsetVersion -notmatch '^\d+\.\d+\.') { throw 'Unexpected Visual Studio compiler toolset path' }
 $compilerRuntimeFamily = ($compilerToolsetVersion -split '\.')[0..1] -join '.'
 $redistRoots = @()
 if ($env:VCToolsRedistDir -and (Test-Path -LiteralPath $env:VCToolsRedistDir -PathType Container)) {
   $redistRoots += $env:VCToolsRedistDir
 } else {
-  $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-  if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
-  $installations = @(& $vswhere -latest -products '*' -property installationPath)
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the installed Visual Studio runtime' }
-  foreach ($installation in $installations) {
-    $candidate = Join-Path $installation 'VC/Redist/MSVC'
-    if (Test-Path -LiteralPath $candidate -PathType Container) { $redistRoots += $candidate }
-  }
-  }
+  $msvcRoot = Split-Path -Parent $compilerToolsetDirectory
+  $toolsRoot = Split-Path -Parent $msvcRoot
+  $vcRoot = Split-Path -Parent $toolsRoot
+  $candidate = Join-Path $vcRoot 'Redist/MSVC'
+  if (Test-Path -LiteralPath $candidate -PathType Container) { $redistRoots += $candidate }
 }
+if ($redistRoots.Count -eq 0) { throw 'Cannot locate Visual Studio x64 VC runtime redistributables' }
 $runtimeDependencies = @{}
 foreach ($binary in @($aflCandidates[0].FullName, $dllCandidates[0].FullName)) {
-  $imports = @(& $dumpbin.Source /nologo /dependents $binary)
+  $imports = @(& $dumpbin /nologo /dependents $binary)
   if ($LASTEXITCODE -ne 0) { throw "Cannot inspect WinAFL imports: $(Split-Path $binary -Leaf)" }
   $importNames = @($imports | ForEach-Object { "$($_)".Trim() } |
     Where-Object { $_ -match '^[A-Za-z0-9_.+-]+\.dll$' } | Select-Object -Unique)
