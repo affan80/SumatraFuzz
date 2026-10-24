@@ -5,6 +5,13 @@ const assert = require('node:assert/strict');
 const read = (file) => readFileSync(file, 'utf8');
 
 test('Windows native gate reserves campaign proof for the installed SCM host', () => {
+  const packageJson = JSON.parse(read('package.json'));
+  assert.match(
+    packageJson.scripts['native:sqlite:build'],
+    /--force_build=1/,
+    'service packaging requires a real SQLite addon build even when a prebuild exists',
+  );
+
   const workflow = read('.github/workflows/repository-checks.yml');
   const job = workflow.split('  real-dynamorio:\n')[1]?.split(/\n {2}[a-z][a-z-]*:\n/)[0];
   assert.ok(job, 'DynamoRIO native acceptance job is required');
