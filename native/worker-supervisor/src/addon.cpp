@@ -2,6 +2,7 @@
 
 #include "command_line.h"
 #include "private_acl.h"
+#include "run_resources.h"
 
 #include <algorithm>
 #include <array>
@@ -83,7 +84,9 @@ struct BoundaryDescriptor {
 // Exceptional teardown must not release a namespace whose processes may still
 // exist. These records deliberately remain owned for the supervisor lifetime.
 // Allocate the record before launch so quarantine cannot fail during unwinding.
+using sumatrafuzz::supervisor::RunResources;
 struct QuarantinedJob {
+  RunResources run_resources;
   PrivateNamespace private_namespace;
   HANDLE job = nullptr;
   HANDLE process = nullptr;
@@ -94,6 +97,7 @@ QuarantinedJob* g_teardown_quarantine = nullptr;
 
 struct Job {
 #ifdef _WIN32
+  RunResources run_resources;
   PrivateNamespace private_namespace;
   PrivateNamespace* launch_namespace = nullptr;  // Scope owner until assignment succeeds.
   std::unique_ptr<QuarantinedJob> quarantine = std::make_unique<QuarantinedJob>();
@@ -132,6 +136,7 @@ struct Job {
       quarantine->job = job;
       quarantine->process = process;
       quarantine->private_namespace = std::move(private_namespace);
+      quarantine->run_resources = std::move(run_resources);
       // On failed assignment, the local namespace still belongs to the launch
       // scope. Preserve that owner too if the suspended root cannot be reaped.
       if (launch_namespace)

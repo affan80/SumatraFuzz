@@ -348,6 +348,44 @@ test('Windows supervisor bounds and tears down a child process tree', {
   assert.throws(() => supervisor.unprotectSecret(Buffer.from('tampered')));
 });
 
+// These contracts catch widened package grants and missing rollback ownership;
+// the Windows case executes the same helper used by the addon.
+test('run resource ACL foundation rejects broad SIDs and owns rollback', () => {
+  const headerPath = path.join(__dirname, '..', 'native/worker-supervisor/include/run_resources.h');
+  assert.ok(existsSync(headerPath), 'production run resource owner must exist');
+  const header = readFileSync(headerPath, 'utf8');
+  const addon = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'), 'utf8');
+  const binding = readFileSync(path.join(__dirname, '..', 'native/worker-supervisor/binding.gyp'), 'utf8');
+  assert.match(header, /struct AppContainerProfile/);
+  assert.match(header, /CreateAppContainerProfile[\s\S]*?nullptr, 0,/);
+  assert.doesNotMatch(header, /DeriveAppContainerSidFromAppContainerName/);
+  assert.match(header, /DeleteAppContainerProfile/);
+  assert.match(header, /SECURITY_APP_PACKAGE_BASE_RID/);
+  assert.match(header, /SECURITY_APP_PACKAGE_RID_COUNT/);
+  assert.doesNotMatch(header, /WinWorldSid|WinAuthenticatedUserSid|WinInteractiveSid|WinBuiltinUsersSid|GENERIC_ALL|FILE_ALL_ACCESS/);
+  assert.match(header, /FILE_FLAG_OPEN_REPARSE_POINT/);
+  assert.match(header, /path\.size\(\) < 3/);
+  assert.match(header, /key\.size\(\) == 3/);
+  assert.match(header, /if \(profile\.sid\) FreeSid\(profile\.sid\)/);
+  assert.match(header, /NO_INHERITANCE/);
+  assert.match(header, /Remove\(\)/);
+  assert.match(addon, /RunResources run_resources/);
+  assert.match(addon, /quarantine->run_resources = std::move\(run_resources\)/);
+  assert.match(binding, /userenv\.lib/);
+});
+
+test('Windows run resources clean ACLs and profiles on normal and partial setup', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const probe = path.join(__dirname, '..', 'build/worker-supervisor/Debug/process_probe.exe');
+  const root = mkdtempSync(path.join(os.tmpdir(), 'sumatrafuzz-resources-'));
+  try {
+    execFileSync(probe, ['--run-resource-contract', root], { stdio: 'pipe', timeout: 60000 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('AppContainer feasibility probe is Windows-only and fails closed on profile and ACL checks', () => {
   const workflow = readFileSync(
     path.join(__dirname, '..', '.github/workflows/electron-typescript.yml'),

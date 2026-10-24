@@ -1,10 +1,12 @@
 #ifdef _WIN32
 #include "command_line.h"
 #include "private_acl.h"
+#include "run_resources.h"
 
 #include <windows.h>
 #include <aclapi.h>
 #include <userenv.h>
+#include <winioctl.h>
 #include <sddl.h>
 #include <cstring>
 #include <iterator>
@@ -14,6 +16,177 @@
 #include <cstdio>
 
 namespace {
+
+// Real helper contract: no child launch here (Task 3 owns token integration).
+DWORD PackageAceMask(const std::wstring& path, PSID sid) {
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  DWORD mask = 0;
+  const DWORD result = GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, &acl, nullptr, &descriptor);
+  if (result != ERROR_SUCCESS || !acl) throw std::runtime_error("contract ACL query failed");
+  for (DWORD i = 0; i < acl->AceCount; ++i) {
+    void* entry = nullptr;
+    if (!GetAce(acl, i, &entry)) { LocalFree(descriptor); throw std::runtime_error("contract ACE query failed"); }
+    auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(entry);
+    if (ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && EqualSid(&ace->SidStart, sid)) {
+      if (ace->Header.AceFlags != 0) { LocalFree(descriptor); throw std::runtime_error("inheritable package ACE"); }
+      mask |= ace->Mask;
+    }
+  }
+  LocalFree(descriptor);
+  return mask;
+}
+
+bool RunResourceContract(const std::wstring& supplied_root) {
+  using namespace sumatrafuzz::supervisor;
+  try {
+    // Windows TEMP may use an 8.3 alias. Authorize the canonical fixture root,
+    // just as Task 3 must bind its policy to held proof handles.
+    auto root_handle = OpenRunResource(supplied_root, FILE_READ_ATTRIBUTES, true);
+    std::wstring root(32768, L'\0');
+    const DWORD root_length = GetFinalPathNameByHandleW(root_handle.value, root.data(),
+        static_cast<DWORD>(root.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (root_length < 4 || root_length >= root.size()) return false;
+    root.resize(root_length);
+    root.erase(0, 4);
+    if (ResourcePathKey(L"C:\\") != L"c:\\") return false;
+    const std::wstring tool = root + L"\\tool.exe";
+    const std::wstring input = root + L"\\input.pdf";
+    const std::wstring input_dir = root + L"\\inputs";
+    const std::wstring output = root + L"\\evidence";
+    const std::wstring sibling = root + L"\\sibling";
+    const std::wstring secret = root + L"\\credentials";
+    const std::wstring link = root + L"\\alias.pdf";
+    for (const auto& file : {tool, input, secret}) {
+      ResourceHandle created(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr));
+      if (created.value == INVALID_HANDLE_VALUE) return false;
+    }
+    if (!CreateDirectoryW(output.c_str(), nullptr) || !CreateDirectoryW(sibling.c_str(), nullptr) ||
+        !CreateDirectoryW(input_dir.c_str(), nullptr)) return false;
+    RunResourcePolicy policy{{{tool, RunResourceAccess::ToolReadExecute},
+                             {input, RunResourceAccess::InputRead},
+                             {input_dir, RunResourceAccess::InputRead},
+                             {output, RunResourceAccess::EvidenceModify},
+                             {secret, RunResourceAccess::EvidenceModify},
+                             {link, RunResourceAccess::InputRead}}, {secret}};
+    RunResources resources;
+    resources.state->profile = CreateRunAppContainerProfile();
+    auto& profile = resources.state->profile;
+    auto second = CreateRunAppContainerProfile();
+    if (!IsRunPackageSid(profile.sid) || EqualSid(profile.sid, second.sid) || profile.name.size() > 64) return false;
+    const auto rejected = [&](const std::wstring& path, RunResourceAccess access, PSID identity) {
+      try { auto unexpected = GrantRunResourceAccess(path, identity, access, policy); }
+      catch (const std::system_error&) { return true; }
+      return false;
+    };
+    RunResourcePolicy volume_policy{{{output, RunResourceAccess::EvidenceModify}}, {root.substr(0, 3)}};
+    try {
+      auto denied_volume = GrantRunResourceAccess(output, profile.sid, RunResourceAccess::EvidenceModify, volume_policy);
+      return false;
+    } catch (const std::system_error&) {}
+    RunResourcePolicy volume_grant{{{root.substr(0, 3), RunResourceAccess::InputRead}}, {}};
+    try {
+      auto denied_root = GrantRunResourceAccess(root.substr(0, 3), profile.sid, RunResourceAccess::InputRead, volume_grant);
+      return false;
+    } catch (const std::system_error&) {}
+    BYTE broad[SECURITY_MAX_SID_SIZE]{};
+    DWORD broad_size = sizeof(broad);
+    if (!CreateWellKnownSid(WinWorldSid, nullptr, broad, &broad_size) ||
+        !rejected(output, RunResourceAccess::EvidenceModify, broad) ||
+        !rejected(sibling, RunResourceAccess::EvidenceModify, profile.sid) ||
+        !rejected(secret, RunResourceAccess::EvidenceModify, profile.sid) ||
+        !rejected(input, RunResourceAccess::ToolReadExecute, profile.sid) ||
+        !rejected(root + L"\\evidence\\..\\input.pdf", RunResourceAccess::InputRead, profile.sid)) return false;
+    if (!CreateHardLinkW(link.c_str(), input.c_str(), nullptr)) return false;
+    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
+    if (!DeleteFileW(link.c_str())) return false;
+    // Directory junctions are rejected without requiring symlink privileges.
+    if (!CreateDirectoryW(link.c_str(), nullptr)) return false;
+    {
+      ResourceHandle reparse(CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+      struct JunctionData {
+        DWORD tag;
+        WORD length;
+        WORD reserved;
+        WORD substitute_offset;
+        WORD substitute_length;
+        WORD print_offset;
+        WORD print_length;
+        wchar_t paths[1024];
+      } junction{};
+      const std::wstring target = L"\\??\\" + sibling;
+      if (target.size() + sibling.size() + 2 > std::size(junction.paths)) return false;
+      junction.tag = IO_REPARSE_TAG_MOUNT_POINT;
+      junction.substitute_length = static_cast<WORD>(target.size() * sizeof(wchar_t));
+      junction.print_offset = junction.substitute_length + sizeof(wchar_t);
+      junction.print_length = static_cast<WORD>(sibling.size() * sizeof(wchar_t));
+      std::memcpy(junction.paths, target.c_str(), (target.size() + 1) * sizeof(wchar_t));
+      std::memcpy(reinterpret_cast<BYTE*>(junction.paths) + junction.print_offset,
+                  sibling.c_str(), (sibling.size() + 1) * sizeof(wchar_t));
+      junction.length = static_cast<WORD>(8 + junction.print_offset + junction.print_length + sizeof(wchar_t));
+      DWORD returned = 0;
+      if (!DeviceIoControl(reparse.value, FSCTL_SET_REPARSE_POINT, &junction,
+                           junction.length + 8, nullptr, 0, &returned, nullptr)) return false;
+    }
+    if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
+    // Partial setup owns a profile too: unwind it only after undoing grants.
+    std::wstring partial_name;
+    std::vector<BYTE> partial_sid;
+    try {
+      RunResources partial;
+      partial.state->profile = CreateRunAppContainerProfile();
+      partial_name = partial.state->profile.name;
+      partial_sid.resize(GetLengthSid(partial.state->profile.sid));
+      if (!CopySid(static_cast<DWORD>(partial_sid.size()), partial_sid.data(), partial.state->profile.sid)) return false;
+      partial.state->grants.push_back(GrantRunResourceAccess(output, partial.state->profile.sid,
+          RunResourceAccess::EvidenceModify, policy));
+      auto denied = GrantRunResourceAccess(sibling, partial.state->profile.sid, RunResourceAccess::EvidenceModify, policy);
+      return false;
+    } catch (const std::system_error&) {}
+    if (partial_name.empty() || partial_sid.empty() || PackageAceMask(output, partial_sid.data()) != 0) return false;
+    PSID recreated_partial = nullptr;
+    if (FAILED(CreateAppContainerProfile(partial_name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated_partial))) return false;
+    const HRESULT removed_partial = DeleteAppContainerProfile(partial_name.c_str());
+    FreeSid(recreated_partial);
+    if (FAILED(removed_partial)) return false;
+    for (const auto& rule : policy.objects) {
+      if (rule.path == secret || rule.path == link) continue;
+      resources.state->grants.push_back(GrantRunResourceAccess(rule.path, profile.sid, rule.access, policy));
+    }
+    const DWORD tool_mask = PackageAceMask(tool, profile.sid);
+    const DWORD input_mask = PackageAceMask(input, profile.sid);
+    const DWORD output_mask = PackageAceMask(output, profile.sid);
+    const DWORD input_dir_mask = PackageAceMask(input_dir, profile.sid);
+    if ((tool_mask & (FILE_READ_DATA | FILE_EXECUTE)) != (FILE_READ_DATA | FILE_EXECUTE) ||
+        (tool_mask & (FILE_WRITE_DATA | DELETE | WRITE_DAC)) ||
+        !(input_mask & FILE_READ_DATA) || (input_mask & (FILE_EXECUTE | FILE_WRITE_DATA | DELETE | WRITE_DAC)) ||
+        (output_mask & (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD)) != (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD) ||
+        (output_mask & (WRITE_DAC | WRITE_OWNER)) ||
+        !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return false;
+    // A concurrent independent package grant must survive our rollback.
+    auto unrelated = GrantRunResourceAccess(output, second.sid, RunResourceAccess::EvidenceModify, policy);
+    std::vector<BYTE> first_sid(GetLengthSid(profile.sid));
+    if (!CopySid(static_cast<DWORD>(first_sid.size()), first_sid.data(), profile.sid)) return false;
+    const std::wstring name = profile.name;
+    RunResources moved(std::move(resources));
+    if (resources.Close() != ERROR_SUCCESS || moved.Close() != ERROR_SUCCESS) return false;
+    if (PackageAceMask(tool, first_sid.data()) || PackageAceMask(input, first_sid.data()) || PackageAceMask(input_dir, first_sid.data()) ||
+        PackageAceMask(output, first_sid.data()) || !PackageAceMask(output, second.sid)) return false;
+    if (unrelated->Remove() != ERROR_SUCCESS || second.Close() != ERROR_SUCCESS) return false;
+    // Creation with the exact former name succeeds only after actual deletion.
+    PSID recreated = nullptr;
+    if (FAILED(CreateAppContainerProfile(name.c_str(), L"Contract", L"Contract", nullptr, 0, &recreated))) return false;
+    const HRESULT deleted = DeleteAppContainerProfile(name.c_str());
+    FreeSid(recreated);
+    return SUCCEEDED(deleted);
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "run-resource contract failed: %s\n", error.what());
+    return false;
+  }
+}
 
 void WriteAppContainerDiagnostic(const char* message, DWORD length) {
   HANDLE error = GetStdHandle(STD_ERROR_HANDLE);
@@ -848,6 +1021,8 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 3 && std::wstring(argv[1]) == L"--run-resource-contract")
+    return RunResourceContract(argv[2]) ? 0 : 83;
   if (argc == 7 && std::wstring(argv[1]) == L"--appcontainer-child")
     return AppContainerChild(argv[2], argv[3], argv[4], argv[5], argv[6]) ? 0 : 81;
   if (argc == 7 && std::wstring(argv[1]) == L"--appcontainer-probe")
