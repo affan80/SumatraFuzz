@@ -15,6 +15,12 @@
 
 namespace {
 
+void ReportAppContainerFailure(const wchar_t* step, HRESULT result, DWORD win32_error) {
+  std::fwprintf(stderr, L"AppContainer probe failed: step=%ls hresult=0x%08lx win32=%lu\n",
+                step, static_cast<unsigned long>(result),
+                static_cast<unsigned long>(win32_error));
+}
+
 bool WriteEvidenceFile(const std::wstring& evidence_dir) {
   const std::wstring path = evidence_dir + L"\\restricted-write-" + std::to_wstring(GetCurrentProcessId());
   HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
@@ -80,7 +86,7 @@ bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   PACL existing_dacl = nullptr;
   const DWORD query = GetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr, nullptr);
-  if (query != ERROR_SUCCESS) return false;
+  if (query != ERROR_SUCCESS) { SetLastError(query); return false; }
   EXPLICIT_ACCESSW access{};
   access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
   access.grfAccessMode = GRANT_ACCESS;
@@ -91,10 +97,11 @@ bool GrantAppContainerDirectoryAccess(const std::wstring& output, PSID sid) {
   PACL dacl = nullptr;
   const DWORD acl_result = SetEntriesInAclW(1, &access, existing_dacl, &dacl);
   if (existing_dacl) LocalFree(existing_dacl);
-  if (acl_result != ERROR_SUCCESS) return false;
+  if (acl_result != ERROR_SUCCESS) { SetLastError(acl_result); return false; }
   const DWORD result = SetNamedSecurityInfoW(const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
   LocalFree(dacl);
+  if (result != ERROR_SUCCESS) SetLastError(result);
   return result == ERROR_SUCCESS;
 }
 
@@ -104,16 +111,14 @@ bool DeleteProbeProfiles(const std::wstring& profile, const std::wstring& second
   if (first_created) {
     const HRESULT result = DeleteAppContainerProfile(profile.c_str());
     if (FAILED(result)) {
-      std::fwprintf(stderr, L"AppContainer profile cleanup failed: %ls (HRESULT=0x%08lx)\n",
-                    profile.c_str(), static_cast<unsigned long>(result));
+      ReportAppContainerFailure(L"delete_primary_profile", result, ERROR_SUCCESS);
       okay = false;
     }
   }
   if (second_created) {
     const HRESULT result = DeleteAppContainerProfile(second_profile.c_str());
     if (FAILED(result)) {
-      std::fwprintf(stderr, L"AppContainer profile cleanup failed: %ls (HRESULT=0x%08lx)\n",
-                    second_profile.c_str(), static_cast<unsigned long>(result));
+      ReportAppContainerFailure(L"delete_secondary_profile", result, ERROR_SUCCESS);
       okay = false;
     }
   }
@@ -135,33 +140,73 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
   try {
     HRESULT result = CreateAppContainerProfile(profile.c_str(), L"SumatraFuzz API Probe",
                                                 L"Ephemeral feasibility probe", nullptr, 0, &sid);
-    if (FAILED(result) || !sid) goto cleanup;
-    first_created = true;
-    result = GetAppContainerFolderPath(profile.c_str(), &profile_path);
-    if (FAILED(result) || !profile_path || GetFullPathNameW(profile_path, 0, nullptr, nullptr) == 0)
+    if (FAILED(result) || !sid) {
+      ReportAppContainerFailure(L"create_profile", result, ERROR_SUCCESS);
       goto cleanup;
+    }
+    first_created = true;
+    {
+      LPWSTR sid_string = nullptr;
+      if (!ConvertSidToStringSidW(sid, &sid_string)) {
+        ReportAppContainerFailure(L"convert_profile_sid", S_OK, GetLastError());
+        goto cleanup;
+      }
+      result = GetAppContainerFolderPath(sid_string, &profile_path);
+      LocalFree(sid_string);
+    }
+    if (FAILED(result) || !profile_path || GetFullPathNameW(profile_path, 0, nullptr, nullptr) == 0) {
+      ReportAppContainerFailure(L"get_profile_folder", result,
+                                FAILED(result) ? ERROR_SUCCESS : GetLastError());
+      goto cleanup;
+    }
     std::fwprintf(stdout, L"AppContainerProfilePath=%ls\n", profile_path);
     std::fwprintf(stdout, L"AppContainerTempPath=%ls\n", output.c_str());
     result = CreateAppContainerProfile(second_profile.c_str(), L"SumatraFuzz API Probe",
                                         L"Ephemeral feasibility probe", nullptr, 0, &second_sid);
-    if (FAILED(result) || !second_sid || EqualSid(sid, second_sid)) goto cleanup;
+    if (FAILED(result) || !second_sid) {
+      ReportAppContainerFailure(L"create_unique_profile", result, ERROR_SUCCESS);
+      goto cleanup;
+    }
+    if (EqualSid(sid, second_sid)) {
+      ReportAppContainerFailure(L"verify_unique_package_sid", HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+                                ERROR_INVALID_DATA);
+      goto cleanup;
+    }
     second_created = true;
-    if (!GrantAppContainerDirectoryAccess(output, sid)) goto cleanup;
+    if (!GrantAppContainerDirectoryAccess(output, sid)) {
+      ReportAppContainerFailure(L"grant_output_acl", S_OK, GetLastError());
+      goto cleanup;
+    }
     {
       const std::wstring appcontainer_executable = output + L"\\appcontainer-probe.exe";
-      if (!CopyFileW(executable.c_str(), appcontainer_executable.c_str(), TRUE)) goto cleanup;
+      if (!CopyFileW(executable.c_str(), appcontainer_executable.c_str(), TRUE)) {
+        ReportAppContainerFailure(L"copy_probe_executable", S_OK, GetLastError());
+        goto cleanup;
+      }
       SIZE_T bytes = 0;
       InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+      if (bytes == 0) {
+        ReportAppContainerFailure(L"size_process_attributes", S_OK, GetLastError());
+        goto cleanup;
+      }
       std::vector<BYTE> attributes(bytes);
       auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
-      if (!InitializeProcThreadAttributeList(list, 1, 0, &bytes)) goto cleanup;
+      if (!InitializeProcThreadAttributeList(list, 1, 0, &bytes)) {
+        ReportAppContainerFailure(L"initialize_process_attributes", S_OK, GetLastError());
+        goto cleanup;
+      }
       SECURITY_CAPABILITIES security{};
       security.AppContainerSid = sid;
       security.CapabilityCount = 0;
       security.Capabilities = nullptr;
       const bool updated = UpdateProcThreadAttribute(list, 0,
           PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr);
-      if (!updated) { DeleteProcThreadAttributeList(list); goto cleanup; }
+      if (!updated) {
+        const DWORD error = GetLastError();
+        DeleteProcThreadAttributeList(list);
+        ReportAppContainerFailure(L"set_security_capabilities", S_OK, error);
+        goto cleanup;
+      }
       STARTUPINFOEXW startup{};
       startup.StartupInfo.cb = sizeof(startup);
       startup.lpAttributeList = list;
@@ -173,7 +218,10 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
           FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, output.c_str(),
           &startup.StartupInfo, &process);
       DeleteProcThreadAttributeList(list);
-      if (!launched) goto cleanup;
+      if (!launched) {
+        ReportAppContainerFailure(L"launch_appcontainer", S_OK, GetLastError());
+        goto cleanup;
+      }
       DWORD wait = WaitForSingleObject(process.hProcess, 30000);
       if (wait == WAIT_TIMEOUT) {
         TerminateProcess(process.hProcess, ERROR_TIMEOUT);
@@ -181,9 +229,12 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
       }
       DWORD exit_code = 0xffffffff;
       if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exit_code);
+      else ReportAppContainerFailure(L"wait_for_appcontainer", S_OK, GetLastError());
       CloseHandle(process.hThread);
       CloseHandle(process.hProcess);
       okay = wait == WAIT_OBJECT_0 && exit_code == 0;
+      if (wait == WAIT_OBJECT_0 && exit_code != 0)
+        ReportAppContainerFailure(L"verify_appcontainer_child", HRESULT_FROM_WIN32(exit_code), exit_code);
     }
   cleanup:
     if (profile_path) CoTaskMemFree(profile_path);
@@ -194,6 +245,7 @@ bool RunAppContainerProbe(const std::wstring& executable, const std::wstring& ou
     okay = profiles_deleted && okay;
     return okay;
   } catch (...) {
+    ReportAppContainerFailure(L"handle_probe_exception", E_FAIL, ERROR_SUCCESS);
     if (profile_path) CoTaskMemFree(profile_path);
     if (sid) FreeSid(sid);
     if (second_sid) FreeSid(second_sid);

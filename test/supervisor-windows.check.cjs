@@ -384,8 +384,10 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(appContainerScript, /nonadministrator identity/);
   assert.match(appContainerScript, /--appcontainer-probe/);
   assert.match(nativeProbe, /CreateAppContainerProfile/);
-  assert.match(nativeProbe, /GetAppContainerFolderPath\(profile\.c_str\(\),\s*&profile_path\)/);
-  assert.doesNotMatch(nativeProbe, /GetAppContainerFolderPath\(sid,/);
+  assert.match(nativeProbe, /ConvertSidToStringSidW\(sid,\s*&sid_string\)/);
+  assert.match(nativeProbe, /GetAppContainerFolderPath\(sid_string,\s*&profile_path\)/);
+  assert.match(nativeProbe, /LocalFree\(sid_string\)/);
+  assert.doesNotMatch(nativeProbe, /GetAppContainerFolderPath\(profile\.c_str\(/);
   assert.match(nativeProbe, /DeleteAppContainerProfile/);
   assert.match(nativeProbe, /PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES/);
   assert.match(nativeProbe, /SECURITY_CAPABILITIES/);
@@ -395,7 +397,11 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
   assert.match(nativeProbe, /AppContainerProfilePath=/);
   assert.match(nativeProbe, /AppContainerTempPath=/);
   assert.match(nativeProbe, /bool DeleteProbeProfiles\(/);
-  assert.match(nativeProbe, /AppContainer profile cleanup failed/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\(L"delete_primary_profile"/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\(L"delete_secondary_profile"/);
+  assert.match(nativeProbe, /step=%ls hresult=.*win32=/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\(L"launch_appcontainer"/);
+  assert.match(nativeProbe, /ReportAppContainerFailure\(L"get_profile_folder"/);
   assert.match(
     nativeProbe,
     /DeleteProbeProfiles\(profile, second_profile,\s*first_created, second_created\)/,

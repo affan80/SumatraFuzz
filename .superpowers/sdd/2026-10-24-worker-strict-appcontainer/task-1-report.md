@@ -56,3 +56,17 @@ Requested local checks:
 - `git diff --check`: passed.
 
 The previous hosted exact-head run failed in the legacy restricted-child startup-marker assertion, before the AppContainer invocation. This reordering should emit feasibility evidence before that blocker, but a clean exact-head Windows run is still required to confirm the probe's execution and cleanup. The legacy runtime failure remains unresolved.
+
+## Fix round: pass the package SID string and report failed stages
+
+The latest hosted Windows run reached the AppContainer probe and returned exit 82. The `GetAppContainerFolderPath` argument was incorrect: Microsoft documents `pszAppContainerSid` as the SID string, so the probe now converts the package SID with `ConvertSidToStringSidW`, passes the resulting string, and releases it with `LocalFree`. The profile name remains in use for profile creation and deletion. Source: [Microsoft Learn: GetAppContainerFolderPath](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getappcontainerfolderpath).
+
+Added failure diagnostics with a stable stage name plus HRESULT and/or Win32 error for profile creation, SID conversion, folder query, unique SID validation, ACL setup, executable copy, process attribute setup, child launch, wait, child exit, and cleanup. These failure messages do not include filesystem paths. Static checks require the SID string conversion, correct API argument, its `LocalFree`, and representative stage diagnostics.
+
+Local checks:
+
+- `npm run format:check`: passed; Biome checked 139 files.
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
+- `git diff --check`: passed.
+
+This macOS workspace cannot compile or run the Windows APIs. The latest hosted execution reached the probe but failed before the SID-string correction; a clean exact-head Windows run is still required to confirm the corrected API query and probe cleanup.
