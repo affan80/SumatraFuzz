@@ -1,6 +1,5 @@
 #ifdef _WIN32
 #include "command_line.h"
-#include "private_acl.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -96,16 +95,11 @@ struct ProbeNamespace {
   HANDLE token = nullptr;
   HANDLE boundary = nullptr;
   HANDLE handle = nullptr;
-  PSID run_sid = nullptr;
-  PACL acl = nullptr;
   std::vector<BYTE> user;
   std::wstring alias;
-  SECURITY_DESCRIPTOR descriptor{};
   ~ProbeNamespace() {
     if (handle) ClosePrivateNamespace(handle, 0);
     if (boundary) DeleteBoundaryDescriptor(boundary);
-    if (acl) LocalFree(acl);
-    if (run_sid) LocalFree(run_sid);
     if (token) CloseHandle(token);
   }
   bool Initialize(unsigned* failure_stage = nullptr, DWORD* failure_error = nullptr) {
@@ -118,41 +112,61 @@ struct ProbeNamespace {
     wchar_t alias_text[64]{}, sid_text[185]{};
     const DWORD alias_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_NAMESPACE_ALIAS", alias_text, 64);
     const DWORD sid_size = GetEnvironmentVariableW(L"SUMATRAFUZZ_RUN_SID", sid_text, 185);
-    if (!alias_size || alias_size >= 64 || !sid_size || sid_size >= 185) return fail_last_error(1);
+    if (!alias_size || alias_size >= 64 || !sid_size || sid_size >= 185)
+      return fail_last_error(1);
     alias = alias_text;
-    if (!ValidAlias(alias) || !ConvertStringSidToSidW(sid_text, &run_sid) || !RunSid(run_sid)) return fail_last_error(2);
+    PSID run_sid = nullptr;
+    if (!ValidAlias(alias) || !ConvertStringSidToSidW(sid_text, &run_sid) ||
+        !RunSid(run_sid)) {
+      if (run_sid) LocalFree(run_sid);
+      return fail_last_error(2);
+    }
     LPWSTR canonical = nullptr;
-    if (!ConvertSidToStringSidW(run_sid, &canonical)) return fail_last_error(3);
+    if (!ConvertSidToStringSidW(run_sid, &canonical)) {
+      LocalFree(run_sid);
+      return fail_last_error(3);
+    }
     const bool exact = std::wstring(canonical) == sid_text;
     LocalFree(canonical);
-    if (!exact) return fail_last_error(4);
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return fail_last_error(5);
+    if (!exact) {
+      LocalFree(run_sid);
+      return fail_last_error(4);
+    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+      LocalFree(run_sid);
+      return fail_last_error(5);
+    }
     DWORD bytes = 0;
     GetTokenInformation(token, TokenRestrictedSids, nullptr, 0, &bytes);
-    if (!bytes) return fail_last_error(6);
+    if (!bytes) {
+      LocalFree(run_sid);
+      return fail_last_error(6);
+    }
     std::vector<BYTE> restrictions(bytes);
-    if (!GetTokenInformation(token, TokenRestrictedSids, restrictions.data(), bytes, &bytes)) return fail_last_error(7);
+    if (!GetTokenInformation(token, TokenRestrictedSids, restrictions.data(), bytes, &bytes)) {
+      LocalFree(run_sid);
+      return fail_last_error(7);
+    }
     auto* groups = reinterpret_cast<TOKEN_GROUPS*>(restrictions.data());
     unsigned matches = 0, run_sids = 0;
     for (DWORD i = 0; i < groups->GroupCount; ++i) {
       if (RunSid(groups->Groups[i].Sid)) ++run_sids;
       if (EqualSid(groups->Groups[i].Sid, run_sid)) ++matches;
     }
-    if (matches != 1 || run_sids != 1) return fail_last_error(8);
+    if (matches != 1 || run_sids != 1) {
+      LocalFree(run_sid);
+      return fail_last_error(8);
+    }
     bytes = 0;
     GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
-    if (!bytes) return fail_last_error(9);
+    if (!bytes) {
+      LocalFree(run_sid);
+      return fail_last_error(9);
+    }
     user.resize(bytes);
-    if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes)) return fail_last_error(10);
-    PSID worker = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
-    const sumatrafuzz::supervisor::PrivateAclGrant grants[] = {
-        {worker, EVENT_MODIFY_STATE | SYNCHRONIZE},
-        {run_sid, EVENT_MODIFY_STATE | SYNCHRONIZE}};
-    acl = sumatrafuzz::supervisor::CreatePrivateAccessAcl(grants, std::size(grants));
-    if (!acl) return fail_last_error(11);
-    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)) return fail_last_error(12);
-    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) return fail_last_error(13);
-    if (!SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) return fail_last_error(14);
+    const bool user_read = GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes) != FALSE;
+    LocalFree(run_sid);
+    if (!user_read) return fail_last_error(10);
     return true;
   }
   bool Open(const std::wstring& target_alias) {
@@ -260,11 +274,10 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     for (;;) Sleep(1000);
   }
 
-  SECURITY_ATTRIBUTES attributes{sizeof(attributes), &ns.descriptor, FALSE};
-  // CreateEvent returns full access to the new handle; request only the rights
-  // granted by this run-private object's ACL instead.
+  // The supervisor sets the restricted token's default DACL to the worker and
+  // this run SID; use that DACL for this named object in the private namespace.
   SetLastError(ERROR_SUCCESS);
-  HANDLE event = CreateEventExW(&attributes, event_name.c_str(), CREATE_EVENT_MANUAL_RESET,
+  HANDLE event = CreateEventExW(nullptr, event_name.c_str(), CREATE_EVENT_MANUAL_RESET,
                                 EVENT_MODIFY_STATE | SYNCHRONIZE);
   const DWORD event_error = GetLastError();
   if (!event || event_error == ERROR_ALREADY_EXISTS) {

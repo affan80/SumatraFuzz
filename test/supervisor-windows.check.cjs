@@ -669,7 +669,7 @@ test('supervisor owns a protected run-private namespace until job teardown', () 
   assert.match(probe, /--namespace-gone/);
 });
 
-test('private namespace probe reports the exact private ACL construction failure', () => {
+test('private namespace probe uses the restricted token default DACL', () => {
   const probe = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
     'utf8',
@@ -678,33 +678,18 @@ test('private namespace probe reports the exact private ACL construction failure
     probe,
     /bool Initialize\(unsigned\* failure_stage = nullptr, DWORD\* failure_error = nullptr\)/,
   );
-  assert.match(probe, /CreatePrivateAccessAcl\(grants, std::size\(grants\)\)/);
-  assert.match(probe, /if \(!acl\) return fail_last_error\(11\);/);
-  const acl = readFileSync(
-    path.join(__dirname, '..', 'native/worker-supervisor/include/private_acl.h'),
+  assert.match(probe, /TokenRestrictedSids/);
+  assert.match(probe, /CreateEventExW\(nullptr, event_name\.c_str\(\)/);
+  const addon = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
     'utf8',
   );
-  assert.match(acl, /InitializeAcl\(acl, static_cast<DWORD>\(acl_size\), ACL_REVISION\)/);
-  assert.match(
-    acl,
-    /AddAccessAllowedAceEx\(acl, ACL_REVISION, 0, grants\[index\]\.access, grants\[index\]\.sid\)/,
-  );
-  assert.match(
-    probe,
-    /InitializeSecurityDescriptor\(&descriptor, SECURITY_DESCRIPTOR_REVISION\)\) return fail_last_error\(12\)/,
-  );
-  assert.match(
-    probe,
-    /SetSecurityDescriptorDacl\(&descriptor, TRUE, acl, FALSE\)\) return fail_last_error\(13\)/,
-  );
-  assert.match(
-    probe,
-    /SetSecurityDescriptorControl\(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED\)\) return fail_last_error\(14\)/,
-  );
+  assert.match(addon, /\{user->User\.Sid, GENERIC_ALL\}, \{run_sid, GENERIC_ALL\}/);
+  assert.match(addon, /SetTokenInformation\(restricted_token, TokenDefaultDacl/);
   assert.match(probe, /ns\.Initialize\(&namespace_stage, &namespace_error\)/);
   assert.match(
     probe,
-    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventExW\(&attributes, event_name\.c_str\(\), CREATE_EVENT_MANUAL_RESET,\s+EVENT_MODIFY_STATE \| SYNCHRONIZE\);\s+const DWORD event_error = GetLastError\(\);/,
+    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventExW\(nullptr, event_name\.c_str\(\), CREATE_EVENT_MANUAL_RESET,\s+EVENT_MODIFY_STATE \| SYNCHRONIZE\);\s+const DWORD event_error = GetLastError\(\);/,
   );
   assert.match(
     probe,
