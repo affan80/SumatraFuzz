@@ -48,13 +48,45 @@ DWORD ProbeEventCreation(const std::wstring& name, SECURITY_ATTRIBUTES* attribut
   return event ? (error == ERROR_ALREADY_EXISTS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS) : error;
 }
 
+DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_access,
+                             BOOL* access_granted) {
+  *access_granted = FALSE;
+  HANDLE process_token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token)) return GetLastError();
+  HANDLE impersonation_token = nullptr;
+  if (!DuplicateTokenEx(process_token, TOKEN_QUERY, nullptr, SecurityImpersonation,
+                        TokenImpersonation, &impersonation_token)) {
+    const DWORD error = GetLastError();
+    CloseHandle(process_token);
+    return error;
+  }
+  CloseHandle(process_token);
+  GENERIC_MAPPING event_mapping{EVENT_QUERY_STATE | SYNCHRONIZE,
+                                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                                SYNCHRONIZE, EVENT_ALL_ACCESS};
+  PRIVILEGE_SET privileges{};
+  DWORD privilege_bytes = sizeof(privileges);
+  DWORD granted_access = 0;
+  BOOL granted = FALSE;
+  const BOOL checked = AccessCheck(descriptor, impersonation_token, desired_access,
+                                   &event_mapping, &privileges, &privilege_bytes,
+                                   &granted_access, &granted);
+  const DWORD error = checked ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(impersonation_token);
+  if (checked) *access_granted = granted;
+  return error;
+}
+
 void WriteNamedEventFailureDiagnostic(const std::wstring& evidence_dir, DWORD error,
                                       DWORD unnamed_error, DWORD local_error,
-                                      DWORD explicit_local_error) {
+                                      DWORD explicit_local_error, DWORD dacl_check_error,
+                                      BOOL dacl_granted) {
   const std::string contents = "private_event_failed=" + std::to_string(error) +
       ",unnamed_event_error=" + std::to_string(unnamed_error) +
       ",local_named_event_error=" + std::to_string(local_error) +
-      ",explicit_local_event_error=" + std::to_string(explicit_local_error) + "\n";
+      ",explicit_local_event_error=" + std::to_string(explicit_local_error) +
+      ",explicit_dacl_access_error=" + std::to_string(dacl_check_error) +
+      ",explicit_dacl_granted=" + std::to_string(dacl_granted ? 1 : 0) + "\n";
   const std::wstring path = evidence_dir + L"\\named-event-diagnostic.txt";
   HANDLE report = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -332,8 +364,11 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
     const std::wstring local_name = L"Local\\SFProbe-" + std::to_wstring(GetCurrentProcessId());
     const DWORD local_error = ProbeEventCreation(local_name);
     const DWORD explicit_local_error = ProbeEventCreation(local_name, &event_attributes);
+    BOOL dacl_granted = FALSE;
+    const DWORD dacl_check_error = CheckExplicitEventDacl(
+        &event_descriptor, event_rights, &dacl_granted);
     WriteNamedEventFailureDiagnostic(evidence_dir, error, unnamed_error, local_error,
-                                     explicit_local_error);
+                                     explicit_local_error, dacl_check_error, dacl_granted);
     LocalFree(event_acl);
     LocalFree(run_sid);
     return 2400 + static_cast<int>(error);
