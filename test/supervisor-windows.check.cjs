@@ -378,6 +378,9 @@ test('run resource ACL foundation constrains grants, proof identity and rollback
   assert.match(header, /if \(profile\.sid\) FreeSid\(profile\.sid\)/);
   // Metadata-only opens do not participate in Windows sharing checks.
   assert.match(header, /access \| FILE_READ_ATTRIBUTES \| FILE_READ_DATA/);
+  assert.match(header, /ValidateRunResourceBoundary/);
+  assert.match(header, /OWNER_SECURITY_INFORMATION/);
+  assert.match(header, /untrusted run resource metadata writer/);
   assert.match(header, /FileIdInfo/);
   assert.match(header, /approved->proof/);
   assert.match(header, /NO_INHERITANCE/);
@@ -402,6 +405,12 @@ test('native resource contract reports every early-return branch', () => {
   assert.match(contract, /CanonicalResourceContractRoot\(supplied_root\)/);
   assert.doesNotMatch(contract, /auto root_handle/);
   assert.match(contract, /parent-pin-control/);
+  assert.match(contract, /reject-untrusted-metadata-writer/);
+  assert.match(contract, /trusted-owner-metadata-positive-control/);
+  assert.match(contract, /RunResourceIdentityProbe\(tool, root, profile.sid, false\)/);
+  assert.match(contract, /RunResourceIdentityProbe\(tool, root, second.sid, true\)/);
+  assert.match(probe, /TokenAppContainerSid/);
+  assert.match(probe, /error != ERROR_ACCESS_DENIED\) failed \|= 0x10/);
   const joined = contract.indexOf('mutation.join();');
   const failure = contract.indexOf('if (!mutation_denied)');
   const caseFixture = contract.indexOf('checkpoint("create-case-sensitive-directory")');
@@ -415,7 +424,10 @@ test('Windows run resources bind proof identities, reject mutations and roll bac
   skip: process.platform !== 'win32',
 }, (t) => {
   const probe = path.join(__dirname, '..', 'build/worker-supervisor/Debug/process_probe.exe');
-  const root = mkdtempSync(path.join(os.tmpdir(), 'sumatrafuzz-resources-'));
+  assert.ok(process.env.SUMATRAFUZZ_RESOURCE_ROOT, 'protected resource fixture is required');
+  const root = mkdtempSync(
+    path.join(process.env.SUMATRAFUZZ_RESOURCE_ROOT, 'sumatrafuzz-resources-'),
+  );
   try {
     const result = spawnSync(probe, ['--run-resource-contract', root], {
       encoding: 'utf8',

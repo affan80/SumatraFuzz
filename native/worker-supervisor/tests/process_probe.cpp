@@ -103,6 +103,117 @@ bool SetContractJunction(HANDLE handle, const std::wstring& destination) {
                         junction.length + 8, nullptr, 0, &returned, nullptr) != FALSE;
 }
 
+// Exercise actual kernel access checks with a no-capability package token.
+// The worker/administrator is trusted and can reset DACLs; its own metadata
+// handle is not a valid hostile identity for this boundary.
+DWORD ResourceIdentityChild(const std::wstring& root, const std::wstring& expected_sid, bool sibling) {
+  using namespace sumatrafuzz::supervisor;
+  HANDLE raw = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) return 1;
+  ResourceHandle token(raw);
+  DWORD is_container = 0, bytes = 0;
+  if (!GetTokenInformation(raw, TokenIsAppContainer, &is_container, sizeof(is_container), &bytes) || !is_container)
+    return 2;
+  std::vector<BYTE> caps(sizeof(TOKEN_GROUPS));
+  if (!GetTokenInformation(raw, TokenCapabilities, caps.data(), static_cast<DWORD>(caps.size()), &bytes) ||
+      reinterpret_cast<TOKEN_GROUPS*>(caps.data())->GroupCount != 0) return 3;
+  GetTokenInformation(raw, TokenAppContainerSid, nullptr, 0, &bytes);
+  std::vector<BYTE> package(bytes);
+  if (!bytes || !GetTokenInformation(raw, TokenAppContainerSid, package.data(), bytes, &bytes)) return 4;
+  PSID expected = nullptr;
+  if (!ConvertStringSidToSidW(expected_sid.c_str(), &expected)) return 5;
+  const bool matches = EqualSid(expected, reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(package.data())->TokenAppContainer);
+  LocalFree(expected);
+  if (!matches) return 6;
+  const std::wstring output = root + L"\\evidence";
+  const std::wstring target = root + L"\\sibling";
+  DWORD failed = 0;
+  // Attempt every mutable directory in the resolution chain, including the
+  // resource root. Require ACCESS_DENIED at open, not DIRECTORY_NOT_EMPTY or
+  // malformed-FSCTL failures that could hide an authorized metadata handle.
+  for (const auto& directory : {root, root + L"\\inputs", output}) {
+    ResourceHandle metadata(CreateFileW(directory.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    const DWORD error = metadata.value == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (metadata.value != INVALID_HANDLE_VALUE) SetContractJunction(metadata.value, target);
+    if (error != ERROR_ACCESS_DENIED) failed |= 0x10;
+    for (DWORD right : {static_cast<DWORD>(WRITE_DAC), static_cast<DWORD>(WRITE_OWNER)}) {
+      ResourceHandle security(CreateFileW(directory.c_str(), right,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (security.value != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ACCESS_DENIED) failed |= 0x20;
+    }
+  }
+  const auto denied_mutation = [](BOOL result) {
+    const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+    return !result && (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION);
+  };
+  if (!denied_mutation(MoveFileExW((root + L"\\inputs\\input.pdf").c_str(), (output + L"\\stolen.pdf").c_str(), 0)) ||
+      !denied_mutation(MoveFileExW((root + L"\\inputs").c_str(), (root + L"\\stolen-inputs").c_str(), 0)) ||
+      !denied_mutation(MoveFileExW(output.c_str(), (root + L"\\stolen-evidence").c_str(), 0)) ||
+      !denied_mutation(MoveFileExW((root + L"\\replaced.pdf").c_str(), (root + L"\\inputs\\input.pdf").c_str(), MOVEFILE_REPLACE_EXISTING)))
+    failed |= 0x40;
+  for (const auto& file : {root + L"\\inputs\\input.pdf", root + L"\\tool.exe"}) {
+    if (!denied_mutation(CreateHardLinkW((output + L"\\hardlink").c_str(), file.c_str(), nullptr))) failed |= 0x80;
+  }
+  ResourceHandle writer(CreateFileW(output.c_str(), GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (writer.value != INVALID_HANDLE_VALUE ||
+      (GetLastError() != ERROR_ACCESS_DENIED && GetLastError() != ERROR_SHARING_VIOLATION)) failed |= 0x100;
+  const std::wstring marker = output + (sibling ? L"\\sibling-write.txt" : L"\\package-write.txt");
+  ResourceHandle child(CreateFileW(marker.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+      nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (sibling) {
+    if (child.value != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ACCESS_DENIED) failed |= 0x200;
+  } else {
+    DWORD written = 0;
+    if (child.value == INVALID_HANDLE_VALUE || !WriteFile(child.value, "x", 1, &written, nullptr) || written != 1)
+      failed |= 0x200;
+  }
+  return failed;
+}
+
+DWORD RunResourceIdentityProbe(const std::wstring& executable, const std::wstring& root, PSID sid, bool sibling) {
+  using namespace sumatrafuzz::supervisor;
+  LPWSTR text = nullptr;
+  if (!ConvertSidToStringSidW(sid, &text)) ResourceError(GetLastError(), "contract package string");
+  const std::wstring expected(text);
+  LocalFree(text);
+  SIZE_T bytes = 0;
+  InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+  if (!bytes) ResourceError(GetLastError(), "contract process attributes size");
+  std::vector<BYTE> storage(bytes);
+  auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+  if (!InitializeProcThreadAttributeList(list, 1, 0, &bytes))
+    ResourceError(GetLastError(), "contract process attributes initialize");
+  struct Attributes { LPPROC_THREAD_ATTRIBUTE_LIST list; ~Attributes() { DeleteProcThreadAttributeList(list); } } attributes{list};
+  SECURITY_CAPABILITIES security{};
+  security.AppContainerSid = sid;
+  if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+      &security, sizeof(security), nullptr, nullptr)) ResourceError(GetLastError(), "contract security capabilities");
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.cb = sizeof(startup);
+  startup.lpAttributeList = list;
+  PROCESS_INFORMATION process{};
+  std::wstring command = L"\"" + executable + L"\" --resource-identity-child \"" + root + L"\" \"" + expected +
+      (sibling ? L"\" sibling" : L"\" owner");
+  if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, root.c_str(), &startup.StartupInfo, &process))
+    ResourceError(GetLastError(), "contract AppContainer launch");
+  ResourceHandle child(process.hProcess), thread(process.hThread);
+  DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+  if (wait != WAIT_OBJECT_0) {
+    TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+    WaitForSingleObject(process.hProcess, 10000);
+    ResourceError(ERROR_TIMEOUT, "contract AppContainer drain");
+  }
+  DWORD code = 0;
+  if (!GetExitCodeProcess(process.hProcess, &code)) ResourceError(GetLastError(), "contract AppContainer exit");
+  return code;
+}
+
 bool RunResourceContract(const std::wstring& supplied_root) {
   using namespace sumatrafuzz::supervisor;
   const char* stage = "entry";
@@ -127,7 +238,10 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     const std::wstring link = root + L"\\alias.pdf";
     checkpoint("create-input-directory");
     if (!CreateDirectoryW(input_dir.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
-    for (const auto& file : {tool, input, secret}) {
+    wchar_t probe_executable[32768]{};
+    if (!GetModuleFileNameW(nullptr, probe_executable, 32768) ||
+        !CopyFileW(probe_executable, tool.c_str(), TRUE)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    for (const auto& file : {input, secret}) {
       checkpoint(file == tool ? "create-tool-file" : file == input ? "create-input-file" : "create-secret-file");
       ResourceHandle created(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                         FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -223,6 +337,47 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         !rejected(secret, RunResourceAccess::EvidenceModify, profile.sid) ||
         !rejected(input, RunResourceAccess::ToolReadExecute, profile.sid) ||
         !rejected(root + L"\\evidence\\..\\input.pdf", RunResourceAccess::InputRead, profile.sid)) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
+    checkpoint("reject-untrusted-metadata-writer");
+    for (const auto& mutable_path : {root, output}) {
+      PACL original = nullptr;
+      PSECURITY_DESCRIPTOR saved = nullptr;
+      DWORD result = GetNamedSecurityInfoW(const_cast<LPWSTR>(mutable_path.c_str()), SE_FILE_OBJECT,
+          DACL_SECURITY_INFORMATION, nullptr, nullptr, &original, nullptr, &saved);
+      if (result != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, result);
+      struct SavedAcl { PSECURITY_DESCRIPTOR value; ~SavedAcl() { if (value) LocalFree(value); } } saved_acl{saved};
+      EXPLICIT_ACCESSW entry{};
+      entry.grfAccessPermissions = FILE_WRITE_ATTRIBUTES;
+      entry.grfAccessMode = GRANT_ACCESS;
+      entry.grfInheritance = NO_INHERITANCE;
+      entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+      entry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(broad);
+      PACL unsafe = nullptr;
+      result = SetEntriesInAclW(1, &entry, original, &unsafe);
+      if (result != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, result);
+      result = SetNamedSecurityInfoW(const_cast<LPWSTR>(mutable_path.c_str()), SE_FILE_OBJECT,
+          DACL_SECURITY_INFORMATION, nullptr, nullptr, unsafe, nullptr);
+      LocalFree(unsafe);
+      if (result != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, result);
+      bool denied = false;
+      try { auto unexpected = GrantRunResourceAccess(output, profile.sid, RunResourceAccess::EvidenceModify, policy); }
+      catch (const std::system_error& error) { denied = error.code().value() == ERROR_ACCESS_DENIED; }
+      result = SetNamedSecurityInfoW(const_cast<LPWSTR>(mutable_path.c_str()), SE_FILE_OBJECT,
+          DACL_SECURITY_INFORMATION, nullptr, nullptr, original, nullptr);
+      if (result != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, result);
+      if (!denied || PackageAceMask(output, profile.sid)) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
+    }
+    checkpoint("trusted-owner-metadata-positive-control");
+    const std::wstring trusted_control = root + L"\\trusted-metadata-control";
+    if (!CreateDirectoryW(trusted_control.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
+    {
+      auto pinned = OpenRunResource(trusted_control, FILE_READ_ATTRIBUTES, true);
+      ResourceHandle metadata(CreateFileW(trusted_control.c_str(), FILE_WRITE_ATTRIBUTES,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (metadata.value == INVALID_HANDLE_VALUE || !SetContractJunction(metadata.value, sibling))
+        return ResourceContractFailure(stage, __LINE__, GetLastError());
+    }
+    if (!RemoveDirectoryW(trusted_control.c_str())) return ResourceContractFailure(stage, __LINE__, GetLastError());
     checkpoint("create-initial-hardlink");
     if (!CreateHardLinkW(link.c_str(), input.c_str(), nullptr)) return ResourceContractFailure(stage, __LINE__, GetLastError());
     policy.objects.push_back(rule(link, RunResourceAccess::InputRead));
@@ -302,6 +457,17 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         (output_mask & (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD)) != (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD) ||
         (output_mask & (WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES)) ||
         !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
+    checkpoint("appcontainer-metadata-boundary");
+    const DWORD package_result = RunResourceIdentityProbe(tool, root, profile.sid, false);
+    ResourceContractDiagnostic(stage, __LINE__, package_result, "primary-package-mutation-and-evidence-result");
+    if (package_result != 0) return ResourceContractFailure(stage, __LINE__, package_result);
+    // The sibling may execute the probe but receives no evidence/input grant.
+    auto sibling_tool = GrantRunResourceAccess(tool, second.sid, RunResourceAccess::ToolReadExecute, policy);
+    const DWORD sibling_result = RunResourceIdentityProbe(tool, root, second.sid, true);
+    ResourceContractDiagnostic(stage, __LINE__, sibling_result, "sibling-package-mutation-and-write-denial-result");
+    if (sibling_result != 0) return ResourceContractFailure(stage, __LINE__, sibling_result);
+    const DWORD sibling_tool_remove = sibling_tool->Remove();
+    if (sibling_tool_remove != ERROR_SUCCESS) return ResourceContractFailure(stage, __LINE__, sibling_tool_remove);
     // A separate thread attempts namespace mutation while grants remain held.
     checkpoint("concurrent-mutations");
     bool mutation_denied = false;
@@ -321,26 +487,19 @@ bool RunResourceContract(const std::wstring& supplied_root) {
           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
       const bool retarget_denied = writer.value == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION;
-      ResourceHandle metadata(CreateFileW(output.c_str(), FILE_WRITE_ATTRIBUTES,
-          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-      const bool metadata_retargeted = metadata.value != INVALID_HANDLE_VALUE && SetContractJunction(metadata.value, sibling);
-      const DWORD metadata_retarget_error = metadata_retargeted ? ERROR_SUCCESS : GetLastError();
-      const bool metadata_retarget_denied = !metadata_retargeted;
       ResourceHandle child(CreateFileW((output + L"\\new.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ,
           nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
       DWORD written = 0;
       const bool output_writable = child.value != INVALID_HANDLE_VALUE && WriteFile(child.value, "x", 1, &written, nullptr) && written == 1;
       char mutation_message[1024]{};
-      const int mutation_length = std::snprintf(mutation_message, sizeof(mutation_message), "resource-pin: inputRenameDenied=%d ancestorRenameDenied=%d evidenceRenameDenied=%d replacementDenied=%d writeOpenDenied=%d metadataRetargetDenied=%d metadataError=%lu inputHardlinkDenied=%d inputLinkError=%lu toolHardlinkDenied=%d toolLinkError=%lu childWrite=%d\n",
+      const int mutation_length = std::snprintf(mutation_message, sizeof(mutation_message), "resource-pin: inputRenameDenied=%d ancestorRenameDenied=%d evidenceRenameDenied=%d replacementDenied=%d writeOpenDenied=%d inputHardlinkDenied=%d inputLinkError=%lu toolHardlinkDenied=%d toolLinkError=%lu childWrite=%d\n",
           input_pinned, ancestor_pinned, output_pinned, replacement_pinned, retarget_denied,
-          metadata_retarget_denied, static_cast<unsigned long>(metadata_retarget_error),
           !input_linked, static_cast<unsigned long>(input_link_error), !tool_linked,
           static_cast<unsigned long>(tool_link_error), output_writable);
       if (mutation_length > 0 && static_cast<size_t>(mutation_length) < sizeof(mutation_message))
         WriteAppContainerDiagnostic(mutation_message, static_cast<DWORD>(mutation_length));
       mutation_denied = input_pinned && ancestor_pinned && output_pinned && replacement_pinned &&
-          retarget_denied && metadata_retarget_denied && !input_linked && !tool_linked && output_writable;
+          retarget_denied && !input_linked && !tool_linked && output_writable;
     });
     mutation.join();
     if (!mutation_denied) return ResourceContractFailure(stage, __LINE__, ERROR_INVALID_DATA);
@@ -1252,6 +1411,8 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 5 && std::wstring(argv[1]) == L"--resource-identity-child")
+    return static_cast<int>(ResourceIdentityChild(argv[2], argv[3], std::wstring(argv[4]) == L"sibling"));
   if (argc == 3 && std::wstring(argv[1]) == L"--run-resource-contract")
     return RunResourceContract(argv[2]) ? 0 : 83;
   if (argc == 7 && std::wstring(argv[1]) == L"--appcontainer-child")

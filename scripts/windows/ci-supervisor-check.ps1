@@ -33,6 +33,9 @@ $account = 'sf-probe-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $password = ConvertTo-SecureString ([Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)) + 'aA1!') -AsPlainText -Force
 $temp = Join-Path $RepoRoot "runs/$account"
 $protected = Join-Path $temp 'protected'
+# Resource admission requires trusted ownership/metadata ACLs all the way to
+# the volume root. The checkout is runner-owned and is not such a boundary.
+$resourceRoot = Join-Path ([IO.Path]::GetPathRoot($RepoRoot)) "sf-resources-$account"
 $credentialSentinel = Join-Path $protected 'credential-sentinel'
 $worldWriteSentinel = Join-Path $temp 'world-write-sentinel'
 $authenticatedWriteSentinel = Join-Path $temp 'authenticated-write-sentinel'
@@ -90,6 +93,15 @@ try {
     $null = New-Item -ItemType Directory -Path $protected -Force
     Set-Content -LiteralPath $credentialSentinel -Value 'service-only trust and DPAPI sentinel' -NoNewline
     $standardUser = "$env:COMPUTERNAME\$account"
+    $null = New-Item -ItemType Directory -Path $resourceRoot
+    & icacls $resourceRoot /inheritance:r
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect resource admission fixture' }
+    & icacls $resourceRoot /grant:r "${standardUser}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot set resource admission fixture ACL' }
+    & icacls $resourceRoot /setowner '*S-1-5-32-544'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot set trusted resource fixture owner' }
+    & icacls $resourceRoot /setintegritylevel '(OI)(CI)L'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot set resource fixture integrity' }
     & icacls $protected /grant:r "${standardUser}:(RX)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant standard-user access to inspect the protected fixture' }
     & icacls $credentialSentinel /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
@@ -119,6 +131,7 @@ try {
     $info.Environment['SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE'] = $authenticatedWriteSentinel
     $info.Environment['SUMATRAFUZZ_WORLD_LOW_WRITE_PROBE'] = $worldLowWriteSentinel
     $info.Environment['SUMATRAFUZZ_AUTHENTICATED_LOW_WRITE_PROBE'] = $authenticatedLowWriteSentinel
+    $info.Environment['SUMATRAFUZZ_RESOURCE_ROOT'] = $resourceRoot
     $info.Environment['TEMP'] = $temp
     $info.Environment['TMP'] = $temp
     $proc = [Diagnostics.Process]::new()
@@ -142,6 +155,7 @@ try {
         if ($started -and -not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(30000) }
         $proc.Dispose()
     }
+    if (Test-Path -LiteralPath $resourceRoot) { Remove-Item -LiteralPath $resourceRoot -Recurse -Force }
     if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $account }
     if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
     $password.Dispose()

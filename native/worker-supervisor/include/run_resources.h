@@ -150,8 +150,8 @@ inline ResourceHandle OpenRunResource(const std::wstring& path, DWORD access, bo
   // FILE_READ_DATA (FILE_LIST_DIRECTORY for directories) makes this open
   // participate in MS-FSA sharing checks. Metadata-only opens do not pin names.
   // Omit WRITE/DELETE sharing to block data-writer opens and rename. This
-  // alone does not establish denial of metadata-only reparse/hardlink changes;
-  // the Windows mutation contract must prove that boundary before integration.
+  // alone cannot deny metadata writes; ValidateRunResourceBoundary checks
+  // that those rights belong only to trusted worker/administrator identities.
   ResourceHandle handle(CreateFileW(path.c_str(), access | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -162,6 +162,72 @@ inline ResourceHandle OpenRunResource(const std::wstring& path, DWORD access, bo
       (directory && !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) || info.nNumberOfLinks > 1)
     ResourceError(ERROR_ACCESS_DENIED, "run resource redirected or aliased");
   return handle;
+}
+
+// Sharing pins block data/delete opens, not FILE_WRITE_ATTRIBUTES. Admission
+// therefore also requires metadata ownership to remain in the trusted worker /
+// OS administrator boundary, including every ancestor up to the volume root.
+// The worker must stage resources in protected storage before calling this;
+// caller-owned or broadly mutable trees are never repaired in place here.
+// Staging must CREATE new objects under a root protected since creation. ACL
+// validation cannot revoke metadata handles issued before a directory was
+// secured; importing/moving an existing untrusted directory is forbidden.
+inline std::vector<BYTE> RunResourceWorkerSid() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    ResourceError(GetLastError(), "run resource worker token");
+  ResourceHandle owner(token);
+  DWORD appcontainer = 0, bytes = 0;
+  if (!GetTokenInformation(token, TokenIsAppContainer, &appcontainer, sizeof(appcontainer), &bytes))
+    ResourceError(GetLastError(), "run resource worker token boundary");
+  if (appcontainer) ResourceError(ERROR_ACCESS_DENIED, "run resource worker must be trusted");
+  GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+  if (!bytes) ResourceError(GetLastError(), "run resource worker identity size");
+  std::vector<BYTE> user(bytes);
+  if (!GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes))
+    ResourceError(GetLastError(), "run resource worker identity");
+  PSID source = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+  std::vector<BYTE> sid(GetLengthSid(source));
+  if (!CopySid(static_cast<DWORD>(sid.size()), sid.data(), source))
+    ResourceError(GetLastError(), "run resource worker identity copy");
+  return sid;
+}
+
+inline bool TrustedResourcePrincipal(PSID sid, PSID worker) {
+  return sid && IsValidSid(sid) && (EqualSid(sid, worker) ||
+      IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid));
+}
+
+inline void ValidateRunResourceBoundary(HANDLE handle, PSID worker) {
+  PACL acl = nullptr;
+  PSID owner = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &acl, nullptr, &descriptor);
+  struct Descriptor { PSECURITY_DESCRIPTOR value; ~Descriptor() { if (value) LocalFree(value); } } held{descriptor};
+  if (result != ERROR_SUCCESS) ResourceError(result, "run resource boundary query");
+  if (!TrustedResourcePrincipal(owner, worker))
+    ResourceError(ERROR_ACCESS_DENIED, "untrusted run resource owner");
+  if (!acl || !IsValidAcl(acl)) ResourceError(ERROR_INVALID_ACL, "run resource boundary ACL");
+  for (DWORD i = 0; i < acl->AceCount; ++i) {
+    void* entry = nullptr;
+    if (!GetAce(acl, i, &entry)) ResourceError(GetLastError(), "run resource boundary ACE");
+    const auto* header = static_cast<ACE_HEADER*>(entry);
+    if (header->AceFlags & INHERIT_ONLY_ACE) continue;
+    if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+    // Fail closed for callback/object/conditional ACEs we do not interpret.
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
+      ResourceError(ERROR_INVALID_ACL, "unsupported run resource boundary ACE");
+    const auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(entry);
+    PSID principal = const_cast<DWORD*>(&ace->SidStart);
+    DWORD mask = ace->Mask;
+    GENERIC_MAPPING mapping{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE,
+                            STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1ff};
+    MapGenericMask(&mask, &mapping);
+    if ((mask & (FILE_WRITE_ATTRIBUTES | WRITE_DAC | WRITE_OWNER)) &&
+        !TrustedResourcePrincipal(principal, worker))
+      ResourceError(ERROR_ACCESS_DENIED, "untrusted run resource metadata writer");
+  }
 }
 
 struct GrantCleanupRecord {
@@ -246,9 +312,13 @@ inline std::unique_ptr<RunResourceGrant> GrantRunResourceAccess(
     ResourceError(GetLastError(), "run resource SID copy");
   // Hold sharing-participating ancestor handles through ACL removal. Bind
   // the final opened object to its held proof identity before changing its ACL.
-  grant->ancestors.push_back(OpenRunResource(path.substr(0, 3), FILE_READ_ATTRIBUTES, true));
-  for (size_t end = path.find(L'\\', 3); end != std::wstring::npos; end = path.find(L'\\', end + 1))
-    grant->ancestors.push_back(OpenRunResource(path.substr(0, end), FILE_READ_ATTRIBUTES, true));
+  auto worker_sid = RunResourceWorkerSid();
+  grant->ancestors.push_back(OpenRunResource(path.substr(0, 3), READ_CONTROL, true));
+  ValidateRunResourceBoundary(grant->ancestors.back().value, worker_sid.data());
+  for (size_t end = path.find(L'\\', 3); end != std::wstring::npos; end = path.find(L'\\', end + 1)) {
+    grant->ancestors.push_back(OpenRunResource(path.substr(0, end), READ_CONTROL, true));
+    ValidateRunResourceBoundary(grant->ancestors.back().value, worker_sid.data());
+  }
   ResourceHandle object = OpenRunResource(path, READ_CONTROL | WRITE_DAC, false);
   grant->object.value = object.value;
   object.value = INVALID_HANDLE_VALUE;
@@ -271,6 +341,7 @@ inline std::unique_ptr<RunResourceGrant> GrantRunResourceAccess(
   if (actual_id.VolumeSerialNumber != proof_id.VolumeSerialNumber ||
       std::memcmp(&actual_id.FileId, &proof_id.FileId, sizeof(actual_id.FileId)) != 0)
     ResourceError(ERROR_FILE_INVALID, "run resource proof identity changed");
+  ValidateRunResourceBoundary(grant->object.value, worker_sid.data());
   if (access == RunResourceAccess::ToolReadExecute && directory)
     ResourceError(ERROR_ACCESS_DENIED, "tool grants require verified files");
   // Writable file handles require FILE_SHARE_WRITE, which would also allow
