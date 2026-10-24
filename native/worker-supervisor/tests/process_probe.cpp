@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <thread>
 
 namespace {
 
@@ -38,6 +39,27 @@ DWORD PackageAceMask(const std::wstring& path, PSID sid) {
   return mask;
 }
 
+bool SetContractJunction(HANDLE handle, const std::wstring& destination) {
+  struct JunctionData {
+    DWORD tag;
+    WORD length, reserved, substitute_offset, substitute_length, print_offset, print_length;
+    wchar_t paths[1024];
+  } junction{};
+  const std::wstring target = L"\\??\\" + destination;
+  if (target.size() + destination.size() + 2 > std::size(junction.paths)) return false;
+  junction.tag = IO_REPARSE_TAG_MOUNT_POINT;
+  junction.substitute_length = static_cast<WORD>(target.size() * sizeof(wchar_t));
+  junction.print_offset = junction.substitute_length + sizeof(wchar_t);
+  junction.print_length = static_cast<WORD>(destination.size() * sizeof(wchar_t));
+  std::memcpy(junction.paths, target.c_str(), (target.size() + 1) * sizeof(wchar_t));
+  std::memcpy(reinterpret_cast<BYTE*>(junction.paths) + junction.print_offset,
+              destination.c_str(), (destination.size() + 1) * sizeof(wchar_t));
+  junction.length = static_cast<WORD>(8 + junction.print_offset + junction.print_length + sizeof(wchar_t));
+  DWORD returned = 0;
+  return DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, &junction,
+                        junction.length + 8, nullptr, 0, &returned, nullptr) != FALSE;
+}
+
 bool RunResourceContract(const std::wstring& supplied_root) {
   using namespace sumatrafuzz::supervisor;
   try {
@@ -52,25 +74,32 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     root.erase(0, 4);
     if (ResourcePathKey(L"C:\\") != L"c:\\") return false;
     const std::wstring tool = root + L"\\tool.exe";
-    const std::wstring input = root + L"\\input.pdf";
     const std::wstring input_dir = root + L"\\inputs";
+    const std::wstring input = input_dir + L"\\input.pdf";
     const std::wstring output = root + L"\\evidence";
     const std::wstring sibling = root + L"\\sibling";
     const std::wstring secret = root + L"\\credentials";
     const std::wstring link = root + L"\\alias.pdf";
+    if (!CreateDirectoryW(input_dir.c_str(), nullptr)) return false;
     for (const auto& file : {tool, input, secret}) {
       ResourceHandle created(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                         FILE_ATTRIBUTE_NORMAL, nullptr));
       if (created.value == INVALID_HANDLE_VALUE) return false;
     }
-    if (!CreateDirectoryW(output.c_str(), nullptr) || !CreateDirectoryW(sibling.c_str(), nullptr) ||
-        !CreateDirectoryW(input_dir.c_str(), nullptr)) return false;
-    RunResourcePolicy policy{{{tool, RunResourceAccess::ToolReadExecute},
-                             {input, RunResourceAccess::InputRead},
-                             {input_dir, RunResourceAccess::InputRead},
-                             {output, RunResourceAccess::EvidenceModify},
-                             {secret, RunResourceAccess::EvidenceModify},
-                             {link, RunResourceAccess::InputRead}}, {secret}};
+    if (!CreateDirectoryW(output.c_str(), nullptr) || !CreateDirectoryW(sibling.c_str(), nullptr)) return false;
+    std::vector<ResourceHandle> proof_handles;
+    const auto rule = [&](const std::wstring& path, RunResourceAccess access) {
+      proof_handles.emplace_back(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (proof_handles.back().value == INVALID_HANDLE_VALUE) throw std::runtime_error("proof fixture open");
+      return RunResourceRule{path, access, proof_handles.back().value};
+    };
+    RunResourcePolicy policy{{rule(tool, RunResourceAccess::ToolReadExecute),
+                             rule(input, RunResourceAccess::InputRead),
+                             rule(input_dir, RunResourceAccess::InputRead),
+                             rule(output, RunResourceAccess::EvidenceModify),
+                             rule(secret, RunResourceAccess::EvidenceModify)}, {secret}};
     RunResources resources;
     resources.state->profile = CreateRunAppContainerProfile();
     auto& profile = resources.state->profile;
@@ -81,16 +110,42 @@ bool RunResourceContract(const std::wstring& supplied_root) {
       catch (const std::system_error&) { return true; }
       return false;
     };
-    RunResourcePolicy volume_policy{{{output, RunResourceAccess::EvidenceModify}}, {root.substr(0, 3)}};
+    RunResourcePolicy volume_policy{{rule(output, RunResourceAccess::EvidenceModify)}, {root.substr(0, 3)}};
     try {
       auto denied_volume = GrantRunResourceAccess(output, profile.sid, RunResourceAccess::EvidenceModify, volume_policy);
       return false;
     } catch (const std::system_error&) {}
-    RunResourcePolicy volume_grant{{{root.substr(0, 3), RunResourceAccess::InputRead}}, {}};
+    RunResourcePolicy volume_grant{{rule(root.substr(0, 3), RunResourceAccess::InputRead)}, {}};
     try {
       auto denied_root = GrantRunResourceAccess(root.substr(0, 3), profile.sid, RunResourceAccess::InputRead, volume_grant);
       return false;
     } catch (const std::system_error&) {}
+    RunResourcePolicy missing_proof{{{input, RunResourceAccess::InputRead}}, {}};
+    try {
+      auto unbound = GrantRunResourceAccess(input, profile.sid, RunResourceAccess::InputRead, missing_proof);
+      return false;
+    } catch (const std::system_error& error) {
+      if (error.code().value() != ERROR_INVALID_HANDLE) throw;
+    }
+    // A stale path authorization must not grant the replacement object.
+    const std::wstring replaced = root + L"\\replaced.pdf";
+    {
+      ResourceHandle created(CreateFileW(replaced.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+      if (created.value == INVALID_HANDLE_VALUE) return false;
+    }
+    RunResourcePolicy replacement_policy{{rule(replaced, RunResourceAccess::InputRead)}, {}};
+    if (!MoveFileExW(replaced.c_str(), (root + L"\\former.pdf").c_str(), 0)) return false;
+    {
+      ResourceHandle created(CreateFileW(replaced.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+      if (created.value == INVALID_HANDLE_VALUE) return false;
+    }
+    try {
+      auto unauthorized = GrantRunResourceAccess(replaced, profile.sid, RunResourceAccess::InputRead, replacement_policy);
+      return false;
+    } catch (const std::system_error& error) {
+      if (error.code().value() != ERROR_FILE_INVALID) throw;
+    }
+    if (PackageAceMask(replaced, profile.sid)) return false;
     BYTE broad[SECURITY_MAX_SID_SIZE]{};
     DWORD broad_size = sizeof(broad);
     if (!CreateWellKnownSid(WinWorldSid, nullptr, broad, &broad_size) ||
@@ -100,6 +155,7 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         !rejected(input, RunResourceAccess::ToolReadExecute, profile.sid) ||
         !rejected(root + L"\\evidence\\..\\input.pdf", RunResourceAccess::InputRead, profile.sid)) return false;
     if (!CreateHardLinkW(link.c_str(), input.c_str(), nullptr)) return false;
+    policy.objects.push_back(rule(link, RunResourceAccess::InputRead));
     if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
     if (!DeleteFileW(link.c_str())) return false;
     // Directory junctions are rejected without requiring symlink privileges.
@@ -107,31 +163,31 @@ bool RunResourceContract(const std::wstring& supplied_root) {
     {
       ResourceHandle reparse(CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-      struct JunctionData {
-        DWORD tag;
-        WORD length;
-        WORD reserved;
-        WORD substitute_offset;
-        WORD substitute_length;
-        WORD print_offset;
-        WORD print_length;
-        wchar_t paths[1024];
-      } junction{};
-      const std::wstring target = L"\\??\\" + sibling;
-      if (target.size() + sibling.size() + 2 > std::size(junction.paths)) return false;
-      junction.tag = IO_REPARSE_TAG_MOUNT_POINT;
-      junction.substitute_length = static_cast<WORD>(target.size() * sizeof(wchar_t));
-      junction.print_offset = junction.substitute_length + sizeof(wchar_t);
-      junction.print_length = static_cast<WORD>(sibling.size() * sizeof(wchar_t));
-      std::memcpy(junction.paths, target.c_str(), (target.size() + 1) * sizeof(wchar_t));
-      std::memcpy(reinterpret_cast<BYTE*>(junction.paths) + junction.print_offset,
-                  sibling.c_str(), (sibling.size() + 1) * sizeof(wchar_t));
-      junction.length = static_cast<WORD>(8 + junction.print_offset + junction.print_length + sizeof(wchar_t));
-      DWORD returned = 0;
-      if (!DeviceIoControl(reparse.value, FSCTL_SET_REPARSE_POINT, &junction,
-                           junction.length + 8, nullptr, 0, &returned, nullptr)) return false;
+      if (!SetContractJunction(reparse.value, sibling)) return false;
     }
+    policy.objects.back() = rule(link, RunResourceAccess::InputRead);
     if (!rejected(link, RunResourceAccess::InputRead, profile.sid)) return false;
+    // Existing data writers must prevent acquiring a supposedly stable pin.
+    for (const auto& directory : {output, input_dir}) {
+      ResourceHandle writer(CreateFileW(directory.c_str(), GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+      if (writer.value == INVALID_HANDLE_VALUE) return false;
+      try {
+        auto unstable = GrantRunResourceAccess(directory == output ? output : input, profile.sid,
+            directory == output ? RunResourceAccess::EvidenceModify : RunResourceAccess::InputRead, policy);
+        return false;
+      } catch (const std::system_error& error) {
+        if (error.code().value() != ERROR_SHARING_VIOLATION) throw;
+      }
+    }
+    RunResourcePolicy writable_file{{rule(input, RunResourceAccess::EvidenceModify)}, {}};
+    try {
+      auto unstable_file = GrantRunResourceAccess(input, profile.sid, RunResourceAccess::EvidenceModify, writable_file);
+      return false;
+    } catch (const std::system_error& error) {
+      if (error.code().value() != ERROR_ACCESS_DENIED) throw;
+    }
     // Partial setup owns a profile too: unwind it only after undoing grants.
     std::wstring partial_name;
     std::vector<BYTE> partial_sid;
@@ -164,8 +220,79 @@ bool RunResourceContract(const std::wstring& supplied_root) {
         (tool_mask & (FILE_WRITE_DATA | DELETE | WRITE_DAC)) ||
         !(input_mask & FILE_READ_DATA) || (input_mask & (FILE_EXECUTE | FILE_WRITE_DATA | DELETE | WRITE_DAC)) ||
         (output_mask & (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD)) != (FILE_WRITE_DATA | DELETE | FILE_DELETE_CHILD) ||
-        (output_mask & (WRITE_DAC | WRITE_OWNER)) ||
+        (output_mask & (WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES)) ||
         !(input_dir_mask & FILE_TRAVERSE) || (input_dir_mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC))) return false;
+    // A separate thread attempts namespace mutation while grants remain held.
+    bool mutation_denied = false;
+    std::thread mutation([&] {
+      const auto rename_denied = [&](const std::wstring& from, const std::wstring& to, DWORD flags) {
+        return !MoveFileExW(from.c_str(), to.c_str(), flags) && GetLastError() == ERROR_SHARING_VIOLATION;
+      };
+      const bool input_pinned = rename_denied(input, root + L"\\renamed.pdf", 0);
+      const bool ancestor_pinned = rename_denied(input_dir, root + L"\\renamed-inputs", 0);
+      const bool output_pinned = rename_denied(output, root + L"\\renamed-evidence", 0);
+      const bool replacement_pinned = rename_denied(replaced, input, MOVEFILE_REPLACE_EXISTING);
+      const bool input_linked = CreateHardLinkW((root + L"\\concurrent-input.pdf").c_str(), input.c_str(), nullptr) != FALSE;
+      const DWORD input_link_error = input_linked ? ERROR_SUCCESS : GetLastError();
+      const bool tool_linked = CreateHardLinkW((root + L"\\concurrent-tool.exe").c_str(), tool.c_str(), nullptr) != FALSE;
+      const DWORD tool_link_error = tool_linked ? ERROR_SUCCESS : GetLastError();
+      ResourceHandle writer(CreateFileW(output.c_str(), GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      const bool retarget_denied = writer.value == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION;
+      ResourceHandle metadata(CreateFileW(output.c_str(), FILE_WRITE_ATTRIBUTES,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      const bool metadata_retargeted = metadata.value != INVALID_HANDLE_VALUE && SetContractJunction(metadata.value, sibling);
+      const DWORD metadata_retarget_error = metadata_retargeted ? ERROR_SUCCESS : GetLastError();
+      const bool metadata_retarget_denied = !metadata_retargeted;
+      ResourceHandle child(CreateFileW((output + L"\\new.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+          nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+      DWORD written = 0;
+      const bool output_writable = child.value != INVALID_HANDLE_VALUE && WriteFile(child.value, "x", 1, &written, nullptr) && written == 1;
+      std::fprintf(stderr, "resource-pin: inputRenameDenied=%d ancestorRenameDenied=%d evidenceRenameDenied=%d replacementDenied=%d writeOpenDenied=%d metadataRetargetDenied=%d metadataError=%lu inputHardlinkDenied=%d inputLinkError=%lu toolHardlinkDenied=%d toolLinkError=%lu childWrite=%d\n",
+          input_pinned, ancestor_pinned, output_pinned, replacement_pinned, retarget_denied,
+          metadata_retarget_denied, static_cast<unsigned long>(metadata_retarget_error),
+          !input_linked, static_cast<unsigned long>(input_link_error), !tool_linked,
+          static_cast<unsigned long>(tool_link_error), output_writable);
+      mutation_denied = input_pinned && ancestor_pinned && output_pinned && replacement_pinned &&
+          retarget_denied && metadata_retarget_denied && !input_linked && !tool_linked && output_writable;
+    });
+    mutation.join();
+    // Case-sensitive NTFS can resolve folded-equal names to different IDs.
+    const std::wstring case_dir = root + L"\\case-sensitive";
+    if (!CreateDirectoryW(case_dir.c_str(), nullptr)) return false;
+    {
+      ResourceHandle directory(CreateFileW(case_dir.c_str(), FILE_WRITE_ATTRIBUTES | FILE_ADD_FILE |
+          FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+      struct { ULONG flags; } case_sensitive{1};
+      // FileCaseSensitiveInfo is Win32 FILE_INFO_BY_HANDLE_CLASS value 23.
+      if (directory.value == INVALID_HANDLE_VALUE || !SetFileInformationByHandle(directory.value,
+          static_cast<FILE_INFO_BY_HANDLE_CLASS>(23), &case_sensitive, sizeof(case_sensitive)))
+        throw std::system_error(GetLastError(), std::system_category(), "case-sensitive fixture required");
+    }
+    const std::wstring lower = case_dir + L"\\input.pdf";
+    const std::wstring upper = case_dir + L"\\INPUT.pdf";
+    for (const auto& name : {lower, upper}) {
+      ResourceHandle created(CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+          FILE_FLAG_POSIX_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr));
+      if (created.value == INVALID_HANDLE_VALUE) return false;
+    }
+    RunResourcePolicy case_policy{{rule(lower, RunResourceAccess::InputRead)}, {}};
+    try {
+      auto unauthorized = GrantRunResourceAccess(upper, profile.sid, RunResourceAccess::InputRead, case_policy);
+      return false;
+    } catch (const std::system_error& error) {
+      if (error.code().value() != ERROR_FILE_INVALID) throw;
+    }
+    if (PackageAceMask(upper, profile.sid)) return false;
+    {
+      auto correct_case = GrantRunResourceAccess(lower, profile.sid, RunResourceAccess::InputRead, case_policy);
+      if (!PackageAceMask(lower, profile.sid)) return false;
+    }
+    std::fprintf(stderr, "resource-identity: replacementDenied=1 caseDistinctDenied=1 correctCaseGranted=1\n");
+    if (!mutation_denied) throw std::runtime_error("pinned mutation or writable child regression");
     // A concurrent independent package grant must survive our rollback.
     auto unrelated = GrantRunResourceAccess(output, second.sid, RunResourceAccess::EvidenceModify, policy);
     std::vector<BYTE> first_sid(GetLengthSid(profile.sid));

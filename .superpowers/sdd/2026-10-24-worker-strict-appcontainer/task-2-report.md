@@ -35,3 +35,35 @@ The new Windows resource contract has not been compiled or executed on this macO
 Prior Windows run `40089250286` demonstrated the separate standard-user feasibility probe through ACL update, AppContainer child launch, write/denial probes, and profile deletion. The overall Windows check still fails in the unchanged restricted-token launcher with `0xC0000135 STATUS_DLL_NOT_FOUND`; this task neither fixes nor weakens/bypasses that check. There is no exact-head Windows run for this commit yet.
 
 Task 5 still must prove actual `NT SERVICE\\SumatraFuzzWorker` profile lifecycle and show all AppContainer profile/temp writes are charged to the worker's NTFS quota, including cleanup/restart behavior. The standard-user feasibility probe and the new helper contract do not establish service identity or quota charging. Issue #91 remains open pending the remaining plan, exact-head Windows acceptance, installed-service evidence, and human review.
+
+## Fix loop round 1 — review of 950b3d8
+
+Findings received:
+
+1. Important/P1: ancestor and final handles requested only metadata/security rights; those opens do not participate in Windows sharing checks, so the claimed rename/replacement/retarget pin was unsound.
+2. Important: lowercased path matching could authorize distinct `input.pdf` and `INPUT.pdf` objects in a case-sensitive NTFS directory.
+
+Changes in this round:
+
+- `OpenRunResource` now requests `FILE_READ_DATA` (`FILE_LIST_DIRECTORY` for directories), retains `FILE_SHARE_READ` only, and therefore participates in the data/delete sharing checks described in [MS-FSA §2.1.5.1.2.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819). Existing writable handles cause acquisition to fail closed. This corrects the metadata-only pin error for data/delete operations; it is not evidence that all metadata mutations are prevented.
+- Every `RunResourceRule` now requires a borrowed held proof handle. Before any ACL mutation the helper compares the opened object's `FileIdInfo` volume serial and 128-bit file ID with that handle. Missing/invalid proof or identity mismatch fails closed. A folded path match cannot authorize another case-distinct object or a replacement at the same path. The launch builder in Task 3 must supply held handles from `VerifyProofs`/selected-input enumeration/new output creation and keep them open through grant acquisition.
+- `EvidenceModify` is restricted to directory objects. Writable-file sharing would permit data/retarget writes to the pinned file itself; existing file grants now fail closed. The directory mask no longer includes `FILE_WRITE_ATTRIBUTES`, so the package is not explicitly authorized for metadata-only root retargeting. Child creation/write compatibility remains a native test and Task 3 acceptance requirement. These restrictions supersede the original report's broader evidence-object Modify description.
+- Extended the shared production-helper Windows fixture with stale-proof replacement rejection, a required case-sensitive NTFS fixture containing `input.pdf` and `INPUT.pdf`, correct-file grant success, existing target/ancestor writer rejection, writable-file rejection, and a separate thread attempting target rename, ancestor rename, existing-file replacement, GENERIC_WRITE open, FILE_WRITE_ATTRIBUTES-only junction retarget, and hardlink creation for pinned input and tool files. It also requires an ordinary child file write to succeed in the pinned evidence directory.
+- The Node Windows test now emits the native diagnostic results with `t.diagnostic` and asserts the native exit status. Logs name each attempted mutation, its denial flag, and metadata/hardlink error codes. Fixture setup failure is a failure; case sensitivity or mutation checks are not skipped or weakened.
+
+Covering tests and commands on this macOS host:
+
+- `test/supervisor-windows.check.cjs`: static test `run resource ACL foundation constrains grants, proof identity and rollback`; runtime test `Windows run resources bind proof identities, reject mutations and roll back setup`.
+- `native/worker-supervisor/tests/process_probe.cpp`: `--run-resource-contract`, using production `run_resources.h` directly.
+- Red observed before the production fix: `node --test test/supervisor-windows.check.cjs` failed on `/access \\| FILE_READ_ATTRIBUTES \\| FILE_READ_DATA/` because sharing-participating access was absent. Native Windows red/green could not be observed here.
+- `npm run native:supervisor:contract`: `100% tests passed, 0 tests failed out of 2`. Windows-only branches are not compiled/executed by this macOS result.
+- `node --test test/supervisor-windows.check.cjs`: `tests 19; pass 15; fail 0; skipped 4`.
+- `npm test`: 37 Vitest files passed; `378 passed | 1 skipped (379)`; Node checks `tests 44; pass 39; fail 0; skipped 5`.
+- `git diff --check`: no output, exit 0.
+
+Finding status and remaining blocker:
+
+- Case-fold authorization finding: addressed in code by mandatory held object identity comparison. Windows fixture compilation/execution remains required.
+- Path stability finding: data/delete sharing participation is corrected, but **the broader metadata-retarget/hardlink stability claim remains open**. [MS-FSA FSCTL_SET_REPARSE_POINT](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165) permits `FILE_WRITE_ATTRIBUTES` alone, and [Microsoft's RedirectionGuard writeup](https://www.microsoft.com/en-us/msrc/blog/2025/06/redirectionguard-mitigating-unsafe-junction-traversal-in-windows) describes attribute-authorized hardlinks/reparse operations. Attribute-only opens can bypass data/delete sharing checks. No source comment or report should represent an initial `nNumberOfLinks` check as race protection. The new Windows test fails if metadata-only retarget or either concurrent hardlink creation succeeds; that outcome is a design blocker requiring a stronger protected storage/identity boundary, not a reason to relax the test.
+- **Observed hosted Windows denials for this round: none.** No Windows run has been performed for this head. All mutation outcomes are pending, and this round must not be called fully resolved from macOS/static results. No speculative oplock implementation, broad ancestor ACL changes, launcher integration, or bypass was introduced.
+- Task 3 must propagate explicit `RunResources::Close()` errors and prove nested evidence/scratch creation under the actual child token. Task 5 must still prove installed-service identity, quota charging of profile/temp storage, and cleanup/restart behavior. The existing `0xC0000135 STATUS_DLL_NOT_FOUND` legacy-launcher failure remains visible and unchanged.

@@ -12,7 +12,7 @@ const {
   rmSync,
   writeFileSync,
 } = require('node:fs');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -350,7 +350,7 @@ test('Windows supervisor bounds and tears down a child process tree', {
 
 // These contracts catch widened package grants and missing rollback ownership;
 // the Windows case executes the same helper used by the addon.
-test('run resource ACL foundation rejects broad SIDs and owns rollback', () => {
+test('run resource ACL foundation constrains grants, proof identity and rollback', () => {
   const headerPath = path.join(__dirname, '..', 'native/worker-supervisor/include/run_resources.h');
   assert.ok(existsSync(headerPath), 'production run resource owner must exist');
   const header = readFileSync(headerPath, 'utf8');
@@ -367,6 +367,10 @@ test('run resource ACL foundation rejects broad SIDs and owns rollback', () => {
   assert.match(header, /path\.size\(\) < 3/);
   assert.match(header, /key\.size\(\) == 3/);
   assert.match(header, /if \(profile\.sid\) FreeSid\(profile\.sid\)/);
+  // Metadata-only opens do not participate in Windows sharing checks.
+  assert.match(header, /access \| FILE_READ_ATTRIBUTES \| FILE_READ_DATA/);
+  assert.match(header, /FileIdInfo/);
+  assert.match(header, /approved->proof/);
   assert.match(header, /NO_INHERITANCE/);
   assert.match(header, /Remove\(\)/);
   assert.match(addon, /RunResources run_resources/);
@@ -374,13 +378,16 @@ test('run resource ACL foundation rejects broad SIDs and owns rollback', () => {
   assert.match(binding, /userenv\.lib/);
 });
 
-test('Windows run resources clean ACLs and profiles on normal and partial setup', {
+test('Windows run resources bind proof identities, reject mutations and roll back setup', {
   skip: process.platform !== 'win32',
-}, () => {
+}, (t) => {
   const probe = path.join(__dirname, '..', 'build/worker-supervisor/Debug/process_probe.exe');
   const root = mkdtempSync(path.join(os.tmpdir(), 'sumatrafuzz-resources-'));
   try {
-    execFileSync(probe, ['--run-resource-contract', root], { stdio: 'pipe', timeout: 60000 });
+    const result = spawnSync(probe, ['--run-resource-contract', root], { encoding: 'utf8', timeout: 60000 });
+    if (result.stderr) t.diagnostic(result.stderr.trim());
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, 'native resource contract must deny every mutation and preserve child writes');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

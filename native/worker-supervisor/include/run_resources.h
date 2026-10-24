@@ -105,6 +105,9 @@ enum class RunResourceAccess { ToolReadExecute, InputRead, EvidenceModify };
 struct RunResourceRule {
   std::wstring path;
   RunResourceAccess access;
+  // Borrowed from the native verifier/selector; must stay open through grant
+  // acquisition. Path text alone is never an authorization identity.
+  HANDLE proof = INVALID_HANDLE_VALUE;
 };
 // The launch builder must populate exact objects from held VerifyProofs handles,
 // selected input enumeration and the newly-created run evidence/scratch objects.
@@ -144,7 +147,12 @@ struct ResourceHandle {
 };
 
 inline ResourceHandle OpenRunResource(const std::wstring& path, DWORD access, bool directory) {
-  ResourceHandle handle(CreateFileW(path.c_str(), access | FILE_READ_ATTRIBUTES,
+  // FILE_READ_DATA (FILE_LIST_DIRECTORY for directories) makes this open
+  // participate in MS-FSA sharing checks. Metadata-only opens do not pin names.
+  // Omit WRITE/DELETE sharing to block data-writer opens and rename. This
+  // alone does not establish denial of metadata-only reparse/hardlink changes;
+  // the Windows mutation contract must prove that boundary before integration.
+  ResourceHandle handle(CreateFileW(path.c_str(), access | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   if (handle.value == INVALID_HANDLE_VALUE) ResourceError(GetLastError(), "run resource open");
@@ -228,15 +236,16 @@ inline std::unique_ptr<RunResourceGrant> GrantRunResourceAccess(
         (root.back() == L'\\' || key[root.size()] == L'\\')))
       ResourceError(ERROR_ACCESS_DENIED, "excluded run resource");
   }
-  const bool approved = std::any_of(policy.objects.begin(), policy.objects.end(), [&](const RunResourceRule& rule) {
+  const auto approved = std::find_if(policy.objects.begin(), policy.objects.end(), [&](const RunResourceRule& rule) {
     return access == rule.access && key == ResourcePathKey(rule.path);
   });
-  if (!approved) ResourceError(ERROR_ACCESS_DENIED, "unapproved run resource");
+  if (approved == policy.objects.end()) ResourceError(ERROR_ACCESS_DENIED, "unapproved run resource");
   auto grant = std::make_unique<RunResourceGrant>();
   grant->sid.resize(GetLengthSid(sid));
   if (!CopySid(static_cast<DWORD>(grant->sid.size()), grant->sid.data(), sid))
     ResourceError(GetLastError(), "run resource SID copy");
-  // Pin every ancestor against replacement/retargeting until ACL removal.
+  // Hold sharing-participating ancestor handles through ACL removal. Bind
+  // the final opened object to its held proof identity before changing its ACL.
   grant->ancestors.push_back(OpenRunResource(path.substr(0, 3), FILE_READ_ATTRIBUTES, true));
   for (size_t end = path.find(L'\\', 3); end != std::wstring::npos; end = path.find(L'\\', end + 1))
     grant->ancestors.push_back(OpenRunResource(path.substr(0, end), FILE_READ_ATTRIBUTES, true));
@@ -253,13 +262,27 @@ inline std::unique_ptr<RunResourceGrant> GrantRunResourceAccess(
   BY_HANDLE_FILE_INFORMATION info{};
   if (!GetFileInformationByHandle(grant->object.value, &info)) ResourceError(GetLastError(), "run resource attributes");
   const bool directory = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  FILE_ID_INFO actual_id{}, proof_id{};
+  if (approved->proof == INVALID_HANDLE_VALUE || approved->proof == nullptr)
+    ResourceError(ERROR_INVALID_HANDLE, "run resource held proof required");
+  if (!GetFileInformationByHandleEx(approved->proof, FileIdInfo, &proof_id, sizeof(proof_id)) ||
+      !GetFileInformationByHandleEx(grant->object.value, FileIdInfo, &actual_id, sizeof(actual_id)))
+    ResourceError(GetLastError(), "run resource proof identity query");
+  if (actual_id.VolumeSerialNumber != proof_id.VolumeSerialNumber ||
+      std::memcmp(&actual_id.FileId, &proof_id.FileId, sizeof(actual_id.FileId)) != 0)
+    ResourceError(ERROR_FILE_INVALID, "run resource proof identity changed");
   if (access == RunResourceAccess::ToolReadExecute && directory)
     ResourceError(ERROR_ACCESS_DENIED, "tool grants require verified files");
+  // Writable file handles require FILE_SHARE_WRITE, which would also allow
+  // reparse retargeting. Only the pinned evidence/scratch directory receives
+  // Modify here; child objects must use the run token's scoped/default DACL.
+  if (access == RunResourceAccess::EvidenceModify && !directory)
+    ResourceError(ERROR_ACCESS_DENIED, "evidence grants require run directories");
   DWORD mask = FILE_GENERIC_READ;
   if (directory) mask |= FILE_TRAVERSE;
   if (access == RunResourceAccess::ToolReadExecute) mask |= FILE_GENERIC_EXECUTE;
   if (access == RunResourceAccess::EvidenceModify) {
-    mask |= FILE_GENERIC_WRITE | DELETE;
+    mask |= (FILE_GENERIC_WRITE & ~FILE_WRITE_ATTRIBUTES) | DELETE;
     if (directory) mask |= FILE_DELETE_CHILD;
   }
   PACL current = nullptr;
