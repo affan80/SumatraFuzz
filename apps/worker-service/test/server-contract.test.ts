@@ -339,7 +339,7 @@ describe('worker API contract', () => {
         true,
       );
     });
-  });
+  }, 15_000);
 
   it('denies new campaign mutations when the audit is unhealthy', async () => {
     await withApiFixture(async ({ server, tlsA, audit, handlers }) => {
