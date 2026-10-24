@@ -19,14 +19,14 @@ if ($Child) {
     }
     Set-Location -LiteralPath $RepoRoot
     Write-Output "Verified standard-user supervisor check: $($identity.Name)"
-    $node = (Get-Command node -ErrorAction Stop).Source
-    & $node --test test/supervisor-windows.check.cjs
-    if ($LASTEXITCODE -ne 0) { throw "Supervisor containment check failed: exit $LASTEXITCODE" }
     & (Join-Path $RepoRoot 'scripts/windows/tests/appcontainer-probe.ps1') -RepoRoot $RepoRoot `
       -WorldWriteSentinel $env:SUMATRAFUZZ_WORLD_WRITE_PROBE `
       -AuthenticatedWriteSentinel $env:SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE `
       -WorldLowWriteSentinel $env:SUMATRAFUZZ_WORLD_LOW_WRITE_PROBE `
       -AuthenticatedLowWriteSentinel $env:SUMATRAFUZZ_AUTHENTICATED_LOW_WRITE_PROBE
+    $node = (Get-Command node -ErrorAction Stop).Source
+    & $node --test test/supervisor-windows.check.cjs
+    if ($LASTEXITCODE -ne 0) { throw "Supervisor containment check failed: exit $LASTEXITCODE" }
     exit 0
 }
 $account = 'sf-probe-' + [guid]::NewGuid().ToString('N').Substring(0,8)

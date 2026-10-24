@@ -374,6 +374,12 @@ test('AppContainer feasibility probe is Windows-only and fails closed on profile
       workflow.indexOf('Test Windows supervisor and AppContainer as a standard user'),
   );
   assert.match(fixture, /tests\/appcontainer-probe\.ps1/);
+  const childMode = fixture.split('if ($Child)')[1].split('\n}')[0];
+  assert.ok(
+    childMode.indexOf('tests/appcontainer-probe.ps1') <
+      childMode.indexOf('--test test/supervisor-windows.check.cjs'),
+    'AppContainer feasibility must run before the legacy supervisor test can fail',
+  );
   assert.match(appContainerScript, /if \(-not \$IsWindows\)/);
   assert.match(appContainerScript, /nonadministrator identity/);
   assert.match(appContainerScript, /--appcontainer-probe/);

@@ -44,3 +44,15 @@ Ran the repository Biome formatter on `test/supervisor-windows.check.cjs` to wra
 - `git diff --check`: passed.
 
 Hosted run status was checked with `gh run view 40087447795 --job 120853170488 --log-failed`. That run used head `69c9af3fac47959136f566af7ac47807eecfaee3`. Its Windows native build/contract step completed, but the standard-user step failed at the pre-existing restricted-child startup-marker assertion (`test/supervisor-windows.check.cjs:160`) before the AppContainer probe invocation. Therefore this hosted run provides no AppContainer execution or cleanup result.
+
+## Fix round: run AppContainer feasibility before the legacy probe
+
+Reordered child-mode checks so `appcontainer-probe.ps1` runs before the legacy `node --test` suite. Both checks remain enabled, and either still stops the fixture on failure. Added a static assertion that enforces this order within the child-mode block.
+
+Requested local checks:
+
+- `npm run format:check`: passed; Biome checked 139 files with no remaining fixes.
+- `node --test test/supervisor-windows.check.cjs`: 14 passed, 3 skipped, 0 failed.
+- `git diff --check`: passed.
+
+The previous hosted exact-head run failed in the legacy restricted-child startup-marker assertion, before the AppContainer invocation. This reordering should emit feasibility evidence before that blocker, but a clean exact-head Windows run is still required to confirm the probe's execution and cleanup. The legacy runtime failure remains unresolved.
