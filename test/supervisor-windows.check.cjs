@@ -715,6 +715,8 @@ test('private namespace probe uses the WinAFL shim per-run object DACL', () => {
   assert.match(probe, /SetSecurityDescriptorControl\(&event_descriptor, SE_DACL_PROTECTED/);
   assert.match(probe, /ProbeEventCreation\(L""\)/);
   assert.match(probe, /local_named_event_error=/);
+  assert.match(probe, /ProbeEventCreation\(local_name, &event_attributes\)/);
+  assert.match(probe, /explicit_local_event_error=/);
   const addon = readFileSync(
     path.join(__dirname, '..', 'native/worker-supervisor/src/addon.cpp'),
     'utf8',
@@ -724,7 +726,7 @@ test('private namespace probe uses the WinAFL shim per-run object DACL', () => {
   assert.match(probe, /ns\.Initialize\(&namespace_stage, &namespace_error\)/);
   assert.match(
     probe,
-    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventExW\(nullptr, name\.empty\(\) \? nullptr : name\.c_str\(\),\s+CREATE_EVENT_MANUAL_RESET,\s+EVENT_MODIFY_STATE \| SYNCHRONIZE\);\s+const DWORD error = GetLastError\(\);/,
+    /SetLastError\(ERROR_SUCCESS\);\s+HANDLE event = CreateEventExW\(attributes, name\.empty\(\) \? nullptr : name\.c_str\(\),\s+CREATE_EVENT_MANUAL_RESET,\s+EVENT_MODIFY_STATE \| SYNCHRONIZE\);\s+const DWORD error = GetLastError\(\);/,
   );
   assert.match(probe, /const DWORD event_error = GetLastError\(\);/);
   assert.match(
