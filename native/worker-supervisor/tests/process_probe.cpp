@@ -61,6 +61,40 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
     return error;
   }
   CloseHandle(process_token);
+  DWORD owner_bytes = 0;
+  DWORD group_bytes = 0;
+  GetTokenInformation(impersonation_token, TokenOwner, nullptr, 0, &owner_bytes);
+  if (owner_bytes < sizeof(TOKEN_OWNER)) {
+    const DWORD error = GetLastError();
+    CloseHandle(impersonation_token);
+    return error;
+  }
+  GetTokenInformation(impersonation_token, TokenPrimaryGroup, nullptr, 0, &group_bytes);
+  if (group_bytes < sizeof(TOKEN_PRIMARY_GROUP)) {
+    const DWORD error = GetLastError();
+    CloseHandle(impersonation_token);
+    return error;
+  }
+  std::vector<BYTE> owner_storage(owner_bytes);
+  std::vector<BYTE> group_storage(group_bytes);
+  if (!GetTokenInformation(impersonation_token, TokenOwner, owner_storage.data(), owner_bytes,
+                           &owner_bytes) ||
+      !GetTokenInformation(impersonation_token, TokenPrimaryGroup, group_storage.data(), group_bytes,
+                           &group_bytes)) {
+    const DWORD error = GetLastError();
+    CloseHandle(impersonation_token);
+    return error;
+  }
+  SECURITY_DESCRIPTOR check_descriptor = *descriptor;
+  if (!SetSecurityDescriptorOwner(
+          &check_descriptor, reinterpret_cast<TOKEN_OWNER*>(owner_storage.data())->Owner, FALSE) ||
+      !SetSecurityDescriptorGroup(
+          &check_descriptor,
+          reinterpret_cast<TOKEN_PRIMARY_GROUP*>(group_storage.data())->PrimaryGroup, FALSE)) {
+    const DWORD error = GetLastError();
+    CloseHandle(impersonation_token);
+    return error;
+  }
   GENERIC_MAPPING event_mapping{EVENT_QUERY_STATE | SYNCHRONIZE,
                                 EVENT_MODIFY_STATE | SYNCHRONIZE,
                                 SYNCHRONIZE, EVENT_ALL_ACCESS};
@@ -68,7 +102,7 @@ DWORD CheckExplicitEventDacl(SECURITY_DESCRIPTOR* descriptor, DWORD desired_acce
   DWORD privilege_bytes = sizeof(privileges);
   DWORD granted_access = 0;
   BOOL granted = FALSE;
-  const BOOL checked = AccessCheck(descriptor, impersonation_token, desired_access,
+  const BOOL checked = AccessCheck(&check_descriptor, impersonation_token, desired_access,
                                    &event_mapping, &privileges, &privilege_bytes,
                                    &granted_access, &granted);
   const DWORD error = checked ? ERROR_SUCCESS : GetLastError();
