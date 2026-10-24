@@ -29,6 +29,8 @@ $password = ConvertTo-SecureString ([Convert]::ToBase64String([Security.Cryptogr
 $temp = Join-Path $RepoRoot "runs/$account"
 $protected = Join-Path $temp 'protected'
 $credentialSentinel = Join-Path $protected 'credential-sentinel'
+$worldWriteSentinel = Join-Path $temp 'world-write-sentinel'
+$authenticatedWriteSentinel = Join-Path $temp 'authenticated-write-sentinel'
 $proc = $null
 $started = $false
 try {
@@ -39,6 +41,34 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant supervisor user read access' }
     & icacls $temp /grant "${account}:(OI)(CI)M"
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant supervisor user temporary storage access' }
+    $volumeRoot = [IO.Path]::GetPathRoot($RepoRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $ancestor = [IO.Path]::GetFullPath((Split-Path -Parent $RepoRoot))
+    while ($true) {
+      & icacls $ancestor /grant '*S-1-5-12:(X)'
+      if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare restricted-code traversal for the containment fixture' }
+      if ([IO.Path]::GetFullPath($ancestor).TrimEnd([IO.Path]::DirectorySeparatorChar) -eq $volumeRoot) { break }
+      $ancestor = Split-Path -Parent $ancestor
+      if (-not $ancestor) { throw 'Cannot reach the volume root for the containment fixture' }
+    }
+    & icacls $RepoRoot /grant '*S-1-5-12:(X)'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare restricted-code traversal for the containment fixture' }
+    $runsRoot = Join-Path $RepoRoot 'runs'
+    & icacls $runsRoot /grant '*S-1-5-12:(X)'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare restricted-code traversal for the containment fixture' }
+    & icacls $temp /grant '*S-1-5-12:(RX)'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the restricted-code ancestor traversal fixture' }
+    Set-Content -LiteralPath $worldWriteSentinel -Value 'world-write access probe' -NoNewline
+    Set-Content -LiteralPath $authenticatedWriteSentinel -Value 'authenticated-users write access probe' -NoNewline
+    foreach ($fixture in @($worldWriteSentinel, $authenticatedWriteSentinel)) {
+      & icacls $fixture /inheritance:r
+      if ($LASTEXITCODE -ne 0) { throw 'Cannot protect the broad-ACL write probe fixture' }
+      & icacls $fixture /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
+      if ($LASTEXITCODE -ne 0) { throw 'Cannot grant administrator cleanup access to the write probe fixture' }
+    }
+    & icacls $worldWriteSentinel /grant '*S-1-1-0:(M)'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the World-writable probe fixture' }
+    & icacls $authenticatedWriteSentinel /grant '*S-1-5-11:(M)'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the Authenticated Users writable probe fixture' }
     $null = New-Item -ItemType Directory -Path $protected -Force
     Set-Content -LiteralPath $credentialSentinel -Value 'service-only trust and DPAPI sentinel' -NoNewline
     $standardUser = "$env:COMPUTERNAME\$account"
@@ -67,6 +97,8 @@ try {
         [void]$info.Environment.Remove($name)
     }
     $info.Environment['SUMATRAFUZZ_PROTECTED_DIR'] = $protected
+    $info.Environment['SUMATRAFUZZ_WORLD_WRITE_PROBE'] = $worldWriteSentinel
+    $info.Environment['SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE'] = $authenticatedWriteSentinel
     $info.Environment['TEMP'] = $temp
     $info.Environment['TMP'] = $temp
     $proc = [Diagnostics.Process]::new()

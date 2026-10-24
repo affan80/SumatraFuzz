@@ -448,6 +448,15 @@ int RunContainmentProbe(int argc, wchar_t** argv, int probe_index) {
 int wmain(int argc, wchar_t** argv) {
   wchar_t secret[16]{};
   if (GetEnvironmentVariableW(L"SUMATRAFUZZ_TEST_SECRET", secret, static_cast<DWORD>(std::size(secret))) > 0) return 11;
+  if (argc == 3 && std::wstring(argv[1]) == L"--expect-write-denied") {
+    HANDLE file = CreateFileW(argv[2], FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+      CloseHandle(file);
+      return 49;
+    }
+    return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 50;
+  }
   if (argc == 3 && std::wstring(argv[1]) == L"--namespace-gone") {
     ProbeNamespace ns;
     if (!ValidAlias(argv[2]) || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &ns.token)) return 44;

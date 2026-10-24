@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const {
+  appendFileSync,
   copyFileSync,
   mkdtempSync,
   mkdirSync,
@@ -117,6 +118,37 @@ test('Windows supervisor bounds and tears down a child process tree', {
   });
   execFileSync('icacls.exe', [inputDir, '/grant', '*S-1-5-12:(GR,GE)'], { stdio: 'ignore' });
   execFileSync('icacls.exe', [inputPath, '/grant', '*S-1-5-12:(GR)'], { stdio: 'ignore' });
+  for (const [variable, description] of [
+    ['SUMATRAFUZZ_WORLD_WRITE_PROBE', 'World'],
+    ['SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE', 'Authenticated Users'],
+  ]) {
+    const probePath = process.env[variable];
+    assert.ok(probePath && path.isAbsolute(probePath), `${description} write probe must be provisioned`);
+    appendFileSync(probePath, '\nstandard-user-write');
+    const deniedJob = supervisor.launchSuspended({
+      executable: containmentProbePath,
+      argv: ['--expect-write-denied', probePath],
+      workingDir: containmentRoot,
+      evidenceDir,
+      limits: { max_memory_bytes: 67108864, max_cpu_percent: 25 },
+      fileProofs: [{ ...proof, path: containmentProbePath, root: toolDir }],
+    });
+    let deniedSample;
+    try {
+      for (let i = 0; i < 100; i++) {
+        deniedSample = supervisor.sampleJob(deniedJob);
+        if (deniedSample.root_exited) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(
+        deniedSample.root_exit_code,
+        0,
+        `restricted child must be denied write access granted to ${description}`,
+      );
+    } finally {
+      supervisor.stopJob(deniedJob, 0);
+    }
+  }
   let job;
   let siblingJob;
   try {
@@ -655,6 +687,22 @@ test('service host verifies every protected install ancestor through the local v
   assert.match(host, /VerifyProtectedInstallAncestors\(paths\.root\)/);
   assert.match(host, /RequireProtectedDacl\(directory\.Get\(\)\)/);
   assert.match(host, /if \(IsLocalVolumeRoot\(ancestor\)\) return;/);
+});
+
+test('restricted-token acceptance probes broad-ACL write access outside run evidence', () => {
+  const probe = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/tests/process_probe.cpp'),
+    'utf8',
+  );
+  const workflow = readFileSync(
+    path.join(__dirname, '..', 'scripts/windows/ci-supervisor-check.ps1'),
+    'utf8',
+  );
+  assert.match(probe, /--expect-write-denied/);
+  assert.match(workflow, /S-1-1-0:\(M\)/);
+  assert.match(workflow, /S-1-5-11:\(M\)/);
+  assert.match(workflow, /SUMATRAFUZZ_WORLD_WRITE_PROBE/);
+  assert.match(workflow, /SUMATRAFUZZ_AUTHENTICATED_WRITE_PROBE/);
 });
 
 test('supervisor owns a protected run-private namespace until job teardown', () => {
