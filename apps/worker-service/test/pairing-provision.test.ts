@@ -419,6 +419,71 @@ describe('worker independently verifies signed pairing evidence', () => {
     );
   });
 
+  it('reimports the current certificate idempotently and rotates after an older overlap expires', async () => {
+    const ctx = context();
+    await verifyAndProvisionPairingBundle(bundle(), ctx, now);
+    const second = await issueCertificate(
+      root,
+      'second-generation',
+      'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n',
+    );
+    const firstRotationTime = new Date(
+      Math.max(now.getTime(), Date.parse(new X509Certificate(second.cert).validFrom)),
+    );
+    const secondBundle = () =>
+      bundle(
+        { controllerCertificatePem: second.cert.toString() },
+        {
+          issuedAt: new Date(firstRotationTime.getTime() - 1000).toISOString(),
+          expiresAt: new Date(firstRotationTime.getTime() + 60_000).toISOString(),
+        },
+      );
+    const secondGeneration = await verifyAndProvisionPairingBundle(
+      secondBundle(),
+      ctx,
+      firstRotationTime,
+    );
+    expect(secondGeneration.generation).toBe(2);
+
+    const revisionAfterRotation = ctx.store.revision;
+    const reimported = await verifyAndProvisionPairingBundle(
+      secondBundle(),
+      ctx,
+      firstRotationTime,
+    );
+    expect(reimported).toEqual(secondGeneration);
+    expect(ctx.store.revision).toBe(revisionAfterRotation);
+
+    const third = await issueCertificate(
+      root,
+      'third-generation',
+      'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n',
+    );
+    const thirdRotationTime = new Date(
+      Math.max(
+        firstRotationTime.getTime() + 60 * 60 * 1000 + 1000,
+        Date.parse(new X509Certificate(third.cert).validFrom),
+      ),
+    );
+    const rotated = await verifyAndProvisionPairingBundle(
+      bundle(
+        { controllerCertificatePem: third.cert.toString() },
+        {
+          issuedAt: new Date(thirdRotationTime.getTime() - 1000).toISOString(),
+          expiresAt: new Date(thirdRotationTime.getTime() + 60_000).toISOString(),
+        },
+      ),
+      ctx,
+      thirdRotationTime,
+    );
+    expect(rotated).toMatchObject({
+      controllerId,
+      fingerprint: pin(third.cert),
+      generation: 3,
+    });
+    expect(ctx.store.listActive()).toHaveLength(2);
+  });
+
   it.each([Buffer.alloc(0), Buffer.from('{}'), Buffer.from('{'), Buffer.alloc(1024 * 1024 + 1)])(
     'rejects malformed or oversized envelopes',
     async (bytes) => rejectsUnchanged(Buffer.from(bytes)),

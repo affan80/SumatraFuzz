@@ -636,12 +636,25 @@ test('worker payload contains admin-only first-run and certificate lifecycle pro
   assert.match(stage, /new Set\(\['\.js', '\.sql'\]\)/);
   assert.match(stage, /provisioning\/worker-service-config\.psm1/);
   assert.match(install, /'start=', 'demand'/);
+  assert.match(install, /function Assert-WorkerProtectedInstallAncestors/);
+  assert.match(install, /Assert-WorkerProtectedInstallAncestors -InstallRoot \$layout\.Root/);
   assert.match(provision, /Assert-WorkerPlatform -RequireElevation/);
   assert.match(provision, /ReparsePoint/);
   assert.match(provision, /-MaximumBytes 1048576/);
   assert.match(provision, /ReadDelete/);
   assert.match(provision, /Set-Service -Name 'SumatraFuzzWorker' -StartupType Automatic/);
   assert.match(provision, /worker-trust-operation\.sftxn/);
+});
+
+test('service host verifies every protected install ancestor through the local volume root', () => {
+  const host = readFileSync(
+    path.join(__dirname, '..', 'native/worker-supervisor/src/service_host.cpp'),
+    'utf8',
+  );
+  assert.match(host, /void VerifyProtectedInstallAncestors\(const std::wstring& install_root\)/);
+  assert.match(host, /VerifyProtectedInstallAncestors\(paths\.root\)/);
+  assert.match(host, /RequireProtectedDacl\(directory\.Get\(\)\)/);
+  assert.match(host, /if \(IsLocalVolumeRoot\(ancestor\)\) return;/);
 });
 
 test('supervisor owns a protected run-private namespace until job teardown', () => {

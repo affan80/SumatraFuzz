@@ -69,6 +69,32 @@ function Resolve-WorkerInstallLayout {
   return [pscustomobject]$paths
 }
 
+function Assert-WorkerProtectedInstallAncestors {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$InstallRoot)
+  $fullPath = [IO.Path]::GetFullPath($InstallRoot)
+  $volumeRoot = [IO.Path]::GetPathRoot($fullPath)
+  if (-not $volumeRoot -or $fullPath.StartsWith('\\')) {
+    throw 'Worker install path must be on a local drive'
+  }
+  $volumeRoot = $volumeRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $current = $fullPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  if ($current -eq $volumeRoot) { $current = $volumeRoot + [IO.Path]::DirectorySeparatorChar }
+  while ($true) {
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw 'Worker install ancestor is redirected or is not a directory'
+    }
+    Assert-WorkerHostCompatibleDacl -Path $current -RequireTrustedOwner -AllowCurrentAdministratorOwner
+    if ([IO.Path]::GetFullPath($current).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) -eq $volumeRoot) {
+      break
+    }
+    $parent = Split-Path -Parent $current
+    if (-not $parent -or $parent -eq $current) { throw 'Worker install ancestor chain is incomplete' }
+    $current = $parent
+  }
+}
+
 function ConvertTo-WorkerIpAddress {
   param([Parameter(Mandatory)][string]$Address)
   $parsed = $null
@@ -732,16 +758,9 @@ function Install-SumatrafuzzWorkerService {
   )
   Assert-WorkerPlatform -RequireElevation
   $layout = Resolve-WorkerInstallLayout $InstallRoot
-  # Validate the trusted boundary above and around the code tree before any
-  # install transaction can mutate ACLs or create service state. Restricting
-  # owners matters because an owner can exercise WRITE_DAC regardless of the
-  # ordinary writable ACEs examined below.
-  $installParent = Split-Path -Parent $layout.Root
-  $installParentItem = Get-Item -LiteralPath $installParent -Force -ErrorAction Stop
-  if (-not $installParentItem.PSIsContainer -or ($installParentItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw 'Worker install parent is redirected or is not a directory'
-  }
-  Assert-WorkerHostCompatibleDacl -Path $installParent -RequireTrustedOwner -AllowCurrentAdministratorOwner
+  # Protect every ancestor, since DELETE_CHILD/rename rights above the immediate
+  # parent can replace the service executable tree despite a protected root DACL.
+  Assert-WorkerProtectedInstallAncestors -InstallRoot $layout.Root
   [void](Get-WorkerProtectedTreeInventory -Path $layout.Root)
   Assert-WorkerHostCompatibleDacl -Path (Join-Path ([IO.Path]::GetPathRoot($env:SystemRoot)) 'ProgramData')
   Assert-WorkerBindConfiguration -Mode $BindMode -Address $BindAddress -Port $Port -AdapterGuid $AdapterGuid -PeerCidrs $PeerCidrs
@@ -902,4 +921,4 @@ function Uninstall-SumatrafuzzWorkerService {
   Write-WorkerInstallMarker $marker
 }
 
-Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataMountPoint, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService
+Export-ModuleMember -Function Get-WorkerPlatformFacts, Assert-WorkerPlatform, Resolve-WorkerInstallLayout, Assert-WorkerProtectedInstallAncestors, Test-WorkerPrivateAddress, Test-WorkerCidr, Assert-WorkerBindConfiguration, Assert-WorkerDataMountPoint, Assert-WorkerDataVolume, Get-WorkerQuotaSetting, Get-WorkerServiceQuotaRecord, Assert-WorkerQuota, Set-WorkerQuota, Restore-WorkerQuota, Invoke-WorkerFsutil, Resolve-WorkerSid, Set-WorkerProtectedAcl, Set-WorkerProtectedTree, Protect-WorkerRuntimeTree, Assert-WorkerProtectedAcl, Assert-WorkerAdminOnlyAcl, Assert-WorkerHostCompatibleDacl, Assert-WorkerNoReparseTree, Get-WorkerInstallMarker, Write-WorkerInstallMarker, Invoke-WorkerSc, Get-WorkerServiceCim, Assert-WorkerServiceMatchesMarker, Install-SumatrafuzzWorkerService, Uninstall-SumatrafuzzWorkerService

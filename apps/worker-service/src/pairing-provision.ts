@@ -224,9 +224,20 @@ export async function verifyAndProvisionPairingBundle(
       notBefore: new Date(client.validFrom).toISOString(),
       notAfter: new Date(client.validTo).toISOString(),
     };
-    const current = context.trust
+    const controllerCertificates = context.trust
       .listActive()
-      .find((record) => record.controllerId === profile.controllerId);
+      .filter((record) => record.controllerId === profile.controllerId);
+    const matching = controllerCertificates.find(
+      (record) => record.fingerprint === trustInput.fingerprint,
+    );
+    if (matching) return await context.trust.provision(trustInput);
+    const current = controllerCertificates
+      .filter(
+        (record) =>
+          Date.parse(record.notBefore) <= now.getTime() &&
+          now.getTime() < Date.parse(record.notAfter),
+      )
+      .sort((left, right) => right.generation - left.generation)[0];
     if (current && current.fingerprint !== trustInput.fingerprint) {
       const overlapUntil = new Date(
         Math.min(now.getTime() + 60 * 60 * 1000, Date.parse(current.notAfter)),

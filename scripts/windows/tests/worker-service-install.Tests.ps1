@@ -4,6 +4,23 @@ BeforeAll {
 }
 
 Describe 'Worker service policy validation' {
+  It 'checks every install-root ancestor so a writable higher parent cannot replace the service tree' {
+    $root = Join-Path $TestDrive 'writable-parent\SumatraFuzz'
+    [void](New-Item -ItemType Directory -Path $root -Force)
+    $script:installAncestorChecks = [System.Collections.Generic.List[string]]::new()
+    Mock Assert-WorkerHostCompatibleDacl -ModuleName worker-service-config {
+      $script:installAncestorChecks.Add([IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar))
+      if ([IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar) -eq
+          [IO.Path]::GetFullPath((Split-Path -Parent $root)).TrimEnd([IO.Path]::DirectorySeparatorChar)) {
+        throw 'An untrusted principal can replace an ancestor of the protected install root'
+      }
+    }
+
+    { Assert-WorkerProtectedInstallAncestors -InstallRoot $root } | Should -Throw '*replace an ancestor*'
+    $script:installAncestorChecks | Should -Contain ([IO.Path]::GetFullPath((Split-Path -Parent $root)).TrimEnd([IO.Path]::DirectorySeparatorChar))
+    $script:installAncestorChecks | Should -Contain ([IO.Path]::GetPathRoot($root).TrimEnd([IO.Path]::DirectorySeparatorChar))
+  }
+
   It 'parses the protected provisioning entrypoint and live-pipe identity check' {
     $scriptPath = Join-Path $PSScriptRoot '../provision-worker-service.ps1'
     $tokens = $null

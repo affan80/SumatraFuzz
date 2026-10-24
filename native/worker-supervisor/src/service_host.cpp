@@ -312,6 +312,31 @@ std::wstring ParentPath(const std::wstring& path) {
   return path.substr(0, separator);
 }
 
+bool IsLocalVolumeRoot(const std::wstring& path) {
+  return (path.size() == 3 && std::iswalpha(path[0]) && path[1] == L':' &&
+          (path[2] == L'\\' || path[2] == L'/')) ||
+         (path.size() == 7 && path.compare(0, 4, L"\\\\?\\") == 0 &&
+          std::iswalpha(path[4]) && path[5] == L':' && path[6] == L'\\');
+}
+
+void VerifyProtectedInstallAncestors(const std::wstring& install_root) {
+  std::wstring ancestor = ParentPath(install_root);
+  for (;;) {
+    // ParentPath trims the separator at a volume root; restore it before opening.
+    if (ancestor.size() == 6 && ancestor.compare(0, 4, L"\\\\?\\") == 0 &&
+        std::iswalpha(ancestor[4]) && ancestor[5] == L':') {
+      ancestor += L"\\";
+    }
+    Handle directory = OpenPath(ancestor, true);
+    RequireProtectedDacl(directory.Get());
+    if (IsLocalVolumeRoot(ancestor)) return;
+    const std::wstring parent = ParentPath(ancestor);
+    if (parent == ancestor || parent.empty())
+      throw std::runtime_error("protected service install ancestor chain is incomplete");
+    ancestor = parent;
+  }
+}
+
 std::wstring Join(const std::wstring& root, const wchar_t* relative) {
   return root + L"\\" + relative;
 }
@@ -467,7 +492,7 @@ InstallPaths ResolveAndVerifyInstall() {
       !SamePath(FinalPath(root_handle.Get()), paths.root)) {
     throw std::runtime_error("service install root changed during validation");
   }
-  RequireProtectedDacl(OpenPath(ParentPath(paths.root), true).Get());
+  VerifyProtectedInstallAncestors(paths.root);
   VerifyProtectedInstallTree(paths.root);
   paths.node = Join(paths.root, kNodeRelativePath);
   paths.worker = Join(paths.root, kWorkerRelativePath);
