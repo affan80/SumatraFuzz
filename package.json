@@ -34,7 +34,7 @@
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
-    "@biomejs/biome": "2.5.15",
+    "@biomejs/biome": "2.6.2",
     "@cyclonedx/cyclonedx-npm": "6.0.1",
     "@electron/fuses": "2.1.3",
     "@electron/rebuild": "4.2.1",
