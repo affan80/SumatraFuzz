@@ -33,7 +33,7 @@
     "verify": "npm run format:check && npm run lint && npm run typecheck && npm run desktop:build && npm test && npm run audit:production && npm audit --audit-level=high"
   },
   "devDependencies": {
-    "@electron/asar": "3.4.1",
+    "@electron/asar": "4.3.1",
     "@biomejs/biome": "2.5.15",
     "@cyclonedx/cyclonedx-npm": "6.0.1",
     "@electron/fuses": "2.1.3",
